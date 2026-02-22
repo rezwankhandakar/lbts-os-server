@@ -32,6 +32,7 @@ async function run() {
 
     const db= client.db('LBTS-OS-DB')
     const userCollection = db.collection('users')
+    const gatePassCollection = db.collection('gate-pass')
 //.........................All API................................//
 
 
@@ -94,7 +95,6 @@ app.patch('/users/status/:id', async (req, res) => {
 });
 
 
-//delete //
 // Delete user by ID
 app.delete('/users/:id', async (req, res) => {
   try {
@@ -114,6 +114,18 @@ app.delete('/users/:id', async (req, res) => {
   }
 });
 
+
+// POST gate pass
+app.post('/gate-pass', async (req, res) => {
+  try {
+    const gatePass = req.body;
+    const result = await gatePassCollection.insertOne(gatePass);
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to add gate pass' });
+  }
+});
 
 
 
