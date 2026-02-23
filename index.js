@@ -1,4 +1,4 @@
-require("dotenv").config();
+require ("dotenv").config();
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
@@ -79,8 +79,6 @@ app.patch('/users/role/:id', async (req, res) => {
 });
 
 
-
-
 //status update api//
 app.patch('/users/status/:id', async (req, res) => {
   const id = req.params.id;
@@ -127,7 +125,113 @@ app.post('/gate-pass', async (req, res) => {
   }
 });
 
+// GET /gate-pass//
+app.get("/gate-pass", async (req, res) => {
+  try {
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    const search = req.query.search || "";
 
+    let query = {};
+
+    // 🔎 search থাকলে full DB search
+    if (search) {
+      query.$or = [
+        { tripDo: { $regex: search, $options: "i" } },
+        { customerName: { $regex: search, $options: "i" } },
+        { csd: { $regex: search, $options: "i" } },
+        { vehicleNo: { $regex: search, $options: "i" } },
+        { zone: { $regex: search, $options: "i" } },
+        { "products.productName": { $regex: search, $options: "i" } },
+        { "products.model": { $regex: search, $options: "i" } },
+      ];
+    } 
+    
+    // 📅 search না থাকলে month filter
+    else {
+      if (!month || !year) {
+        const now = new Date();
+        month = now.getMonth() + 1;
+        year = now.getFullYear();
+      }
+
+      query.tripMonth = month;
+      query.tripYear = year;
+    }
+
+    const data = await gatePassCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({ data });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Failed to fetch gate passes" });
+  }
+});
+
+// 🔍 Generic autocomplete Search character from gate-pass collection API
+app.get("/autocomplete", async (req, res) => {
+  try {
+    const { field, search } = req.query;
+
+    let pipeline = [];
+
+    // ⭐ product & model nested field
+    if (field === "productName" || field === "model") {
+      pipeline = [
+        { $unwind: "$products" },
+        {
+          $match: {
+            [`products.${field}`]: { $regex: search || "", $options: "i" }
+          }
+        },
+        {
+          $group: {
+            _id: `$products.${field}`
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            value: "$_id"
+          }
+        },
+        { $limit: 5 }
+      ];
+    }
+
+    // ⭐ normal field
+    else {
+      pipeline = [
+        {
+          $match: {
+            [field]: { $regex: search || "", $options: "i" }
+          }
+        },
+        {
+          $group: {
+            _id: `$${field}`
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            value: "$_id"
+          }
+        },
+        { $limit: 5 }
+      ];
+    }
+
+    const result = await gatePassCollection.aggregate(pipeline).toArray();
+    res.send(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Autocomplete failed" });
+  }
+});
 
     console.log("✅ MongoDB connected successfully");
   } catch (err) {
