@@ -191,7 +191,7 @@ app.get("/gate-pass", async (req, res) => {
 app.patch('/gate-pass/:id', async (req, res) => {
   try {
     const id = req.params.id;
-    const { tripDo, tripDate, customerName, csd, vehicleNo, zone } = req.body;
+    const { tripDo, tripDate, customerName, csd, vehicleNo, zone,currentUser } = req.body;
 
     const updateDoc = {
       $set: {
@@ -201,6 +201,7 @@ app.patch('/gate-pass/:id', async (req, res) => {
         csd,
         vehicleNo,
         zone,
+        currentUser,
         tripMonth: new Date(tripDate).getMonth() + 1,
         tripYear: new Date(tripDate).getFullYear()
       }
