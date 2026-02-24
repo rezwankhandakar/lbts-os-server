@@ -112,13 +112,29 @@ app.delete('/users/:id', async (req, res) => {
   }
 });
 
-
-// POST gate pass
+//add gate pass//
 app.post('/gate-pass', async (req, res) => {
   try {
     const gatePass = req.body;
+
+    // ⭐ products এ unique _id add
+    if (gatePass.products && Array.isArray(gatePass.products)) {
+      gatePass.products = gatePass.products.map(p => ({
+        _id: new ObjectId().toString(),   // string id (React friendly)
+        productName: p.productName,
+        model: p.model,
+        quantity: Number(p.quantity)
+      }));
+    }
+
+    // ⭐ extra fields auto set (optional but recommended)
+    gatePass.createdAt = new Date();
+    gatePass.tripMonth = new Date(gatePass.tripDate).getMonth() + 1;
+    gatePass.tripYear = new Date(gatePass.tripDate).getFullYear();
+
     const result = await gatePassCollection.insertOne(gatePass);
     res.send(result);
+
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to add gate pass' });
@@ -170,6 +186,93 @@ app.get("/gate-pass", async (req, res) => {
     res.status(500).send({ message: "Failed to fetch gate passes" });
   }
 });
+
+// Update a gate pass//
+app.patch('/gate-pass/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { tripDo, tripDate, customerName, csd, vehicleNo, zone } = req.body;
+
+    const updateDoc = {
+      $set: {
+        tripDo,
+        tripDate,
+        customerName,
+        csd,
+        vehicleNo,
+        zone,
+        tripMonth: new Date(tripDate).getMonth() + 1,
+        tripYear: new Date(tripDate).getFullYear()
+      }
+    };
+
+    const result = await gatePassCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc
+    );
+
+    const updatedGatePass = await gatePassCollection.findOne({ _id: new ObjectId(id) });
+
+    res.send({ success: true, data: updatedGatePass });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ success: false, message: "Failed to update gate pass" });
+  }
+});
+
+// Update a gate pass Single Proguct//
+app.put('/gate-pass/:gatePassId/product/:productId', async (req, res) => {
+  try {
+    const { gatePassId, productId } = req.params;
+    const { productName, model, quantity } = req.body;
+
+    const result = await gatePassCollection.updateOne(
+      {
+        _id: new ObjectId(gatePassId),
+        "products._id": productId   // ⚡ match specific product
+      },
+      {
+        $set: {
+          "products.$.productName": productName,
+          "products.$.model": model,
+          "products.$.quantity": Number(quantity)
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ success: false, message: "Product not found" });
+    }
+
+    const updatedGatePass = await gatePassCollection.findOne({ _id: new ObjectId(gatePassId) });
+
+    res.send({ success: true, data: updatedGatePass });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ success: false, message: "Failed to update product" });
+  }
+});
+
+// Delete a gate pass by ID
+app.delete('/gate-pass/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    const result = await gatePassCollection.deleteOne({ _id: new ObjectId(id) });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ success: false, message: "Gate Pass not found" });
+    }
+
+    res.send({ success: true, message: "Gate Pass deleted successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ success: false, message: "Failed to delete gate pass" });
+  }
+});
+
 
 // 🔍 Generic autocomplete Search character from gate-pass collection API
 app.get("/autocomplete", async (req, res) => {
