@@ -33,6 +33,7 @@ async function run() {
     const db= client.db('LBTS-OS-DB')
     const userCollection = db.collection('users')
     const gatePassCollection = db.collection('gate-pass')
+    const challanCollection  = db.collection('challans')
 //.........................All API................................//
 
 
@@ -111,6 +112,8 @@ app.delete('/users/:id', async (req, res) => {
     res.status(500).send({ success: false, message: 'Failed to delete user' });
   }
 });
+
+//Gate Related API//
 
 //add gate pass//
 app.post('/gate-pass', async (req, res) => {
@@ -275,68 +278,157 @@ app.delete('/gate-pass/:id', async (req, res) => {
   }
 });
 
-
 // 🔍 Generic autocomplete Search character from gate-pass collection API
 app.get("/autocomplete", async (req, res) => {
   try {
-    const { field, search } = req.query;
+    const { field, search, collection } = req.query;
+
+    // ⭐ collection select
+    let targetCollection;
+
+    if (collection === "challan") {
+      targetCollection = challanCollection;
+    } else {
+      targetCollection = gatePassCollection; // default
+    }
 
     let pipeline = [];
 
-    // ⭐ product & model nested field
+    // nested product/model
     if (field === "productName" || field === "model") {
       pipeline = [
         { $unwind: "$products" },
         {
           $match: {
-            [`products.${field}`]: { $regex: search || "", $options: "i" }
-          }
+            [`products.${field}`]: {
+              $regex: search || "",
+              $options: "i",
+            },
+          },
         },
         {
           $group: {
-            _id: `$products.${field}`
-          }
+            _id: `$products.${field}`,
+          },
         },
         {
           $project: {
             _id: 0,
-            value: "$_id"
-          }
+            value: "$_id",
+          },
         },
-        { $limit: 5 }
+        { $limit: 5 },
       ];
-    }
-
-    // ⭐ normal field
-    else {
+    } else {
       pipeline = [
         {
           $match: {
-            [field]: { $regex: search || "", $options: "i" }
-          }
+            [field]: { $regex: search || "", $options: "i" },
+          },
         },
         {
-          $group: {
-            _id: `$${field}`
-          }
+          $group: { _id: `$${field}` },
         },
         {
           $project: {
             _id: 0,
-            value: "$_id"
-          }
+            value: "$_id",
+          },
         },
-        { $limit: 5 }
+        { $limit: 5 },
       ];
     }
 
-    const result = await gatePassCollection.aggregate(pipeline).toArray();
+    const result = await targetCollection.aggregate(pipeline).toArray();
+
     res.send(result);
   } catch (err) {
     console.error(err);
     res.status(500).send({ message: "Autocomplete failed" });
   }
 });
+
+
+//Challan Related API//
+app.post("/challan", async (req, res) => {
+  try {
+    const challan = req.body;
+
+    challan.createdAt = new Date();
+
+    const result = await challanCollection.insertOne(challan);
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to add challan" });
+  }
+});
+
+
+app.get("/challan/recent", async (req, res) => {
+  const result = await challanCollection
+    .find()
+    .sort({ createdAt: -1 })
+    .limit(1)
+    .toArray();
+
+  res.send({ data: result });
+});
+
+
+// GET /challans logic (Add this to your server.js)
+app.get("/challans", async (req, res) => {
+  try {
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    const search = req.query.search || "";
+
+    let query = {};
+
+    if (search) {
+      query.$or = [
+        { customerName: { $regex: search, $options: "i" } },
+        { address: { $regex: search, $options: "i" } },
+        { receiverNumber: { $regex: search, $options: "i" } },
+        { zone: { $regex: search, $options: "i" } },
+        { "products.productName": { $regex: search, $options: "i" } },
+        { "products.model": { $regex: search, $options: "i" } },
+      ];
+    } else {
+      if (!month || !year) {
+        const now = new Date();
+        month = now.getMonth() + 1;
+        year = now.getFullYear();
+      }
+
+      // createdAt date query (Month and Year extract korte aggregation use kora better)
+      const startDate = new Date(year, month - 1, 1);
+      const endDate = new Date(year, month, 0, 23, 59, 59);
+      query.createdAt = { $gte: startDate, $lte: endDate };
+    }
+
+    const data = await challanCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({ data });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Failed to fetch challans" });
+  }
+});
+
+
+app.delete("/challan/:id", async (req, res) => {
+  const id = req.params.id;
+  const result = await challanCollection.deleteOne({
+    _id: new ObjectId(id),
+  });
+  res.send(result);
+});
+
 
     console.log("✅ MongoDB connected successfully");
   } catch (err) {
