@@ -354,11 +354,21 @@ app.post("/challan", async (req, res) => {
   try {
     const challan = req.body;
 
+    // ✅ products এ string _id add
+    if (challan.products && Array.isArray(challan.products)) {
+      challan.products = challan.products.map(p => ({
+        _id: new ObjectId().toString(),   // string id (React friendly)
+        productName: p.productName,
+        model: p.model,
+        quantity: Number(p.quantity)
+      }));
+    }
+
     challan.createdAt = new Date();
 
     const result = await challanCollection.insertOne(challan);
-
     res.send(result);
+
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: "Failed to add challan" });
@@ -427,6 +437,82 @@ app.delete("/challan/:id", async (req, res) => {
     _id: new ObjectId(id),
   });
   res.send(result);
+});
+
+
+// Update a Challan (Main Details)
+app.patch('/challan/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { customerName, address,thana,district, receiverNumber, zone, currentUser, createdAt } = req.body;
+
+    const updateDoc = {
+      $set: {
+        customerName,
+        address,
+        thana,
+        district,
+        receiverNumber,
+        zone,
+        currentUser,
+        // Optional: Update month/year if date is changed
+        month: createdAt ? new Date(createdAt).getMonth() + 1 : undefined,
+        year: createdAt ? new Date(createdAt).getFullYear() : undefined
+      }
+    };
+
+    // Undefined fields remove kora (jodi value na thake)
+    Object.keys(updateDoc.$set).forEach(key => updateDoc.$set[key] === undefined && delete updateDoc.$set[key]);
+
+    const result = await challanCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc
+    );
+
+    const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(id) });
+    res.send({ success: true, data: updatedChallan });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ success: false, message: "Failed to update challan" });
+  }
+});
+
+
+// Update a Challan Single Product
+app.put('/challan/:challanId/product/:productId', async (req, res) => {
+  try {
+    const { challanId, productId } = req.params;
+    const { productName, model, quantity } = req.body;
+
+    const result = await challanCollection.updateOne(
+      {
+        _id: new ObjectId(challanId),
+        "products._id": productId   // ✅ string match (Gate Pass style)
+      },
+      {
+        $set: {
+          "products.$.productName": productName,
+          "products.$.model": model,
+          "products.$.quantity": Number(quantity)
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ success: false, message: "Product not found" });
+    }
+
+    const updatedChallan = await challanCollection.findOne({
+      _id: new ObjectId(challanId)
+    });
+
+    res.send({ success: true, data: updatedChallan });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ success: false, message: "Failed to update product" });
+  }
 });
 
 
