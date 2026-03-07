@@ -517,6 +517,70 @@ async function run() {
     });
 
 
+    app.delete("/challans/:challanId/product/:productId", async (req, res) => {
+  try {
+    const { challanId, productId } = req.params;
+
+    const result = await challanCollection.updateOne(
+      { _id: new ObjectId(challanId) },
+      { $pull: { products: { _id: productId } } } // প্রোডাক্ট এর string _id দিয়ে রিমুভ করবে
+    );
+
+    if (result.modifiedCount > 0) {
+      res.send({ success: true, message: "Product removed from challan" });
+    } else {
+      res.status(404).send({ success: false, message: "Product not found" });
+    }
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ success: false, message: "Failed to delete product" });
+  }
+});
+
+
+
+app.patch('/challans/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    // বডি থেকে products অ্যারে সহ সব ডাটা রিসিভ করুন
+    const { 
+      customerName, 
+      receiverNumber, 
+      zone, 
+      address, 
+      thana, 
+      district, 
+      products // এইটা যোগ করা হয়েছে
+    } = req.body;
+
+    const updateDoc = {
+      $set: {
+        customerName,
+        receiverNumber,
+        zone,
+        address,
+        thana,
+        district,
+        products // ডাটাবেসে প্রোডাক্ট অ্যারে আপডেট করার জন্য এইটা জরুরি
+      }
+    };
+
+    const result = await challanCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc
+    );
+
+    if (result.matchedCount > 0) {
+      res.send({ success: true, message: "Challan and Products updated successfully" });
+    } else {
+      res.status(404).send({ success: false, message: "Challan not found" });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ success: false, message: "Update failed" });
+  }
+});
+
     //vendor and driver related api//
 
     app.post("/vendors", async (req, res) => {
