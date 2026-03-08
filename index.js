@@ -35,6 +35,7 @@ async function run() {
     const gatePassCollection = db.collection('gate-pass')
     const challanCollection = db.collection('challans')
     const vendorsCollection = db.collection('vendors')
+    const deliveriesCollection = db.collection('deliveries')
     //.........................All API................................//
 
 
@@ -518,68 +519,66 @@ async function run() {
 
 
     app.delete("/challans/:challanId/product/:productId", async (req, res) => {
-  try {
-    const { challanId, productId } = req.params;
+      try {
+        const { challanId, productId } = req.params;
 
-    const result = await challanCollection.updateOne(
-      { _id: new ObjectId(challanId) },
-      { $pull: { products: { _id: productId } } } // প্রোডাক্ট এর string _id দিয়ে রিমুভ করবে
-    );
+        const result = await challanCollection.updateOne(
+          { _id: new ObjectId(challanId) },
+          { $pull: { products: { _id: productId } } } // প্রোডাক্ট এর string _id দিয়ে রিমুভ করবে
+        );
 
-    if (result.modifiedCount > 0) {
-      res.send({ success: true, message: "Product removed from challan" });
-    } else {
-      res.status(404).send({ success: false, message: "Product not found" });
-    }
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ success: false, message: "Failed to delete product" });
-  }
-});
-
-
-
-app.patch('/challans/:id', async (req, res) => {
-  try {
-    const id = req.params.id;
-    // বডি থেকে products অ্যারে সহ সব ডাটা রিসিভ করুন
-    const { 
-      customerName, 
-      receiverNumber, 
-      zone, 
-      address, 
-      thana, 
-      district, 
-      products // এইটা যোগ করা হয়েছে
-    } = req.body;
-
-    const updateDoc = {
-      $set: {
-        customerName,
-        receiverNumber,
-        zone,
-        address,
-        thana,
-        district,
-        products // ডাটাবেসে প্রোডাক্ট অ্যারে আপডেট করার জন্য এইটা জরুরি
+        if (result.modifiedCount > 0) {
+          res.send({ success: true, message: "Product removed from challan" });
+        } else {
+          res.status(404).send({ success: false, message: "Product not found" });
+        }
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ success: false, message: "Failed to delete product" });
       }
-    };
+    });
 
-    const result = await challanCollection.updateOne(
-      { _id: new ObjectId(id) },
-      updateDoc
-    );
+    app.patch('/challans/:id', async (req, res) => {
+      try {
+        const id = req.params.id;
+        // বডি থেকে products অ্যারে সহ সব ডাটা রিসিভ করুন
+        const {
+          customerName,
+          receiverNumber,
+          zone,
+          address,
+          thana,
+          district,
+          products // এইটা যোগ করা হয়েছে
+        } = req.body;
 
-    if (result.matchedCount > 0) {
-      res.send({ success: true, message: "Challan and Products updated successfully" });
-    } else {
-      res.status(404).send({ success: false, message: "Challan not found" });
-    }
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ success: false, message: "Update failed" });
-  }
-});
+        const updateDoc = {
+          $set: {
+            customerName,
+            receiverNumber,
+            zone,
+            address,
+            thana,
+            district,
+            products // ডাটাবেসে প্রোডাক্ট অ্যারে আপডেট করার জন্য এইটা জরুরি
+          }
+        };
+
+        const result = await challanCollection.updateOne(
+          { _id: new ObjectId(id) },
+          updateDoc
+        );
+
+        if (result.matchedCount > 0) {
+          res.send({ success: true, message: "Challan and Products updated successfully" });
+        } else {
+          res.status(404).send({ success: false, message: "Challan not found" });
+        }
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ success: false, message: "Update failed" });
+      }
+    });
 
     //vendor and driver related api//
 
@@ -644,95 +643,171 @@ app.patch('/challans/:id', async (req, res) => {
 
 
     // Vehicles-er jonno alada collection lagbe na
-app.post("/vehicles", async (req, res) => {
-  const { vendorId, ...vehicleData } = req.body;
+    app.post("/vehicles", async (req, res) => {
+      const { vendorId, ...vehicleData } = req.body;
 
-  try {
-    const query = { _id: new ObjectId(vendorId) };
-    
-    // Vendor-er vehicles array-te push kora
-    const updateDoc = {
-      $push: {
-        vehicles: {
-          _id: new ObjectId(), // Prti vehicle-er jonno ekti unique ID create kora
-          ...vehicleData,
-          createdAt: new Date()
+      try {
+        const query = { _id: new ObjectId(vendorId) };
+
+        // Vendor-er vehicles array-te push kora
+        const updateDoc = {
+          $push: {
+            vehicles: {
+              _id: new ObjectId(), // Prti vehicle-er jonno ekti unique ID create kora
+              ...vehicleData,
+              createdAt: new Date()
+            }
+          }
+        };
+
+        const result = await vendorsCollection.updateOne(query, updateDoc);
+
+        if (result.modifiedCount > 0) {
+          res.send({ insertedId: true }); // Frontend-er logic thik rakhar jonno
+        } else {
+          res.status(404).send({ error: "Vendor not found" });
+        }
+      } catch (error) {
+        res.status(500).send({ error: "Failed to add vehicle" });
+      }
+    });
+
+
+    // DELETE: Remove a vehicle from the vendor's array
+    app.delete("/vehicles/:vendorId/:vehicleId", async (req, res) => {
+      const { vendorId, vehicleId } = req.params;
+
+      try {
+        const query = { _id: new ObjectId(vendorId) };
+        const updateDoc = {
+          $pull: {
+            vehicles: { _id: new ObjectId(vehicleId) } // Array theke specific ID remove kora
+          }
+        };
+
+        const result = await vendorsCollection.updateOne(query, updateDoc);
+
+        if (result.modifiedCount > 0) {
+          res.send({ deletedCount: 1 });
+        } else {
+          res.status(404).send({ error: "Vehicle or Vendor not found" });
+        }
+      } catch (error) {
+        res.status(500).send({ error: "Failed to delete vehicle" });
+      }
+    });
+
+
+    // PUT: Update a specific vehicle inside the vendor's array
+    app.put("/vehicles/:vendorId/:vehicleId", async (req, res) => {
+      const { vendorId, vehicleId } = req.params;
+      const updatedData = req.body;
+
+      try {
+        const query = { _id: new ObjectId(vendorId) };
+
+        // Proti-ti field-ke array-r bhetore update korar jonno set kora
+        const updateDoc = {
+          $set: {
+            "vehicles.$[elem].vehicleNumber": updatedData.vehicleNumber,
+            "vehicles.$[elem].vehicleModel": updatedData.vehicleModel,
+            "vehicles.$[elem].driverName": updatedData.driverName,
+            "vehicles.$[elem].driverPhone": updatedData.driverPhone,
+          }
+        };
+
+        const options = {
+          arrayFilters: [{ "elem._id": new ObjectId(vehicleId) }]
+        };
+
+        const result = await vendorsCollection.updateOne(query, updateDoc, options);
+
+        if (result.modifiedCount > 0) {
+          res.send({ modifiedCount: 1 });
+        } else {
+          res.status(404).send({ error: "Nothing updated" });
+        }
+      } catch (error) {
+        res.status(500).send({ error: "Failed to update vehicle" });
+      }
+    });
+
+
+    //delivery related api//
+app.get("/vehicles/search", async (req, res) => {
+
+  const search = req.query.search;
+
+  if (!search) return res.send([]);
+
+  const result = await vendorsCollection.aggregate([
+    { $unwind: "$vehicles" },
+    {
+      $match: {
+        "vehicles.vehicleNumber": {
+          $regex: search,
+          $options: "i"
         }
       }
-    };
-
-    const result = await vendorsCollection.updateOne(query, updateDoc);
-
-    if (result.modifiedCount > 0) {
-      res.send({ insertedId: true }); // Frontend-er logic thik rakhar jonno
-    } else {
-      res.status(404).send({ error: "Vendor not found" });
-    }
-  } catch (error) {
-    res.status(500).send({ error: "Failed to add vehicle" });
-  }
-});
-
-
-// DELETE: Remove a vehicle from the vendor's array
-app.delete("/vehicles/:vendorId/:vehicleId", async (req, res) => {
-  const { vendorId, vehicleId } = req.params;
-
-  try {
-    const query = { _id: new ObjectId(vendorId) };
-    const updateDoc = {
-      $pull: {
-        vehicles: { _id: new ObjectId(vehicleId) } // Array theke specific ID remove kora
+    },
+    {
+      $project: {
+        vendorName: 1,
+        vendorPhone: 1,
+        vehicleNumber: "$vehicles.vehicleNumber",
+        driverName: "$vehicles.driverName",
+        driverPhone: "$vehicles.driverPhone"
       }
-    };
-
-    const result = await vendorsCollection.updateOne(query, updateDoc);
-
-    if (result.modifiedCount > 0) {
-      res.send({ deletedCount: 1 });
-    } else {
-      res.status(404).send({ error: "Vehicle or Vendor not found" });
     }
-  } catch (error) {
-    res.status(500).send({ error: "Failed to delete vehicle" });
-  }
+  ]).toArray();
+
+  res.send(result);
 });
 
 
-// PUT: Update a specific vehicle inside the vendor's array
-app.put("/vehicles/:vendorId/:vehicleId", async (req, res) => {
-  const { vendorId, vehicleId } = req.params;
-  const updatedData = req.body;
 
+app.post("/deliveries", async (req, res) => {
   try {
-    const query = { _id: new ObjectId(vendorId) };
-    
-    // Proti-ti field-ke array-r bhetore update korar jonno set kora
-    const updateDoc = {
-      $set: {
-        "vehicles.$[elem].vehicleNumber": updatedData.vehicleNumber,
-        "vehicles.$[elem].vehicleModel": updatedData.vehicleModel,
-        "vehicles.$[elem].driverName": updatedData.driverName,
-        "vehicles.$[elem].driverPhone": updatedData.driverPhone,
-      }
-    };
+    const deliveries = req.body;
 
-    const options = {
-      arrayFilters: [{ "elem._id": new ObjectId(vehicleId) }]
-    };
+    // ১️⃣ Delivery collection এ save
+    const result = await deliveriesCollection.insertMany(deliveries);
 
-    const result = await vendorsCollection.updateOne(query, updateDoc, options);
+    // ২️⃣ Challan IDs বের করা
+    const challanIds = deliveries.map(d =>
+      typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+    );
 
-    if (result.modifiedCount > 0) {
-      res.send({ modifiedCount: 1 });
-    } else {
-      res.status(404).send({ error: "Nothing updated" });
-    }
+    console.log("Challan IDs to update:", challanIds); // debug
+
+    // ৩️⃣ Challan status update করা
+    const updateResult = await challanCollection.updateMany(
+      { _id: { $in: challanIds } },
+      { $set: { status: "delivered" } }
+    );
+
+    console.log("Challan update result:", updateResult); // debug
+
+    // ৪️⃣ Response পাঠানো
+    res.send({ insertedCount: result.insertedCount, updatedCount: updateResult.modifiedCount });
+
   } catch (error) {
-    res.status(500).send({ error: "Failed to update vehicle" });
+    console.error("Delivery Error:", error);
+    res.status(500).send({ success: false, message: "Delivery failed", error: error.message });
   }
 });
 
+
+// GET all deliveries
+app.get("/deliveries", async (req, res) => {
+  try {
+    const deliveries = await deliveriesCollection.find().sort({ createdAt: -1 }).toArray();
+    res.send({ success: true, data: deliveries });
+  } catch (error) {
+    console.error("Fetch Deliveries Error:", error);
+    res.status(500).send({ success: false, message: "Failed to fetch deliveries" });
+  }
+});
 
 
     console.log("✅ MongoDB connected successfully");
