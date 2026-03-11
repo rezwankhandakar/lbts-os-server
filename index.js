@@ -36,6 +36,7 @@ async function run() {
     const challanCollection = db.collection('challans')
     const vendorsCollection = db.collection('vendors')
     const deliveriesCollection = db.collection('deliveries')
+    const counterCollection = db.collection('counters');
     //.........................All API................................//
 
 
@@ -734,71 +735,290 @@ async function run() {
 
 
     //delivery related api//
+// app.get("/vehicles/search", async (req, res) => {
+
+//   const search = req.query.search;
+
+//   if (!search) return res.send([]);
+
+//   const result = await vendorsCollection.aggregate([
+//     { $unwind: "$vehicles" },
+//     {
+//       $match: {
+//         "vehicles.vehicleNumber": {
+//           $regex: search,
+//           $options: "i"
+//         }
+//       }
+//     },
+//     {
+//       $project: {
+//         vendorName: 1,
+//         vendorPhone: 1,
+//         vehicleNumber: "$vehicles.vehicleNumber",
+//         driverName: "$vehicles.driverName",
+//         driverPhone: "$vehicles.driverPhone"
+//       }
+//     }
+//   ]).toArray();
+
+//   res.send(result);
+// });
+
 app.get("/vehicles/search", async (req, res) => {
-
-  const search = req.query.search;
-
-  if (!search) return res.send([]);
-
-  const result = await vendorsCollection.aggregate([
-    { $unwind: "$vehicles" },
-    {
-      $match: {
-        "vehicles.vehicleNumber": {
-          $regex: search,
-          $options: "i"
-        }
-      }
-    },
-    {
-      $project: {
-        vendorName: 1,
-        vendorPhone: 1,
-        vehicleNumber: "$vehicles.vehicleNumber",
-        driverName: "$vehicles.driverName",
-        driverPhone: "$vehicles.driverPhone"
-      }
-    }
-  ]).toArray();
-
-  res.send(result);
-});
-
-
-
-app.post("/deliveries", async (req, res) => {
   try {
-    const deliveries = req.body;
+    const search = req.query.search?.trim();
 
-    // ১️⃣ Delivery collection এ save
-    const result = await deliveriesCollection.insertMany(deliveries);
+    if (!search) {
+      return res.send([]);
+    }
 
-    // ২️⃣ Challan IDs বের করা
-    const challanIds = deliveries.map(d =>
-      typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-    );
+    const result = await vendorsCollection.aggregate([
+      { $unwind: "$vehicles" },
 
-    console.log("Challan IDs to update:", challanIds); // debug
+      {
+        $match: {
+          "vehicles.vehicleNumber": {
+            $regex: search,
+            $options: "i",
+          },
+        },
+      },
 
-    // ৩️⃣ Challan status update করা
-    const updateResult = await challanCollection.updateMany(
-      { _id: { $in: challanIds } },
-      { $set: { status: "delivered" } }
-    );
+      {
+        $project: {
+          _id: 0,
+          vendorName: 1,
+          vendorPhone: 1,
+          vehicleNumber: "$vehicles.vehicleNumber",
+          driverName: "$vehicles.driverName",
+          driverPhone: "$vehicles.driverPhone",
+        },
+      },
 
-    console.log("Challan update result:", updateResult); // debug
+      { $limit: 10 } // suggestion limit
+    ]).toArray();
 
-    // ৪️⃣ Response পাঠানো
-    res.send({ insertedCount: result.insertedCount, updatedCount: updateResult.modifiedCount });
-
+    res.send(result);
   } catch (error) {
-    console.error("Delivery Error:", error);
-    res.status(500).send({ success: false, message: "Delivery failed", error: error.message });
+    console.error(error);
+    res.status(500).send({ message: "Server Error" });
   }
 });
 
 
+// app.post("/deliveries", async (req, res) => {
+//   try {
+//     const deliveries = req.body;
+
+//     // ১️⃣ Delivery collection এ save
+//     const result = await deliveriesCollection.insertMany(deliveries);
+
+//     // ২️⃣ Challan IDs বের করা
+//     const challanIds = deliveries.map(d =>
+//       typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+//     );
+
+//     console.log("Challan IDs to update:", challanIds); // debug
+
+//     // ৩️⃣ Challan status update করা
+//     const updateResult = await challanCollection.updateMany(
+//       { _id: { $in: challanIds } },
+//       { $set: { status: "delivered" } }
+//     );
+
+//     console.log("Challan update result:", updateResult); // debug
+
+//     // ৪️⃣ Response পাঠানো
+//     res.send({ insertedCount: result.insertedCount, updatedCount: updateResult.modifiedCount });
+
+//   } catch (error) {
+//     console.error("Delivery Error:", error);
+//     res.status(500).send({ success: false, message: "Delivery failed", error: error.message });
+//   }
+// });
+
+
 // GET all deliveries
+
+// app.post("/deliveries", async (req, res) => {
+//   try {
+//     const deliveries = req.body;
+
+//     // Insert deliveries
+//     const result = await deliveriesCollection.insertMany(deliveries);
+
+//     // Update challan status
+//     const challanIds = deliveries.map(d =>
+//       typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+//     );
+
+//     const updateResult = await challanCollection.updateMany(
+//       { _id: { $in: challanIds } },
+//       { $set: { status: "delivered" } }
+//     );
+
+//     res.send({
+//       insertedCount: result.insertedCount,
+//       updatedCount: updateResult.modifiedCount,
+//       tripNumber: deliveries[0].tripNumber // return trip number for frontend
+//     });
+
+//   } catch (error) {
+//     console.error("Delivery Error:", error);
+//     res.status(500).send({ success: false, message: "Delivery failed", error: error.message });
+//   }
+// });
+
+
+// app.post("/deliveries", async (req, res) => {
+//   try {
+//     const deliveries = req.body;
+
+//     if (!Array.isArray(deliveries) || deliveries.length === 0) {
+//       return res.status(400).send({ success: false, message: "No deliveries provided" });
+//     }
+
+//     // ✅ Trip Number জেনারেট করার জন্য কাউন্টার আপডেট
+//     // returnDocument: "after" দিলে এটি আপডেটেড ডাটা সরাসরি রিটার্ন করে
+//     const counter = await counterCollection.findOneAndUpdate(
+//       { _id: "tripNumber" },
+//       { $inc: { seq: 1 } },
+//       { upsert: true, returnDocument: "after" } 
+//     );
+
+//     // v4+ ড্রাইভার বা Atlas-এ counter সরাসরি আপডেট হওয়া ডকুমেন্টটি দেয়
+//     // যদি value এর ভেতর থাকে তবে counter.value.seq হবে, নাহলে counter.seq
+//     let seq = counter?.seq || counter?.value?.seq || 1;
+
+//     const tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
+
+//     // প্রতিটি ডেলিভারিতে tripNumber এবং current date যুক্ত করা
+//     const deliveriesWithTrip = deliveries.map(d => ({ 
+//       ...d, 
+//       tripNumber,
+//       createdAt: new Date() // সার্ভার সাইড ডেট নিশ্চিত করা
+//     }));
+
+//     // ১. Deliveries কালেকশনে ইনসার্ট করা
+//     const result = await deliveriesCollection.insertMany(deliveriesWithTrip);
+
+//     // ২. সংশ্লিষ্ট Challan গুলোর স্ট্যাটাস আপডেট করা
+//     const challanIds = deliveriesWithTrip.map(d =>
+//       typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+//     );
+
+//     const updateResult = await challanCollection.updateMany(
+//       { _id: { $in: challanIds } },
+//       { $set: { status: "delivered" } }
+//     );
+
+//     res.send({
+//       success: true,
+//       insertedCount: result.insertedCount,
+//       updatedCount: updateResult.modifiedCount,
+//       tripNumber
+//     });
+
+//   } catch (error) {
+//     console.error("Delivery Error:", error);
+//     res.status(500).send({ success: false, message: "Delivery failed", error: error.message });
+//   }
+// });
+
+app.post("/deliveries", async (req, res) => {
+  try {
+
+    const deliveries = req.body;
+
+    if (!Array.isArray(deliveries) || deliveries.length === 0) {
+      return res.status(400).send({
+        success: false,
+        message: "No deliveries provided"
+      });
+    }
+
+    // ✅ Trip Number Counter
+    const counter = await counterCollection.findOneAndUpdate(
+      { _id: "tripNumber" },
+      { $inc: { seq: 1 } },
+      { upsert: true, returnDocument: "after" }
+    );
+
+    let seq = counter?.seq || counter?.value?.seq || 1;
+
+    const tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
+
+    // ✅ Challan IDs
+    const challanIds = deliveries.map(d =>
+      typeof d.challanId === "string"
+        ? new ObjectId(d.challanId)
+        : d.challanId
+    );
+
+    // ✅ Trip Document
+    const tripDocument = {
+
+      tripNumber,
+
+      vehicleNumber: deliveries[0].vehicleNumber,
+      vendorName: deliveries[0].vendorName,
+      vendorNumber: deliveries[0].vendorNumber,
+
+      driverName: deliveries[0].driverName,
+      driverNumber: deliveries[0].driverNumber,
+
+      createdBy: deliveries[0].createdBy || "unknown",
+
+      totalChallan: deliveries.length,
+
+      challans: deliveries.map(d => ({
+        challanId: d.challanId,
+        customerName: d.customerName,
+        zone: d.zone,
+        address: d.address,
+        thana: d.thana,
+        district: d.district,
+        receiverNumber: d.receiverNumber,
+        products: d.products
+      })),
+
+      createdAt: new Date()
+
+    };
+
+    // ✅ Insert Trip
+    const result = await deliveriesCollection.insertOne(tripDocument);
+
+    // ✅ Update Challan Status
+    const updateResult = await challanCollection.updateMany(
+      { _id: { $in: challanIds } },
+      { $set: { status: "delivered", tripNumber } }
+    );
+
+    res.send({
+      success: true,
+      insertedId: result.insertedId,
+      updatedCount: updateResult.modifiedCount,
+      tripNumber,
+      totalChallan: deliveries.length
+    });
+
+  } catch (error) {
+
+    console.error("Delivery Error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Delivery failed",
+      error: error.message
+    });
+
+  }
+}); 
+
+
+
 app.get("/deliveries", async (req, res) => {
   try {
     const deliveries = await deliveriesCollection.find().sort({ createdAt: -1 }).toArray();
