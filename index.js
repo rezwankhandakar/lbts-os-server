@@ -1030,6 +1030,70 @@ app.get("/deliveries", async (req, res) => {
 });
 
 
+app.patch("/deliveries/confirm", async (req, res) => {
+
+  try {
+
+    const { tripNumber, challanId, status, note, operator } = req.body;
+
+    const result = await deliveriesCollection.updateOne(
+      {
+        tripNumber: tripNumber,
+        "challans.challanId": String(challanId)
+      },
+      {
+        $set: {
+          "challans.$.deliveryStatus": status,
+          "challans.$.operatorNote": note || "",
+          "challans.$.confirmedBy": operator,
+          "challans.$.confirmedAt": new Date()
+        }
+      }
+    );
+
+    res.send(result);
+
+  } catch (err) {
+
+    console.error(err);
+    res.status(500).send({ message: "Confirm failed" });
+
+  }
+
+});
+
+app.patch("/deliveries/challan-return", async (req, res) => {
+
+  try {
+
+    const { tripNumber, challanId, status, operator } = req.body;
+
+    const result = await deliveriesCollection.updateOne(
+      {
+        tripNumber: tripNumber,
+        "challans.challanId": String(challanId)
+      },
+      {
+        $set: {
+          "challans.$.challanReturnStatus": status,
+          "challans.$.challanReturnedAt": new Date(),
+          "challans.$.challanReceivedBy": operator
+        }
+      }
+    );
+
+    res.send(result);
+
+  } catch (err) {
+
+    console.error(err);
+    res.status(500).send({ message: "Challan return update failed" });
+
+  }
+
+});
+
+
     console.log("✅ MongoDB connected successfully");
   } catch (err) {
     console.error("MongoDB connection failed:", err);
