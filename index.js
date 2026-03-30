@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 const express = require('express');
 const cors = require('cors');
@@ -8,11 +9,19 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // middleware//
-app.use(cors());
+// app.use(cors());
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "https://adorable-lolly-ea6038.netlify.app"
+  ],
+  credentials: true
+}));
+
 app.use(express.json());
 
 //mondoDB Uri// 
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fu1n5ti.mongodb.net/myDB?retryWrites=true&w=majority`;
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority`;
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -26,22 +35,78 @@ app.get('/', (req, res) => {
   res.send('LBTS-OS Server is running');
 });
 
-async function run() {
+
+
+
+// let db;
+// let userCollection;
+// let gatePassCollection;
+// let challanCollection;
+// let vendorsCollection;
+// let deliveriesCollection;
+// let counterCollection;
+
+//  async function connectDB() {
+//   if (!db) {
+//     await client.connect();
+
+//     db = client.db('LBTS-OS-DB');
+
+//     userCollection = db.collection('users');
+//     gatePassCollection = db.collection('gate-pass');
+//     challanCollection = db.collection('challans');
+//     vendorsCollection = db.collection('vendors');
+//     deliveriesCollection = db.collection('deliveries');
+//     counterCollection = db.collection('counters');
+
+//     console.log("✅ MongoDB Connected");
+//   }
+// }
+
+
+// 🔵 Global DB variables
+let db;
+let isConnected = false;
+
+let userCollection;
+let gatePassCollection;
+let challanCollection;
+let vendorsCollection;
+let deliveriesCollection;
+let counterCollection;
+
+
+// 🔥 Connect DB (ONLY ONCE)
+async function connectDB() {
   try {
+    if (isConnected) return;
+
     await client.connect();
 
-    const db = client.db('LBTS-OS-DB')
-    const userCollection = db.collection('users')
-    const gatePassCollection = db.collection('gate-pass')
-    const challanCollection = db.collection('challans')
-    const vendorsCollection = db.collection('vendors')
-    const deliveriesCollection = db.collection('deliveries')
-    const counterCollection = db.collection('counters');
-    //.........................All API................................//
+    db = client.db('LBTS-OS-DB');
+
+    userCollection = db.collection('users');
+    gatePassCollection = db.collection('gate-pass');
+    challanCollection = db.collection('challans');
+    vendorsCollection = db.collection('vendors');
+    deliveriesCollection = db.collection('deliveries');
+    counterCollection = db.collection('counters');
+
+    isConnected = true;
+
+    console.log("✅ MongoDB Connected");
+
+  } catch (error) {
+    console.error("❌ MongoDB Connection Failed:", error);
+     // Production safety: exit process so server doesn't run without DB
+    process.exit(1);
+  }
+}
 
 
     //  Add user//
     app.post('/users', async (req, res) => {
+ 
       const user = req.body;
       user.role = 'user';
       user.status = 'pending'
@@ -51,6 +116,7 @@ async function run() {
 
     //Get all users//
     app.get('/users', async (req, res) => {
+
       const result = await userCollection.find().toArray();
       res.send(result);
     });
@@ -58,6 +124,7 @@ async function run() {
 
     // Get role & status of single user
     app.get('/users/:email/role', async (req, res) => {
+      
       const email = req.params.email;
       try {
         const user = await userCollection.findOne({ email });
@@ -71,6 +138,7 @@ async function run() {
 
     //role update//
     app.patch('/users/role/:id', async (req, res) => {
+
       const id = req.params.id;
       const { role } = req.body;
 
@@ -85,6 +153,7 @@ async function run() {
 
     //status update api//
     app.patch('/users/status/:id', async (req, res) => {
+ 
       const id = req.params.id;
       const { status } = req.body;
 
@@ -99,6 +168,7 @@ async function run() {
 
     // Delete user by ID
     app.delete('/users/:id', async (req, res) => {
+  
       try {
         const id = req.params.id;
 
@@ -120,6 +190,7 @@ async function run() {
 
     //add gate pass//
     app.post('/gate-pass', async (req, res) => {
+  
       try {
         const gatePass = req.body;
 
@@ -149,6 +220,7 @@ async function run() {
 
     // GET /gate-pass//
     app.get("/gate-pass", async (req, res) => {
+      
       try {
         let month = parseInt(req.query.month);
         let year = parseInt(req.query.year);
@@ -195,6 +267,7 @@ async function run() {
 
     // Update a gate pass//
     app.patch('/gate-pass/:id', async (req, res) => {
+     
       try {
         const id = req.params.id;
         const { tripDo, tripDate, customerName, csd, unit, vehicleNo, zone, currentUser } = req.body;
@@ -231,6 +304,7 @@ async function run() {
 
     // Update a gate pass Single Proguct//
     app.put('/gate-pass/:gatePassId/product/:productId', async (req, res) => {
+    
       try {
         const { gatePassId, productId } = req.params;
         const { productName, model, quantity } = req.body;
@@ -265,6 +339,7 @@ async function run() {
 
     // Delete a gate pass by ID
     app.delete('/gate-pass/:id', async (req, res) => {
+      
       try {
         const id = req.params.id;
 
@@ -283,6 +358,7 @@ async function run() {
 
     // 🔍 Generic autocomplete Search character from gate-pass collection API
     app.get("/autocomplete", async (req, res) => {
+    
       try {
         const { field, search, collection } = req.query;
 
@@ -354,6 +430,7 @@ async function run() {
 
     //Challan Related API//
     app.post("/challan", async (req, res) => {
+      
       try {
         const challan = req.body;
 
@@ -380,6 +457,7 @@ async function run() {
 
 
     app.get("/challan/recent", async (req, res) => {
+    
       const result = await challanCollection
         .find()
         .sort({ createdAt: -1 })
@@ -392,6 +470,7 @@ async function run() {
 
     // GET /challans logic (Add this to your server.js)
     app.get("/challans", async (req, res) => {
+       
       try {
         let month = parseInt(req.query.month);
         let year = parseInt(req.query.year);
@@ -435,6 +514,7 @@ async function run() {
 
 
     app.delete("/challan/:id", async (req, res) => {
+      
       const id = req.params.id;
       const result = await challanCollection.deleteOne({
         _id: new ObjectId(id),
@@ -445,6 +525,7 @@ async function run() {
 
     // Update a Challan (Main Details)
     app.patch('/challan/:id', async (req, res) => {
+      
       try {
         const id = req.params.id;
         const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt } = req.body;
@@ -484,6 +565,7 @@ async function run() {
 
     // Update a Challan Single Product
     app.put('/challan/:challanId/product/:productId', async (req, res) => {
+       
       try {
         const { challanId, productId } = req.params;
         const { productName, model, quantity } = req.body;
@@ -520,6 +602,7 @@ async function run() {
 
 
     app.delete("/challans/:challanId/product/:productId", async (req, res) => {
+      
       try {
         const { challanId, productId } = req.params;
 
@@ -540,6 +623,7 @@ async function run() {
     });
 
     app.patch('/challans/:id', async (req, res) => {
+     
       try {
         const id = req.params.id;
         // বডি থেকে products অ্যারে সহ সব ডাটা রিসিভ করুন
@@ -584,6 +668,7 @@ async function run() {
     //vendor and driver related api//
 
     app.post("/vendors", async (req, res) => {
+     
       const vendor = req.body;
 
       const result = await vendorsCollection.insertOne({
@@ -596,11 +681,13 @@ async function run() {
     });
 
     app.get("/vendors", async (req, res) => {
+      
       const result = await vendorsCollection.find().toArray();
       res.send(result);
     });
 
     app.patch("/vendors/:id", async (req, res) => {
+     
       const id = req.params.id;
       const updatedVendor = req.body;
 
@@ -622,6 +709,7 @@ async function run() {
     });
 
     app.delete("/vendors/:id", async (req, res) => {
+      
       const id = req.params.id;
 
       const result = await vendorsCollection.deleteOne({
@@ -632,6 +720,7 @@ async function run() {
     });
 
     app.get("/vendors/:id", async (req, res) => {
+      
 
       const id = req.params.id;
 
@@ -645,6 +734,7 @@ async function run() {
 
     // Vehicles-er jonno alada collection lagbe na
     app.post("/vehicles", async (req, res) => {
+     
       const { vendorId, ...vehicleData } = req.body;
 
       try {
@@ -676,6 +766,7 @@ async function run() {
 
     // DELETE: Remove a vehicle from the vendor's array
     app.delete("/vehicles/:vendorId/:vehicleId", async (req, res) => {
+      
       const { vendorId, vehicleId } = req.params;
 
       try {
@@ -701,6 +792,7 @@ async function run() {
 
     // PUT: Update a specific vehicle inside the vendor's array
     app.put("/vehicles/:vendorId/:vehicleId", async (req, res) => {
+    
       const { vendorId, vehicleId } = req.params;
       const updatedData = req.body;
 
@@ -735,37 +827,9 @@ async function run() {
 
 
     //delivery related api//
-// app.get("/vehicles/search", async (req, res) => {
-
-//   const search = req.query.search;
-
-//   if (!search) return res.send([]);
-
-//   const result = await vendorsCollection.aggregate([
-//     { $unwind: "$vehicles" },
-//     {
-//       $match: {
-//         "vehicles.vehicleNumber": {
-//           $regex: search,
-//           $options: "i"
-//         }
-//       }
-//     },
-//     {
-//       $project: {
-//         vendorName: 1,
-//         vendorPhone: 1,
-//         vehicleNumber: "$vehicles.vehicleNumber",
-//         driverName: "$vehicles.driverName",
-//         driverPhone: "$vehicles.driverPhone"
-//       }
-//     }
-//   ]).toArray();
-
-//   res.send(result);
-// });
 
 app.get("/vehicles/search", async (req, res) => {
+  
   try {
     const search = req.query.search?.trim();
 
@@ -806,127 +870,8 @@ app.get("/vehicles/search", async (req, res) => {
   }
 });
 
-
-// app.post("/deliveries", async (req, res) => {
-//   try {
-//     const deliveries = req.body;
-
-//     // ১️⃣ Delivery collection এ save
-//     const result = await deliveriesCollection.insertMany(deliveries);
-
-//     // ২️⃣ Challan IDs বের করা
-//     const challanIds = deliveries.map(d =>
-//       typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-//     );
-
-//     console.log("Challan IDs to update:", challanIds); // debug
-
-//     // ৩️⃣ Challan status update করা
-//     const updateResult = await challanCollection.updateMany(
-//       { _id: { $in: challanIds } },
-//       { $set: { status: "delivered" } }
-//     );
-
-//     console.log("Challan update result:", updateResult); // debug
-
-//     // ৪️⃣ Response পাঠানো
-//     res.send({ insertedCount: result.insertedCount, updatedCount: updateResult.modifiedCount });
-
-//   } catch (error) {
-//     console.error("Delivery Error:", error);
-//     res.status(500).send({ success: false, message: "Delivery failed", error: error.message });
-//   }
-// });
-
-
-// GET all deliveries
-
-// app.post("/deliveries", async (req, res) => {
-//   try {
-//     const deliveries = req.body;
-
-//     // Insert deliveries
-//     const result = await deliveriesCollection.insertMany(deliveries);
-
-//     // Update challan status
-//     const challanIds = deliveries.map(d =>
-//       typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-//     );
-
-//     const updateResult = await challanCollection.updateMany(
-//       { _id: { $in: challanIds } },
-//       { $set: { status: "delivered" } }
-//     );
-
-//     res.send({
-//       insertedCount: result.insertedCount,
-//       updatedCount: updateResult.modifiedCount,
-//       tripNumber: deliveries[0].tripNumber // return trip number for frontend
-//     });
-
-//   } catch (error) {
-//     console.error("Delivery Error:", error);
-//     res.status(500).send({ success: false, message: "Delivery failed", error: error.message });
-//   }
-// });
-
-
-// app.post("/deliveries", async (req, res) => {
-//   try {
-//     const deliveries = req.body;
-
-//     if (!Array.isArray(deliveries) || deliveries.length === 0) {
-//       return res.status(400).send({ success: false, message: "No deliveries provided" });
-//     }
-
-//     // ✅ Trip Number জেনারেট করার জন্য কাউন্টার আপডেট
-//     // returnDocument: "after" দিলে এটি আপডেটেড ডাটা সরাসরি রিটার্ন করে
-//     const counter = await counterCollection.findOneAndUpdate(
-//       { _id: "tripNumber" },
-//       { $inc: { seq: 1 } },
-//       { upsert: true, returnDocument: "after" } 
-//     );
-
-//     // v4+ ড্রাইভার বা Atlas-এ counter সরাসরি আপডেট হওয়া ডকুমেন্টটি দেয়
-//     // যদি value এর ভেতর থাকে তবে counter.value.seq হবে, নাহলে counter.seq
-//     let seq = counter?.seq || counter?.value?.seq || 1;
-
-//     const tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
-
-//     // প্রতিটি ডেলিভারিতে tripNumber এবং current date যুক্ত করা
-//     const deliveriesWithTrip = deliveries.map(d => ({ 
-//       ...d, 
-//       tripNumber,
-//       createdAt: new Date() // সার্ভার সাইড ডেট নিশ্চিত করা
-//     }));
-
-//     // ১. Deliveries কালেকশনে ইনসার্ট করা
-//     const result = await deliveriesCollection.insertMany(deliveriesWithTrip);
-
-//     // ২. সংশ্লিষ্ট Challan গুলোর স্ট্যাটাস আপডেট করা
-//     const challanIds = deliveriesWithTrip.map(d =>
-//       typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-//     );
-
-//     const updateResult = await challanCollection.updateMany(
-//       { _id: { $in: challanIds } },
-//       { $set: { status: "delivered" } }
-//     );
-
-//     res.send({
-//       success: true,
-//       insertedCount: result.insertedCount,
-//       updatedCount: updateResult.modifiedCount,
-//       tripNumber
-//     });
-
-//   } catch (error) {
-//     console.error("Delivery Error:", error);
-//     res.status(500).send({ success: false, message: "Delivery failed", error: error.message });
-//   }
-// });
-
 app.post("/deliveries", async (req, res) => {
+   
   try {
 
     const deliveries = req.body;
@@ -1020,6 +965,7 @@ app.post("/deliveries", async (req, res) => {
 
 
 app.get("/deliveries", async (req, res) => {
+  
   try {
     const deliveries = await deliveriesCollection.find().sort({ createdAt: -1 }).toArray();
     res.send({ success: true, data: deliveries });
@@ -1031,6 +977,7 @@ app.get("/deliveries", async (req, res) => {
 
 
 app.patch("/deliveries/confirm", async (req, res) => {
+   
 
   try {
 
@@ -1063,6 +1010,7 @@ app.patch("/deliveries/confirm", async (req, res) => {
 });
 
 app.patch("/deliveries/challan-return", async (req, res) => {
+   
 
   try {
 
@@ -1094,14 +1042,30 @@ app.patch("/deliveries/challan-return", async (req, res) => {
 });
 
 
-    console.log("✅ MongoDB connected successfully");
-  } catch (err) {
-    console.error("MongoDB connection failed:", err);
+app.use((err, req, res, next) => {
+  console.error("💥 Error:", err.stack);
+  res.status(500).send({ message: "Internal Server Error" });
+});
+
+// 🔥 Start Server (Vercel-compatible)
+async function startServer() {
+  try {
+    await connectDB(); // ✅ connect once before server start
+
+    // Only listen if not in production (Vercel serverless ignores listen)
+    if (process.env.NODE_ENV !== "production") {
+      app.listen(port, () => {
+        console.log(`🚀 Server running on port ${port}`);
+      });
+    }
+
+  } catch (error) {
+    console.error("❌ Server Start Failed:", error);
   }
 }
 
-run();
+// Start server in development
+startServer();
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+// Export app for Vercel serverless deployment
+module.exports = app;
