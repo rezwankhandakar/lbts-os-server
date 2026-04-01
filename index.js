@@ -1,28 +1,56 @@
-
 require("dotenv").config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+
+// ── Environment Variable Validation ───────────────────────────────────────────
+const requiredEnvVars = ['DB_USER', 'DB_PASS', 'ALLOWED_ORIGINS'];
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingVars.join(', ')}`);
+  process.exit(1);
+}
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ── Middleware ──────────────────────────────────────────────────────────────────
+// ── Security Middleware ────────────────────────────────────────────────────────
+app.use(helmet());
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' }
+});
+app.use(limiter);
+
+// ── CORS ───────────────────────────────────────────────────────────────────────
+const allowedOrigins = process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim());
 
 app.use(cors({
-  origin: [
-    "http://localhost:5173",
-    "https://adorable-lolly-ea6038.netlify.app"
-  ],
+  origin: allowedOrigins,
   credentials: true
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const isValidObjectId = (id) => {
+  try {
+    return ObjectId.isValid(id) && new ObjectId(id).toString() === id;
+  } catch {
+    return false;
+  }
+};
 
 // ── MongoDB (Vercel-safe singleton) ────────────────────────────────────────────
-// ✅ Vercel serverless-এ global variable module cache হয়
-//    তাই client একবার তৈরি হলে পরের request-এ আর নতুন connection হয় না
-
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 let client;
@@ -44,8 +72,6 @@ function getClient() {
   return client;
 }
 
-// ✅ connectDB() প্রতিটি route-এ call হবে
-//    কিন্তু db একবার তৈরি হলে আর reconnect হবে না
 async function connectDB() {
   if (db) return db;
   const c = getClient();
@@ -58,7 +84,7 @@ async function connectDB() {
 // ── Health Check ───────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.send('LBTS-OS Server is running ✅');
+  res.send({ status: 'ok', message: 'LBTS-OS Server is running ✅' });
 });
 
 // ── Users ──────────────────────────────────────────────────────────────────────
@@ -69,6 +95,10 @@ app.post('/users', async (req, res) => {
     const userCollection = db.collection('users');
 
     const user = req.body;
+    if (!user.email || !user.name) {
+      return res.status(400).send({ message: 'Email and name are required' });
+    }
+
     const exists = await userCollection.findOne({ email: user.email });
     if (exists) return res.send({ message: 'User already exists' });
 
@@ -112,6 +142,16 @@ app.patch('/users/role/:id', async (req, res) => {
     const db = await connectDB();
     const userCollection = db.collection('users');
     const { role } = req.body;
+
+    const allowedRoles = ['user', 'operator', 'manager', 'admin'];
+    if (!role || !allowedRoles.includes(role)) {
+      return res.status(400).send({ message: 'Invalid role value' });
+    }
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid user ID' });
+    }
+
     const result = await userCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
       { $set: { role } }
@@ -128,6 +168,16 @@ app.patch('/users/status/:id', async (req, res) => {
     const db = await connectDB();
     const userCollection = db.collection('users');
     const { status } = req.body;
+
+    const allowedStatuses = ['pending', 'approved', 'rejected'];
+    if (!status || !allowedStatuses.includes(status)) {
+      return res.status(400).send({ message: 'Invalid status value' });
+    }
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid user ID' });
+    }
+
     const result = await userCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
       { $set: { status } }
@@ -143,6 +193,11 @@ app.delete('/users/:id', async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid user ID' });
+    }
+
     const result = await userCollection.deleteOne({ _id: new ObjectId(req.params.id) });
     if (result.deletedCount === 1) {
       res.send({ success: true, message: 'User deleted successfully' });
@@ -163,12 +218,19 @@ app.post('/gate-pass', async (req, res) => {
     const gatePassCollection = db.collection('gate-pass');
     const gatePass = req.body;
 
+    if (!gatePass.tripDo || !gatePass.tripDate) {
+      return res.status(400).send({ message: 'tripDo and tripDate are required' });
+    }
+
     if (gatePass.products && Array.isArray(gatePass.products)) {
+      if (gatePass.products.length > 100) {
+        return res.status(400).send({ message: 'Too many products (max 100)' });
+      }
       gatePass.products = gatePass.products.map(p => ({
         _id: new ObjectId().toString(),
-        productName: p.productName,
-        model: p.model,
-        quantity: Number(p.quantity)
+        productName: String(p.productName || '').slice(0, 200),
+        model: String(p.model || '').slice(0, 200),
+        quantity: Math.max(0, Number(p.quantity) || 0)
       }));
     }
 
@@ -191,7 +253,7 @@ app.get("/gate-pass", async (req, res) => {
 
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
-    const search = req.query.search || "";
+    const search = escapeRegex((req.query.search || "").trim().slice(0, 100));
     let query = {};
 
     if (search) {
@@ -226,6 +288,11 @@ app.patch('/gate-pass/:id', async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid ID' });
+    }
+
     const { tripDo, tripDate, customerName, csd, unit, vehicleNo, zone, currentUser } = req.body;
 
     await gatePassCollection.updateOne(
@@ -254,13 +321,17 @@ app.put('/gate-pass/:gatePassId/product/:productId', async (req, res) => {
     const { gatePassId, productId } = req.params;
     const { productName, model, quantity } = req.body;
 
+    if (!isValidObjectId(gatePassId)) {
+      return res.status(400).send({ message: 'Invalid gate pass ID' });
+    }
+
     const result = await gatePassCollection.updateOne(
       { _id: new ObjectId(gatePassId), "products._id": productId },
       {
         $set: {
-          "products.$.productName": productName,
-          "products.$.model": model,
-          "products.$.quantity": Number(quantity)
+          "products.$.productName": String(productName || '').slice(0, 200),
+          "products.$.model": String(model || '').slice(0, 200),
+          "products.$.quantity": Math.max(0, Number(quantity) || 0)
         }
       }
     );
@@ -280,6 +351,11 @@ app.delete('/gate-pass/:id', async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid ID' });
+    }
+
     const result = await gatePassCollection.deleteOne({ _id: new ObjectId(req.params.id) });
     if (result.deletedCount === 0)
       return res.status(404).send({ success: false, message: "Gate Pass not found" });
@@ -298,22 +374,27 @@ app.get("/autocomplete", async (req, res) => {
     const gatePassCollection = db.collection('gate-pass');
     const challanCollection = db.collection('challans');
 
-    const { field, search, collection } = req.query;
+    const { field, collection } = req.query;
+    const search = escapeRegex((req.query.search || "").slice(0, 100));
     const targetCollection = collection === "challan" ? challanCollection : gatePassCollection;
+
+    if (!field) {
+      return res.status(400).send({ message: 'field is required' });
+    }
 
     let pipeline = [];
 
     if (field === "productName" || field === "model") {
       pipeline = [
         { $unwind: "$products" },
-        { $match: { [`products.${field}`]: { $regex: search || "", $options: "i" } } },
+        { $match: { [`products.${field}`]: { $regex: search, $options: "i" } } },
         { $group: { _id: `$products.${field}` } },
         { $project: { _id: 0, value: "$_id" } },
         { $limit: 5 },
       ];
     } else {
       pipeline = [
-        { $match: { [field]: { $regex: search || "", $options: "i" } } },
+        { $match: { [field]: { $regex: search, $options: "i" } } },
         { $group: { _id: `$${field}` } },
         { $project: { _id: 0, value: "$_id" } },
         { $limit: 5 },
@@ -336,12 +417,19 @@ app.post("/challan", async (req, res) => {
     const challanCollection = db.collection('challans');
     const challan = req.body;
 
+    if (!challan.customerName) {
+      return res.status(400).send({ message: 'customerName is required' });
+    }
+
     if (challan.products && Array.isArray(challan.products)) {
+      if (challan.products.length > 100) {
+        return res.status(400).send({ message: 'Too many products (max 100)' });
+      }
       challan.products = challan.products.map(p => ({
         _id: new ObjectId().toString(),
-        productName: p.productName,
-        model: p.model,
-        quantity: Number(p.quantity)
+        productName: String(p.productName || '').slice(0, 200),
+        model: String(p.model || '').slice(0, 200),
+        quantity: Math.max(0, Number(p.quantity) || 0)
       }));
     }
 
@@ -373,7 +461,7 @@ app.get("/challans", async (req, res) => {
 
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
-    const search = req.query.search || "";
+    const search = escapeRegex((req.query.search || "").trim().slice(0, 100));
     let query = {};
 
     if (search) {
@@ -408,6 +496,11 @@ app.delete("/challan/:id", async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid ID' });
+    }
+
     const result = await challanCollection.deleteOne({ _id: new ObjectId(req.params.id) });
     res.send(result);
   } catch (err) {
@@ -420,6 +513,11 @@ app.patch('/challan/:id', async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid ID' });
+    }
+
     const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt } = req.body;
 
     const setDoc = { customerName, address, thana, district, receiverNumber, zone, currentUser };
@@ -444,13 +542,17 @@ app.put('/challan/:challanId/product/:productId', async (req, res) => {
     const { challanId, productId } = req.params;
     const { productName, model, quantity } = req.body;
 
+    if (!isValidObjectId(challanId)) {
+      return res.status(400).send({ message: 'Invalid challan ID' });
+    }
+
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(challanId), "products._id": productId },
       {
         $set: {
-          "products.$.productName": productName,
-          "products.$.model": model,
-          "products.$.quantity": Number(quantity)
+          "products.$.productName": String(productName || '').slice(0, 200),
+          "products.$.model": String(model || '').slice(0, 200),
+          "products.$.quantity": Math.max(0, Number(quantity) || 0)
         }
       }
     );
@@ -472,6 +574,10 @@ app.delete("/challans/:challanId/product/:productId", async (req, res) => {
     const challanCollection = db.collection('challans');
     const { challanId, productId } = req.params;
 
+    if (!isValidObjectId(challanId)) {
+      return res.status(400).send({ message: 'Invalid challan ID' });
+    }
+
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(challanId) },
       { $pull: { products: { _id: productId } } }
@@ -492,6 +598,11 @@ app.patch('/challans/:id', async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid ID' });
+    }
+
     const { customerName, receiverNumber, zone, address, thana, district, products } = req.body;
 
     const result = await challanCollection.updateOne(
@@ -516,8 +627,17 @@ app.post("/vendors", async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
+    const { vendorName, vendorImg, vendorAddress, vendorPhone } = req.body;
+
+    if (!vendorName) {
+      return res.status(400).send({ message: 'vendorName is required' });
+    }
+
     const result = await vendorsCollection.insertOne({
-      ...req.body,
+      vendorName: String(vendorName).slice(0, 200),
+      vendorImg: vendorImg || '',
+      vendorAddress: String(vendorAddress || '').slice(0, 500),
+      vendorPhone: String(vendorPhone || '').slice(0, 20),
       vehicles: [],
       createdAt: new Date(),
     });
@@ -544,7 +664,13 @@ app.get("/vendors/:id", async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid vendor ID' });
+    }
+
     const vendor = await vendorsCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!vendor) return res.status(404).send({ message: 'Vendor not found' });
     res.send(vendor);
   } catch (err) {
     console.error(err);
@@ -556,6 +682,11 @@ app.patch("/vendors/:id", async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid vendor ID' });
+    }
+
     const { vendorName, vendorImg, vendorAddress, vendorPhone } = req.body;
     const result = await vendorsCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
@@ -572,6 +703,11 @@ app.delete("/vendors/:id", async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
+
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).send({ message: 'Invalid vendor ID' });
+    }
+
     const result = await vendorsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
     res.send(result);
   } catch (err) {
@@ -587,8 +723,10 @@ app.get("/vehicles/search", async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
-    const search = req.query.search?.trim();
-    if (!search) return res.send([]);
+    const rawSearch = req.query.search?.trim();
+    if (!rawSearch) return res.send([]);
+
+    const search = escapeRegex(rawSearch.slice(0, 50));
 
     const result = await vendorsCollection.aggregate([
       { $unwind: "$vehicles" },
@@ -619,6 +757,10 @@ app.post("/vehicles", async (req, res) => {
     const vendorsCollection = db.collection('vendors');
     const { vendorId, ...vehicleData } = req.body;
 
+    if (!isValidObjectId(vendorId)) {
+      return res.status(400).send({ message: 'Invalid vendor ID' });
+    }
+
     const result = await vendorsCollection.updateOne(
       { _id: new ObjectId(vendorId) },
       {
@@ -645,6 +787,10 @@ app.delete("/vehicles/:vendorId/:vehicleId", async (req, res) => {
     const vendorsCollection = db.collection('vendors');
     const { vendorId, vehicleId } = req.params;
 
+    if (!isValidObjectId(vendorId) || !isValidObjectId(vehicleId)) {
+      return res.status(400).send({ message: 'Invalid ID' });
+    }
+
     const result = await vendorsCollection.updateOne(
       { _id: new ObjectId(vendorId) },
       { $pull: { vehicles: { _id: new ObjectId(vehicleId) } } }
@@ -667,6 +813,10 @@ app.put("/vehicles/:vendorId/:vehicleId", async (req, res) => {
     const vendorsCollection = db.collection('vendors');
     const { vendorId, vehicleId } = req.params;
     const updatedData = req.body;
+
+    if (!isValidObjectId(vendorId) || !isValidObjectId(vehicleId)) {
+      return res.status(400).send({ message: 'Invalid ID' });
+    }
 
     const result = await vendorsCollection.updateOne(
       { _id: new ObjectId(vendorId) },
@@ -705,6 +855,10 @@ app.post("/deliveries", async (req, res) => {
 
     if (!Array.isArray(deliveries) || deliveries.length === 0) {
       return res.status(400).send({ success: false, message: "No deliveries provided" });
+    }
+
+    if (deliveries.length > 200) {
+      return res.status(400).send({ success: false, message: "Too many deliveries (max 200)" });
     }
 
     const counter = await counterCollection.findOneAndUpdate(
@@ -780,6 +934,10 @@ app.patch("/deliveries/confirm", async (req, res) => {
     const deliveriesCollection = db.collection('deliveries');
     const { tripNumber, challanId, status, note, operator } = req.body;
 
+    if (!tripNumber || !challanId || !status) {
+      return res.status(400).send({ message: 'tripNumber, challanId, and status are required' });
+    }
+
     const result = await deliveriesCollection.updateOne(
       { tripNumber, "challans.challanId": String(challanId) },
       {
@@ -804,6 +962,10 @@ app.patch("/deliveries/challan-return", async (req, res) => {
     const deliveriesCollection = db.collection('deliveries');
     const { tripNumber, challanId, status, operator } = req.body;
 
+    if (!tripNumber || !challanId || !status) {
+      return res.status(400).send({ message: 'tripNumber, challanId, and status are required' });
+    }
+
     const result = await deliveriesCollection.updateOne(
       { tripNumber, "challans.challanId": String(challanId) },
       {
@@ -824,13 +986,11 @@ app.patch("/deliveries/challan-return", async (req, res) => {
 // ── Global Error Handler ───────────────────────────────────────────────────────
 
 app.use((err, req, res, next) => {
-  console.error("💥 Error:", err.stack);
+  console.error("💥 Unhandled Error:", err.message);
   res.status(500).send({ message: "Internal Server Error" });
 });
 
 // ── Start Server ───────────────────────────────────────────────────────────────
-// ✅ Local:  NODE_ENV সেট না থাকলে normally listen করবে → node server.js
-// ✅ Vercel: module.exports = app → serverless function হিসেবে চলবে
 
 if (process.env.NODE_ENV !== "production") {
   app.listen(port, () => {
