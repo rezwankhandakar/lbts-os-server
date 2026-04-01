@@ -1,23 +1,89 @@
 
 require("dotenv").config();
+
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET;
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ── Middleware ──────────────────────────────────────────────────────────────────
+
+const multer = require('multer');
+const FormData = require('form-data');
+const axios = require('axios');
+
+// multer — memory storage (file disk এ save হবে না)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // max 5MB
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only JPEG, PNG, WEBP allowed'));
+    }
+  }
+});
+
+
+const { body, param, query, validationResult } = require('express-validator');
+
+// ── Validation helper ──────────────────────────────────────────────
+const validate = (validations) => async (req, res, next) => {
+  await Promise.all(validations.map(v => v.run(req)));
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).send({
+      success: false,
+      message: 'Validation failed',
+      errors: errors.array().map(e => ({ field: e.path, message: e.msg }))
+    });
+  }
+  next();
+};
+
+// ── Rate Limiters ──────────────────────────────────────────────────
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  message: { success: false, message: 'Too many requests, please try again after 15 minutes' }
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  message: { success: false, message: 'Too many login attempts, please try again after 15 minutes' }
+});
+
+// ── CORS ───────────────────────────────────────────────────────────
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : ['http://localhost:5173'];
 
 app.use(cors({
-  origin: [
-    "http://localhost:5173",
-    "https://adorable-lolly-ea6038.netlify.app"
-  ],
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked: ${origin}`));
+    }
+  },
   credentials: true
 }));
 
 app.use(express.json());
+app.use(generalLimiter); // ← সব route এ apply
 
 // ── MongoDB (Vercel-safe singleton) ────────────────────────────────────────────
 // ✅ Vercel serverless-এ global variable module cache হয়
@@ -55,15 +121,104 @@ async function connectDB() {
   return db;
 }
 
+
+
+// ── JWT Verify Middleware ──────────────────────────────────────────
+function verifyToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).send({ message: 'Unauthorized: No token provided' });
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // { email, role, status }
+    next();
+  } catch (err) {
+    return res.status(401).send({ message: 'Unauthorized: Invalid or expired token' });
+  }
+}
+
+// Admin only middleware
+function verifyAdmin(req, res, next) {
+  if (req.user?.role !== 'admin' || req.user?.status !== 'approved') {
+    return res.status(403).send({ message: 'Forbidden: Admins only' });
+  }
+  next();
+}
+
 // ── Health Check ───────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
   res.send('LBTS-OS Server is running ✅');
 });
 
+
+// ── Image Upload ───────────────────────────────────────────────────
+app.post('/upload-image', verifyToken, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).send({ success: false, message: 'No image provided' });
+    }
+
+    const formData = new FormData();
+    formData.append('image', req.file.buffer.toString('base64'));
+
+    const response = await axios.post(
+      `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+      formData,
+      { headers: formData.getHeaders() }
+    );
+
+    res.send({
+      success: true,
+      url: response.data.data.url,
+    });
+  } catch (err) {
+    console.error('Image upload error:', err.message);
+    res.status(500).send({ success: false, message: 'Image upload failed' });
+  }
+});
+
+// ── JWT Token Issue ────────────────────────────────────────────────
+// Firebase login এর পরে frontend এ এই route call করবে
+app.post('/jwt',authLimiter, validate([
+    body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
+  ]), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const userCollection = db.collection('users');
+    const { email } = req.body;
+
+    if (!email) return res.status(400).send({ message: 'Email required' });
+
+    // DB থেকে role আর status নিয়ে token এ ভরছি
+    const user = await userCollection.findOne({ email });
+    const payload = {
+      email,
+      role: user?.role || 'user',
+      status: user?.status || 'pending',
+    };
+
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+    res.send({ token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: 'Token generation failed' });
+  }
+});
+
 // ── Users ──────────────────────────────────────────────────────────────────────
 
-app.post('/users', async (req, res) => {
+// ── Users ──────────────────────────────────────────────────────────────────────
+
+app.post('/users',authLimiter,validate([
+    body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
+    body('displayName').trim().notEmpty().withMessage('Name required'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -82,7 +237,7 @@ app.post('/users', async (req, res) => {
   }
 });
 
-app.get('/users', async (req, res) => {
+app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -94,7 +249,7 @@ app.get('/users', async (req, res) => {
   }
 });
 
-app.get('/users/:email/role', async (req, res) => {
+app.get('/users/:email/role', verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -107,7 +262,10 @@ app.get('/users/:email/role', async (req, res) => {
   }
 });
 
-app.patch('/users/role/:id', async (req, res) => {
+app.patch('/users/role/:id', verifyToken, verifyAdmin,validate([
+    param('id').isMongoId().withMessage('Invalid user ID'),
+    body('role').isIn(['admin', 'manager', 'operator', 'user']).withMessage('Invalid role'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -123,7 +281,10 @@ app.patch('/users/role/:id', async (req, res) => {
   }
 });
 
-app.patch('/users/status/:id', async (req, res) => {
+app.patch('/users/status/:id', verifyToken, verifyAdmin, validate([
+    param('id').isMongoId().withMessage('Invalid user ID'),
+    body('status').isIn(['approved', 'pending', 'rejected']).withMessage('Invalid status'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -139,7 +300,9 @@ app.patch('/users/status/:id', async (req, res) => {
   }
 });
 
-app.delete('/users/:id', async (req, res) => {
+app.delete('/users/:id', verifyToken, verifyAdmin,validate([
+    param('id').isMongoId().withMessage('Invalid user ID'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -157,7 +320,18 @@ app.delete('/users/:id', async (req, res) => {
 
 // ── Gate Pass ──────────────────────────────────────────────────────────────────
 
-app.post('/gate-pass', async (req, res) => {
+app.post('/gate-pass', verifyToken,validate([
+    body('tripDo').trim().notEmpty().withMessage('Trip Do required'),
+    body('tripDate').isISO8601().withMessage('Valid date required'),
+    body('customerName').trim().notEmpty().withMessage('Customer name required'),
+    body('csd').trim().notEmpty().withMessage('CSD required'),
+    body('vehicleNo').trim().notEmpty().withMessage('Vehicle number required'),
+    body('zone').trim().notEmpty().withMessage('Zone required'),
+    body('products').isArray({ min: 1 }).withMessage('At least one product required'),
+    body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
+    body('products.*.model').trim().notEmpty().withMessage('Model required'),
+    body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
@@ -184,7 +358,7 @@ app.post('/gate-pass', async (req, res) => {
   }
 });
 
-app.get("/gate-pass", async (req, res) => {
+app.get("/gate-pass", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
@@ -222,7 +396,11 @@ app.get("/gate-pass", async (req, res) => {
   }
 });
 
-app.patch('/gate-pass/:id', async (req, res) => {
+app.patch('/gate-pass/:id', verifyToken,validate([
+    param('id').isMongoId().withMessage('Invalid gate pass ID'),
+    body('customerName').trim().notEmpty().withMessage('Customer name required'),
+    body('tripDate').isISO8601().withMessage('Valid date required'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
@@ -247,7 +425,12 @@ app.patch('/gate-pass/:id', async (req, res) => {
   }
 });
 
-app.put('/gate-pass/:gatePassId/product/:productId', async (req, res) => {
+app.put('/gate-pass/:gatePassId/product/:productId', verifyToken,validate([
+    param('gatePassId').isMongoId().withMessage('Invalid gate pass ID'),
+    body('productName').trim().notEmpty().withMessage('Product name required'),
+    body('model').trim().notEmpty().withMessage('Model required'),
+    body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
@@ -276,7 +459,9 @@ app.put('/gate-pass/:gatePassId/product/:productId', async (req, res) => {
   }
 });
 
-app.delete('/gate-pass/:id', async (req, res) => {
+app.delete('/gate-pass/:id', verifyToken,validate([
+    param('id').isMongoId().withMessage('Invalid ID'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
@@ -292,7 +477,7 @@ app.delete('/gate-pass/:id', async (req, res) => {
 
 // ── Autocomplete ───────────────────────────────────────────────────────────────
 
-app.get("/autocomplete", async (req, res) => {
+app.get("/autocomplete", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
@@ -330,7 +515,16 @@ app.get("/autocomplete", async (req, res) => {
 
 // ── Challan ────────────────────────────────────────────────────────────────────
 
-app.post("/challan", async (req, res) => {
+app.post("/challan", verifyToken,validate([
+    body('customerName').trim().notEmpty().withMessage('Customer name required'),
+    body('address').trim().notEmpty().withMessage('Address required'),
+    body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
+    body('zone').trim().notEmpty().withMessage('Zone required'),
+    body('products').isArray({ min: 1 }).withMessage('At least one product required'),
+    body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
+    body('products.*.model').trim().notEmpty().withMessage('Model required'),
+    body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -354,7 +548,7 @@ app.post("/challan", async (req, res) => {
   }
 });
 
-app.get("/challan/recent", async (req, res) => {
+app.get("/challan/recent", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -366,7 +560,7 @@ app.get("/challan/recent", async (req, res) => {
   }
 });
 
-app.get("/challans", async (req, res) => {
+app.get("/challans", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -404,7 +598,9 @@ app.get("/challans", async (req, res) => {
   }
 });
 
-app.delete("/challan/:id", async (req, res) => {
+app.delete("/challan/:id", verifyToken,validate([
+    param('id').isMongoId().withMessage('Invalid ID'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -416,7 +612,11 @@ app.delete("/challan/:id", async (req, res) => {
   }
 });
 
-app.patch('/challan/:id', async (req, res) => {
+app.patch('/challan/:id', verifyToken,validate([
+    param('id').isMongoId().withMessage('Invalid challan ID'),
+    body('customerName').trim().notEmpty().withMessage('Customer name required'),
+    body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -437,7 +637,12 @@ app.patch('/challan/:id', async (req, res) => {
   }
 });
 
-app.put('/challan/:challanId/product/:productId', async (req, res) => {
+app.put('/challan/:challanId/product/:productId', verifyToken,validate([
+    param('challanId').isMongoId().withMessage('Invalid challan ID'),
+    body('productName').trim().notEmpty().withMessage('Product name required'),
+    body('model').trim().notEmpty().withMessage('Model required'),
+    body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -466,7 +671,7 @@ app.put('/challan/:challanId/product/:productId', async (req, res) => {
   }
 });
 
-app.delete("/challans/:challanId/product/:productId", async (req, res) => {
+app.delete("/challans/:challanId/product/:productId", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -488,7 +693,7 @@ app.delete("/challans/:challanId/product/:productId", async (req, res) => {
   }
 });
 
-app.patch('/challans/:id', async (req, res) => {
+app.patch('/challans/:id', verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -512,7 +717,11 @@ app.patch('/challans/:id', async (req, res) => {
 
 // ── Vendors ────────────────────────────────────────────────────────────────────
 
-app.post("/vendors", async (req, res) => {
+app.post("/vendors", verifyToken,validate([
+    body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
+    body('vendorPhone').trim().notEmpty().withMessage('Phone required'),
+    body('vendorAddress').trim().notEmpty().withMessage('Address required'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -528,7 +737,7 @@ app.post("/vendors", async (req, res) => {
   }
 });
 
-app.get("/vendors", async (req, res) => {
+app.get("/vendors", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -540,7 +749,7 @@ app.get("/vendors", async (req, res) => {
   }
 });
 
-app.get("/vendors/:id", async (req, res) => {
+app.get("/vendors/:id", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -552,7 +761,10 @@ app.get("/vendors/:id", async (req, res) => {
   }
 });
 
-app.patch("/vendors/:id", async (req, res) => {
+app.patch("/vendors/:id", verifyToken,validate([
+    param('id').isMongoId().withMessage('Invalid vendor ID'),
+    body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -568,7 +780,9 @@ app.patch("/vendors/:id", async (req, res) => {
   }
 });
 
-app.delete("/vendors/:id", async (req, res) => {
+app.delete("/vendors/:id", verifyToken, verifyAdmin,validate([
+    param('id').isMongoId().withMessage('Invalid ID'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -582,8 +796,7 @@ app.delete("/vendors/:id", async (req, res) => {
 
 // ── Vehicles ───────────────────────────────────────────────────────────────────
 
-// ✅ /vehicles/search — MUST be BEFORE /vehicles/:vendorId/:vehicleId
-app.get("/vehicles/search", async (req, res) => {
+app.get("/vehicles/search", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -613,7 +826,12 @@ app.get("/vehicles/search", async (req, res) => {
   }
 });
 
-app.post("/vehicles", async (req, res) => {
+app.post("/vehicles", verifyToken,validate([
+    body('vendorId').isMongoId().withMessage('Invalid vendor ID'),
+    body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
+    body('driverName').trim().notEmpty().withMessage('Driver name required'),
+    body('driverPhone').trim().notEmpty().withMessage('Driver phone required'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -639,7 +857,7 @@ app.post("/vehicles", async (req, res) => {
   }
 });
 
-app.delete("/vehicles/:vendorId/:vehicleId", async (req, res) => {
+app.delete("/vehicles/:vendorId/:vehicleId", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -661,7 +879,7 @@ app.delete("/vehicles/:vendorId/:vehicleId", async (req, res) => {
   }
 });
 
-app.put("/vehicles/:vendorId/:vehicleId", async (req, res) => {
+app.put("/vehicles/:vendorId/:vehicleId", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -694,7 +912,13 @@ app.put("/vehicles/:vendorId/:vehicleId", async (req, res) => {
 
 // ── Deliveries ─────────────────────────────────────────────────────────────────
 
-app.post("/deliveries", async (req, res) => {
+app.post("/deliveries", verifyToken,validate([
+    body().isArray({ min: 1 }).withMessage('At least one delivery required'),
+    body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
+    body('*.driverName').trim().notEmpty().withMessage('Driver name required'),
+    body('*.customerName').trim().notEmpty().withMessage('Customer name required'),
+    body('*.products').isArray({ min: 1 }).withMessage('Products required'),
+  ]), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -762,7 +986,7 @@ app.post("/deliveries", async (req, res) => {
   }
 });
 
-app.get("/deliveries", async (req, res) => {
+app.get("/deliveries", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -774,7 +998,7 @@ app.get("/deliveries", async (req, res) => {
   }
 });
 
-app.patch("/deliveries/confirm", async (req, res) => {
+app.patch("/deliveries/confirm", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -798,7 +1022,7 @@ app.patch("/deliveries/confirm", async (req, res) => {
   }
 });
 
-app.patch("/deliveries/challan-return", async (req, res) => {
+app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
