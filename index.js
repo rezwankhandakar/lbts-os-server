@@ -48,18 +48,18 @@ const validate = (validations) => async (req, res, next) => {
 };
 
 // ── Rate Limiters ──────────────────────────────────────────────────
-const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
-  message: { success: false, message: 'Too many requests, please try again after 15 minutes' }
-});
+// const generalLimiter = rateLimit({
+//   windowMs: 15 * 60 * 1000,
+//   max: 200,
+//   standardHeaders: true,
+//   legacyHeaders: false,
+//   validate: { xForwardedForHeader: false },
+//   message: { success: false, message: 'Too many requests, please try again after 15 minutes' }
+// });
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  max: 20,
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false },
@@ -83,42 +83,45 @@ app.use(cors({
 }));
 
 app.use(express.json());
-app.use(generalLimiter); // ← সব route এ apply
+// app.use(generalLimiter); // ← সব route এ apply
 
 // ── MongoDB (Vercel-safe singleton) ────────────────────────────────────────────
 // ✅ Vercel serverless-এ global variable module cache হয়
 //    তাই client একবার তৈরি হলে পরের request-এ আর নতুন connection হয় না
 
+// ── MongoDB ────────────────────────────────────────────────────────
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
-let client;
-let db;
+// ✅ getClient() এবং পুরনো let client; let db; সব সরিয়ে এটা দাও
+let cachedClient = null;
+let cachedDb = null;
 
-function getClient() {
-  if (!client) {
-    client = new MongoClient(uri, {
-      serverApi: {
-        version: ServerApiVersion.v1,
-        strict: true,
-        deprecationErrors: true,
-      },
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-    });
-  }
-  return client;
-}
-
-// ✅ connectDB() প্রতিটি route-এ call হবে
-//    কিন্তু db একবার তৈরি হলে আর reconnect হবে না
 async function connectDB() {
-  if (db) return db;
-  const c = getClient();
-  await c.connect();
-  db = c.db('LBTS-OS-DB');
+  if (cachedDb) return cachedDb;
+
+  if (cachedClient) {
+    cachedDb = cachedClient.db('LBTS-OS-DB');
+    return cachedDb;
+  }
+
+  cachedClient = new MongoClient(uri, {
+    serverApi: {
+      version: ServerApiVersion.v1,
+      strict: true,
+      deprecationErrors: true,
+    },
+    maxPoolSize: 10,
+    minPoolSize: 1,
+    maxIdleTimeMS: 30000,
+    serverSelectionTimeoutMS: 10000,
+    socketTimeoutMS: 45000,
+    connectTimeoutMS: 10000,
+  });
+
+  await cachedClient.connect();
+  cachedDb = cachedClient.db('LBTS-OS-DB');
   console.log("✅ MongoDB Connected");
-  return db;
+  return cachedDb;
 }
 
 
@@ -358,6 +361,44 @@ app.post('/gate-pass', verifyToken,validate([
   }
 });
 
+// app.get("/gate-pass", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const gatePassCollection = db.collection('gate-pass');
+
+//     let month = parseInt(req.query.month);
+//     let year = parseInt(req.query.year);
+//     const search = req.query.search || "";
+//     let query = {};
+
+//     if (search) {
+//       query.$or = [
+//         { tripDo: { $regex: search, $options: "i" } },
+//         { customerName: { $regex: search, $options: "i" } },
+//         { csd: { $regex: search, $options: "i" } },
+//         { vehicleNo: { $regex: search, $options: "i" } },
+//         { zone: { $regex: search, $options: "i" } },
+//         { "products.productName": { $regex: search, $options: "i" } },
+//         { "products.model": { $regex: search, $options: "i" } },
+//       ];
+//     } else {
+//       if (!month || !year) {
+//         const now = new Date();
+//         month = now.getMonth() + 1;
+//         year = now.getFullYear();
+//       }
+//       query.tripMonth = month;
+//       query.tripYear = year;
+//     }
+
+//     const data = await gatePassCollection.find(query).sort({ createdAt: -1 }).toArray();
+//     res.send({ data });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to fetch gate passes" });
+//   }
+// });
+
 app.get("/gate-pass", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -366,6 +407,12 @@ app.get("/gate-pass", verifyToken, async (req, res) => {
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     const search = req.query.search || "";
+
+    // ── Pagination params ──────────────────────────────────────────
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const skip = (page - 1) * limit;
+
     let query = {};
 
     if (search) {
@@ -388,8 +435,23 @@ app.get("/gate-pass", verifyToken, async (req, res) => {
       query.tripYear = year;
     }
 
-    const data = await gatePassCollection.find(query).sort({ createdAt: -1 }).toArray();
-    res.send({ data });
+    // ── total count আর data একসাথে fetch ──────────────────────────
+    const [data, total] = await Promise.all([
+      gatePassCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      gatePassCollection.countDocuments(query),
+    ]);
+
+    res.send({
+      data,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+        hasNextPage: page < Math.ceil(total / limit),
+        hasPrevPage: page > 1,
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).send({ message: "Failed to fetch gate passes" });
@@ -560,6 +622,44 @@ app.get("/challan/recent", verifyToken, async (req, res) => {
   }
 });
 
+// app.get("/challans", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+
+//     let month = parseInt(req.query.month);
+//     let year = parseInt(req.query.year);
+//     const search = req.query.search || "";
+//     let query = {};
+
+//     if (search) {
+//       query.$or = [
+//         { customerName: { $regex: search, $options: "i" } },
+//         { address: { $regex: search, $options: "i" } },
+//         { receiverNumber: { $regex: search, $options: "i" } },
+//         { zone: { $regex: search, $options: "i" } },
+//         { "products.productName": { $regex: search, $options: "i" } },
+//         { "products.model": { $regex: search, $options: "i" } },
+//       ];
+//     } else {
+//       if (!month || !year) {
+//         const now = new Date();
+//         month = now.getMonth() + 1;
+//         year = now.getFullYear();
+//       }
+//       const startDate = new Date(year, month - 1, 1);
+//       const endDate = new Date(year, month, 0, 23, 59, 59);
+//       query.createdAt = { $gte: startDate, $lte: endDate };
+//     }
+
+//     const data = await challanCollection.find(query).sort({ createdAt: -1 }).toArray();
+//     res.send({ data });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to fetch challans" });
+//   }
+// });
+
 app.get("/challans", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -568,6 +668,12 @@ app.get("/challans", verifyToken, async (req, res) => {
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     const search = req.query.search || "";
+
+    // ── Pagination params ──────────────────────────────────────────
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const skip = (page - 1) * limit;
+
     let query = {};
 
     if (search) {
@@ -590,8 +696,22 @@ app.get("/challans", verifyToken, async (req, res) => {
       query.createdAt = { $gte: startDate, $lte: endDate };
     }
 
-    const data = await challanCollection.find(query).sort({ createdAt: -1 }).toArray();
-    res.send({ data });
+    const [data, total] = await Promise.all([
+      challanCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      challanCollection.countDocuments(query),
+    ]);
+
+    res.send({
+      data,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+        hasNextPage: page < Math.ceil(total / limit),
+        hasPrevPage: page > 1,
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).send({ message: "Failed to fetch challans" });
@@ -912,13 +1032,13 @@ app.put("/vehicles/:vendorId/:vehicleId", verifyToken, async (req, res) => {
 
 // ── Deliveries ─────────────────────────────────────────────────────────────────
 
-app.post("/deliveries", verifyToken,validate([
-    body().isArray({ min: 1 }).withMessage('At least one delivery required'),
-    body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
-    body('*.driverName').trim().notEmpty().withMessage('Driver name required'),
-    body('*.customerName').trim().notEmpty().withMessage('Customer name required'),
-    body('*.products').isArray({ min: 1 }).withMessage('Products required'),
-  ]), async (req, res) => {
+app.post("/deliveries", verifyToken, validate([
+  body().isArray({ min: 1 }).withMessage('At least one delivery required'),
+  body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
+  body('*.driverName').trim().notEmpty().withMessage('Driver name required'),
+  body('*.customerName').trim().notEmpty().withMessage('Customer name required'),
+  body('*.products').isArray({ min: 1 }).withMessage('Products required'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -931,58 +1051,80 @@ app.post("/deliveries", verifyToken,validate([
       return res.status(400).send({ success: false, message: "No deliveries provided" });
     }
 
-    const counter = await counterCollection.findOneAndUpdate(
-      { _id: "tripNumber" },
-      { $inc: { seq: 1 } },
-      { upsert: true, returnDocument: "after" }
-    );
+    // ✅ Transaction শুরু
+    const session = cachedClient.startSession();
+    let tripNumber;
+    let result;
 
-    const seq = counter?.seq ?? counter?.value?.seq ?? 1;
-    const tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
+    try {
+      await session.withTransaction(async () => {
 
-    const challanIds = deliveries.map(d =>
-      typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-    );
+        // ✅ Atomic counter — transaction এর ভেতরে
+        const counter = await counterCollection.findOneAndUpdate(
+          { _id: "tripNumber" },
+          { $inc: { seq: 1 } },
+          { upsert: true, returnDocument: "after", session }
+        );
 
-    const tripDocument = {
-      tripNumber,
-      vehicleNumber: deliveries[0].vehicleNumber,
-      vendorName: deliveries[0].vendorName,
-      vendorNumber: deliveries[0].vendorNumber,
-      driverName: deliveries[0].driverName,
-      driverNumber: deliveries[0].driverNumber,
-      createdBy: deliveries[0].createdBy || "unknown",
-      totalChallan: deliveries.length,
-      challans: deliveries.map(d => ({
-        challanId: d.challanId,
-        customerName: d.customerName,
-        zone: d.zone,
-        address: d.address,
-        thana: d.thana,
-        district: d.district,
-        receiverNumber: d.receiverNumber,
-        products: d.products
-      })),
-      createdAt: new Date()
-    };
+        const seq = counter?.seq ?? counter?.value?.seq ?? 1;
+        tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
 
-    const result = await deliveriesCollection.insertOne(tripDocument);
+        const challanIds = deliveries.map(d =>
+          typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+        );
 
-    const updateResult = await challanCollection.updateMany(
-      { _id: { $in: challanIds } },
-      { $set: { status: "delivered", tripNumber } }
-    );
+        const tripDocument = {
+          tripNumber,
+          vehicleNumber: deliveries[0].vehicleNumber,
+          vendorName: deliveries[0].vendorName,
+          vendorNumber: deliveries[0].vendorNumber,
+          driverName: deliveries[0].driverName,
+          driverNumber: deliveries[0].driverNumber,
+          createdBy: deliveries[0].createdBy || "unknown",
+          totalChallan: deliveries.length,
+          challans: deliveries.map(d => ({
+            challanId: d.challanId,
+            customerName: d.customerName,
+            zone: d.zone,
+            address: d.address,
+            thana: d.thana,
+            district: d.district,
+            receiverNumber: d.receiverNumber,
+            products: d.products
+          })),
+          createdAt: new Date()
+        };
 
-    res.send({
-      success: true,
-      insertedId: result.insertedId,
-      updatedCount: updateResult.modifiedCount,
-      tripNumber,
-      totalChallan: deliveries.length
-    });
+        // ✅ Insert আর update দুটোই transaction এ
+        result = await deliveriesCollection.insertOne(tripDocument, { session });
+
+        await challanCollection.updateMany(
+          { _id: { $in: challanIds } },
+          { $set: { status: "delivered", tripNumber } },
+          { session }
+        );
+
+      });
+
+      res.send({
+        success: true,
+        insertedId: result.insertedId,
+        tripNumber,
+        totalChallan: deliveries.length
+      });
+
+    } finally {
+      // ✅ Session সবসময় end করো
+      await session.endSession();
+    }
+
   } catch (err) {
     console.error("Delivery Error:", err);
-    res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
+    res.status(500).send({
+      success: false,
+      message: "Delivery failed",
+      error: err.message
+    });
   }
 });
 
@@ -990,8 +1132,53 @@ app.get("/deliveries", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
-    const deliveries = await deliveriesCollection.find().sort({ createdAt: -1 }).toArray();
-    res.send({ success: true, data: deliveries });
+
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    const search = req.query.search || "";
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const skip = (page - 1) * limit;
+
+    let query = {};
+
+    if (search) {
+      query.$or = [
+        { tripNumber: { $regex: search, $options: "i" } },
+        { vendorName: { $regex: search, $options: "i" } },
+        { driverName: { $regex: search, $options: "i" } },
+        { vehicleNumber: { $regex: search, $options: "i" } },
+        { "challans.customerName": { $regex: search, $options: "i" } },
+        { "challans.zone": { $regex: search, $options: "i" } },
+      ];
+    } else {
+      if (!month || !year) {
+        const now = new Date();
+        month = now.getMonth() + 1;
+        year = now.getFullYear();
+      }
+      const startDate = new Date(year, month - 1, 1);
+      const endDate = new Date(year, month, 0, 23, 59, 59, 999);
+      query.createdAt = { $gte: startDate, $lte: endDate };
+    }
+
+    const [data, total] = await Promise.all([
+      deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      deliveriesCollection.countDocuments(query),
+    ]);
+
+    res.send({
+      success: true,
+      data,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+        hasNextPage: page < Math.ceil(total / limit),
+        hasPrevPage: page > 1,
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).send({ success: false, message: "Failed to fetch deliveries" });
