@@ -11,15 +11,14 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const app = express();
 const port = process.env.PORT || 3000;
 
-
 const multer = require('multer');
 const FormData = require('form-data');
 const axios = require('axios');
+const helmet = require('helmet');
 
-// multer — memory storage (file disk এ save হবে না)
-const upload = multer({
+const multerUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // max 5MB
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'image/webp'];
     if (allowed.includes(file.mimetype)) {
@@ -30,10 +29,8 @@ const upload = multer({
   }
 });
 
-
 const { body, param, query, validationResult } = require('express-validator');
 
-// ── Validation helper ──────────────────────────────────────────────
 const validate = (validations) => async (req, res, next) => {
   await Promise.all(validations.map(v => v.run(req)));
   const errors = validationResult(req);
@@ -47,16 +44,23 @@ const validate = (validations) => async (req, res, next) => {
   next();
 };
 
-// ── Rate Limiters ──────────────────────────────────────────────────
-// const generalLimiter = rateLimit({
-//   windowMs: 15 * 60 * 1000,
-//   max: 200,
-//   standardHeaders: true,
-//   legacyHeaders: false,
-//   validate: { xForwardedForHeader: false },
-//   message: { success: false, message: 'Too many requests, please try again after 15 minutes' }
-// });
+// ── Simple Logger ──────────────────────────────────────────────────
+const logger = {
+  info: (msg, data = {}) => console.log(JSON.stringify({
+    level: "info", msg, ...data, time: new Date().toISOString()
+  })),
+  error: (msg, err = {}) => console.error(JSON.stringify({
+    level: "error", msg,
+    error: err?.message || String(err),
+    stack: err?.stack,
+    time: new Date().toISOString()
+  })),
+  warn: (msg, data = {}) => console.warn(JSON.stringify({
+    level: "warn", msg, ...data, time: new Date().toISOString()
+  })),
+};
 
+// ── Rate Limiters ──────────────────────────────────────────────────
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -82,17 +86,16 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json());
-// app.use(generalLimiter); // ← সব route এ apply
+// ── Security Headers ───────────────────────────────────────────────
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }, // imgbb image load এর জন্য
+}));
 
-// ── MongoDB (Vercel-safe singleton) ────────────────────────────────────────────
-// ✅ Vercel serverless-এ global variable module cache হয়
-//    তাই client একবার তৈরি হলে পরের request-এ আর নতুন connection হয় না
+app.use(express.json());
 
 // ── MongoDB ────────────────────────────────────────────────────────
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
-// ✅ getClient() এবং পুরনো let client; let db; সব সরিয়ে এটা দাও
 let cachedClient = null;
 let cachedDb = null;
 
@@ -120,11 +123,9 @@ async function connectDB() {
 
   await cachedClient.connect();
   cachedDb = cachedClient.db('LBTS-OS-DB');
-  console.log("✅ MongoDB Connected");
+  logger.info("MongoDB Connected");
   return cachedDb;
 }
-
-
 
 // ── JWT Verify Middleware ──────────────────────────────────────────
 function verifyToken(req, res, next) {
@@ -138,14 +139,14 @@ function verifyToken(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded; // { email, role, status }
+    req.user = decoded;
     next();
   } catch (err) {
     return res.status(401).send({ message: 'Unauthorized: Invalid or expired token' });
   }
 }
 
-// Admin only middleware
+// ── Admin only middleware ──────────────────────────────────────────
 function verifyAdmin(req, res, next) {
   if (req.user?.role !== 'admin' || req.user?.status !== 'approved') {
     return res.status(403).send({ message: 'Forbidden: Admins only' });
@@ -153,15 +154,32 @@ function verifyAdmin(req, res, next) {
   next();
 }
 
-// ── Health Check ───────────────────────────────────────────────────────────────
 
+// ── ObjectId Validation Helper ─────────────────────────────────────
+function isValidObjectId(id) {
+  return ObjectId.isValid(id) && String(new ObjectId(id)) === id;
+}
+
+function validateObjectId(paramName = 'id') {
+  return (req, res, next) => {
+    const id = req.params[paramName];
+    if (!isValidObjectId(id)) {
+      return res.status(400).send({
+        success: false,
+        message: `Invalid ID format: ${paramName}`
+      });
+    }
+    next();
+  };
+}
+
+// ── Health Check ───────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.send('LBTS-OS Server is running ✅');
 });
 
-
 // ── Image Upload ───────────────────────────────────────────────────
-app.post('/upload-image', verifyToken, upload.single('image'), async (req, res) => {
+app.post('/upload-image', verifyToken, multerUpload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).send({ success: false, message: 'No image provided' });
@@ -176,21 +194,17 @@ app.post('/upload-image', verifyToken, upload.single('image'), async (req, res) 
       { headers: formData.getHeaders() }
     );
 
-    res.send({
-      success: true,
-      url: response.data.data.url,
-    });
+    res.send({ success: true, url: response.data.data.url });
   } catch (err) {
-    console.error('Image upload error:', err.message);
+    logger.error("Image upload failed", err);
     res.status(500).send({ success: false, message: 'Image upload failed' });
   }
 });
 
 // ── JWT Token Issue ────────────────────────────────────────────────
-// Firebase login এর পরে frontend এ এই route call করবে
-app.post('/jwt',authLimiter, validate([
-    body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
-  ]), async (req, res) => {
+app.post('/jwt', authLimiter, validate([
+  body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -198,7 +212,6 @@ app.post('/jwt',authLimiter, validate([
 
     if (!email) return res.status(400).send({ message: 'Email required' });
 
-    // DB থেকে role আর status নিয়ে token এ ভরছি
     const user = await userCollection.findOne({ email });
     const payload = {
       email,
@@ -209,7 +222,7 @@ app.post('/jwt',authLimiter, validate([
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
     res.send({ token });
   } catch (err) {
-    console.error(err);
+    logger.error("Token generation failed", err);
     res.status(500).send({ message: 'Token generation failed' });
   }
 });
@@ -218,18 +231,16 @@ app.post('/jwt',authLimiter, validate([
 
 // ── Users ──────────────────────────────────────────────────────────────────────
 
-app.post('/users',authLimiter,validate([
-    body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
-    body('displayName').trim().notEmpty().withMessage('Name required'),
-  ]), async (req, res) => {
+app.post('/users', authLimiter, validate([
+  body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
+  body('displayName').trim().notEmpty().withMessage('Name required'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
-
     const user = req.body;
     const exists = await userCollection.findOne({ email: user.email });
     if (exists) return res.send({ message: 'User already exists' });
-
     user.role = 'user';
     user.status = 'pending';
     const result = await userCollection.insertOne(user);
@@ -265,10 +276,10 @@ app.get('/users/:email/role', verifyToken, async (req, res) => {
   }
 });
 
-app.patch('/users/role/:id', verifyToken, verifyAdmin,validate([
-    param('id').isMongoId().withMessage('Invalid user ID'),
-    body('role').isIn(['admin', 'manager', 'operator', 'user']).withMessage('Invalid role'),
-  ]), async (req, res) => {
+app.patch('/users/role/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid user ID'),
+  body('role').isIn(['admin', 'manager', 'operator', 'user']).withMessage('Invalid role'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -284,10 +295,10 @@ app.patch('/users/role/:id', verifyToken, verifyAdmin,validate([
   }
 });
 
-app.patch('/users/status/:id', verifyToken, verifyAdmin, validate([
-    param('id').isMongoId().withMessage('Invalid user ID'),
-    body('status').isIn(['approved', 'pending', 'rejected']).withMessage('Invalid status'),
-  ]), async (req, res) => {
+app.patch('/users/status/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid user ID'),
+  body('status').isIn(['approved', 'pending', 'rejected']).withMessage('Invalid status'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -303,9 +314,9 @@ app.patch('/users/status/:id', verifyToken, verifyAdmin, validate([
   }
 });
 
-app.delete('/users/:id', verifyToken, verifyAdmin,validate([
-    param('id').isMongoId().withMessage('Invalid user ID'),
-  ]), async (req, res) => {
+app.delete('/users/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid user ID'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
@@ -323,23 +334,22 @@ app.delete('/users/:id', verifyToken, verifyAdmin,validate([
 
 // ── Gate Pass ──────────────────────────────────────────────────────────────────
 
-app.post('/gate-pass', verifyToken,validate([
-    body('tripDo').trim().notEmpty().withMessage('Trip Do required'),
-    body('tripDate').isISO8601().withMessage('Valid date required'),
-    body('customerName').trim().notEmpty().withMessage('Customer name required'),
-    body('csd').trim().notEmpty().withMessage('CSD required'),
-    body('vehicleNo').trim().notEmpty().withMessage('Vehicle number required'),
-    body('zone').trim().notEmpty().withMessage('Zone required'),
-    body('products').isArray({ min: 1 }).withMessage('At least one product required'),
-    body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
-    body('products.*.model').trim().notEmpty().withMessage('Model required'),
-    body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
-  ]), async (req, res) => {
+app.post('/gate-pass', verifyToken, validate([
+  body('tripDo').trim().notEmpty().withMessage('Trip Do required'),
+  body('tripDate').isISO8601().withMessage('Valid date required'),
+  body('customerName').trim().notEmpty().withMessage('Customer name required'),
+  body('csd').trim().notEmpty().withMessage('CSD required'),
+  body('vehicleNo').trim().notEmpty().withMessage('Vehicle number required'),
+  body('zone').trim().notEmpty().withMessage('Zone required'),
+  body('products').isArray({ min: 1 }).withMessage('At least one product required'),
+  body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
+  body('products.*.model').trim().notEmpty().withMessage('Model required'),
+  body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
     const gatePass = req.body;
-
     if (gatePass.products && Array.isArray(gatePass.products)) {
       gatePass.products = gatePass.products.map(p => ({
         _id: new ObjectId().toString(),
@@ -348,11 +358,9 @@ app.post('/gate-pass', verifyToken,validate([
         quantity: Number(p.quantity)
       }));
     }
-
     gatePass.createdAt = new Date();
     gatePass.tripMonth = new Date(gatePass.tripDate).getMonth() + 1;
     gatePass.tripYear = new Date(gatePass.tripDate).getFullYear();
-
     const result = await gatePassCollection.insertOne(gatePass);
     res.send(result);
   } catch (err) {
@@ -361,60 +369,17 @@ app.post('/gate-pass', verifyToken,validate([
   }
 });
 
-// app.get("/gate-pass", verifyToken, async (req, res) => {
-//   try {
-//     const db = await connectDB();
-//     const gatePassCollection = db.collection('gate-pass');
-
-//     let month = parseInt(req.query.month);
-//     let year = parseInt(req.query.year);
-//     const search = req.query.search || "";
-//     let query = {};
-
-//     if (search) {
-//       query.$or = [
-//         { tripDo: { $regex: search, $options: "i" } },
-//         { customerName: { $regex: search, $options: "i" } },
-//         { csd: { $regex: search, $options: "i" } },
-//         { vehicleNo: { $regex: search, $options: "i" } },
-//         { zone: { $regex: search, $options: "i" } },
-//         { "products.productName": { $regex: search, $options: "i" } },
-//         { "products.model": { $regex: search, $options: "i" } },
-//       ];
-//     } else {
-//       if (!month || !year) {
-//         const now = new Date();
-//         month = now.getMonth() + 1;
-//         year = now.getFullYear();
-//       }
-//       query.tripMonth = month;
-//       query.tripYear = year;
-//     }
-
-//     const data = await gatePassCollection.find(query).sort({ createdAt: -1 }).toArray();
-//     res.send({ data });
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).send({ message: "Failed to fetch gate passes" });
-//   }
-// });
-
 app.get("/gate-pass", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
-
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     const search = req.query.search || "";
-
-    // ── Pagination params ──────────────────────────────────────────
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
-
     let query = {};
-
     if (search) {
       query.$or = [
         { tripDo: { $regex: search, $options: "i" } },
@@ -434,19 +399,14 @@ app.get("/gate-pass", verifyToken, async (req, res) => {
       query.tripMonth = month;
       query.tripYear = year;
     }
-
-    // ── total count আর data একসাথে fetch ──────────────────────────
     const [data, total] = await Promise.all([
       gatePassCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
       gatePassCollection.countDocuments(query),
     ]);
-
     res.send({
       data,
       pagination: {
-        total,
-        page,
-        limit,
+        total, page, limit,
         totalPages: Math.ceil(total / limit),
         hasNextPage: page < Math.ceil(total / limit),
         hasPrevPage: page > 1,
@@ -458,16 +418,15 @@ app.get("/gate-pass", verifyToken, async (req, res) => {
   }
 });
 
-app.patch('/gate-pass/:id', verifyToken,validate([
-    param('id').isMongoId().withMessage('Invalid gate pass ID'),
-    body('customerName').trim().notEmpty().withMessage('Customer name required'),
-    body('tripDate').isISO8601().withMessage('Valid date required'),
-  ]), async (req, res) => {
+app.patch('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid gate pass ID'),
+  body('customerName').trim().notEmpty().withMessage('Customer name required'),
+  body('tripDate').isISO8601().withMessage('Valid date required'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
     const { tripDo, tripDate, customerName, csd, unit, vehicleNo, zone, currentUser } = req.body;
-
     await gatePassCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
       {
@@ -478,7 +437,6 @@ app.patch('/gate-pass/:id', verifyToken,validate([
         }
       }
     );
-
     const updatedGatePass = await gatePassCollection.findOne({ _id: new ObjectId(req.params.id) });
     res.send({ success: true, data: updatedGatePass });
   } catch (err) {
@@ -487,18 +445,17 @@ app.patch('/gate-pass/:id', verifyToken,validate([
   }
 });
 
-app.put('/gate-pass/:gatePassId/product/:productId', verifyToken,validate([
-    param('gatePassId').isMongoId().withMessage('Invalid gate pass ID'),
-    body('productName').trim().notEmpty().withMessage('Product name required'),
-    body('model').trim().notEmpty().withMessage('Model required'),
-    body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
-  ]), async (req, res) => {
+app.put('/gate-pass/:gatePassId/product/:productId', verifyToken, validateObjectId('gatePassId'), validate([
+  param('gatePassId').isMongoId().withMessage('Invalid gate pass ID'),
+  body('productName').trim().notEmpty().withMessage('Product name required'),
+  body('model').trim().notEmpty().withMessage('Model required'),
+  body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
     const { gatePassId, productId } = req.params;
     const { productName, model, quantity } = req.body;
-
     const result = await gatePassCollection.updateOne(
       { _id: new ObjectId(gatePassId), "products._id": productId },
       {
@@ -509,10 +466,8 @@ app.put('/gate-pass/:gatePassId/product/:productId', verifyToken,validate([
         }
       }
     );
-
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Product not found" });
-
     const updatedGatePass = await gatePassCollection.findOne({ _id: new ObjectId(gatePassId) });
     res.send({ success: true, data: updatedGatePass });
   } catch (err) {
@@ -521,9 +476,9 @@ app.put('/gate-pass/:gatePassId/product/:productId', verifyToken,validate([
   }
 });
 
-app.delete('/gate-pass/:id', verifyToken,validate([
-    param('id').isMongoId().withMessage('Invalid ID'),
-  ]), async (req, res) => {
+app.delete('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid ID'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
@@ -544,12 +499,9 @@ app.get("/autocomplete", verifyToken, async (req, res) => {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
     const challanCollection = db.collection('challans');
-
     const { field, search, collection } = req.query;
     const targetCollection = collection === "challan" ? challanCollection : gatePassCollection;
-
     let pipeline = [];
-
     if (field === "productName" || field === "model") {
       pipeline = [
         { $unwind: "$products" },
@@ -566,7 +518,6 @@ app.get("/autocomplete", verifyToken, async (req, res) => {
         { $limit: 5 },
       ];
     }
-
     const result = await targetCollection.aggregate(pipeline).toArray();
     res.send(result);
   } catch (err) {
@@ -577,21 +528,20 @@ app.get("/autocomplete", verifyToken, async (req, res) => {
 
 // ── Challan ────────────────────────────────────────────────────────────────────
 
-app.post("/challan", verifyToken,validate([
-    body('customerName').trim().notEmpty().withMessage('Customer name required'),
-    body('address').trim().notEmpty().withMessage('Address required'),
-    body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
-    body('zone').trim().notEmpty().withMessage('Zone required'),
-    body('products').isArray({ min: 1 }).withMessage('At least one product required'),
-    body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
-    body('products.*.model').trim().notEmpty().withMessage('Model required'),
-    body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
-  ]), async (req, res) => {
+app.post("/challan", verifyToken, validate([
+  body('customerName').trim().notEmpty().withMessage('Customer name required'),
+  body('address').trim().notEmpty().withMessage('Address required'),
+  body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
+  body('zone').trim().notEmpty().withMessage('Zone required'),
+  body('products').isArray({ min: 1 }).withMessage('At least one product required'),
+  body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
+  body('products.*.model').trim().notEmpty().withMessage('Model required'),
+  body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const challan = req.body;
-
     if (challan.products && Array.isArray(challan.products)) {
       challan.products = challan.products.map(p => ({
         _id: new ObjectId().toString(),
@@ -600,7 +550,6 @@ app.post("/challan", verifyToken,validate([
         quantity: Number(p.quantity)
       }));
     }
-
     challan.createdAt = new Date();
     const result = await challanCollection.insertOne(challan);
     res.send(result);
@@ -622,60 +571,28 @@ app.get("/challan/recent", verifyToken, async (req, res) => {
   }
 });
 
-// app.get("/challans", verifyToken, async (req, res) => {
-//   try {
-//     const db = await connectDB();
-//     const challanCollection = db.collection('challans');
-
-//     let month = parseInt(req.query.month);
-//     let year = parseInt(req.query.year);
-//     const search = req.query.search || "";
-//     let query = {};
-
-//     if (search) {
-//       query.$or = [
-//         { customerName: { $regex: search, $options: "i" } },
-//         { address: { $regex: search, $options: "i" } },
-//         { receiverNumber: { $regex: search, $options: "i" } },
-//         { zone: { $regex: search, $options: "i" } },
-//         { "products.productName": { $regex: search, $options: "i" } },
-//         { "products.model": { $regex: search, $options: "i" } },
-//       ];
-//     } else {
-//       if (!month || !year) {
-//         const now = new Date();
-//         month = now.getMonth() + 1;
-//         year = now.getFullYear();
-//       }
-//       const startDate = new Date(year, month - 1, 1);
-//       const endDate = new Date(year, month, 0, 23, 59, 59);
-//       query.createdAt = { $gte: startDate, $lte: endDate };
-//     }
-
-//     const data = await challanCollection.find(query).sort({ createdAt: -1 }).toArray();
-//     res.send({ data });
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).send({ message: "Failed to fetch challans" });
-//   }
-// });
-
 app.get("/challans", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
-
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     const search = req.query.search || "";
-
-    // ── Pagination params ──────────────────────────────────────────
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
 
-    let query = {};
+    // ── Server-side column filters ─────────────────────────────────
+    const customerFilter = req.query.customer || "";
+    const zoneFilter = req.query.zone || "";
+    const districtFilter = req.query.district || "";
+    const thanaFilter = req.query.thana || "";
+    const receiverFilter = req.query.receiver || "";
+    const modelFilter = req.query.model || "";
+    const productNameFilter = req.query.productName || "";
+    const dateFilter = req.query.date || "";
 
+    let query = {};
     if (search) {
       query.$or = [
         { customerName: { $regex: search, $options: "i" } },
@@ -695,18 +612,28 @@ app.get("/challans", verifyToken, async (req, res) => {
       const endDate = new Date(year, month, 0, 23, 59, 59);
       query.createdAt = { $gte: startDate, $lte: endDate };
     }
+    if (customerFilter) query.customerName = { $regex: customerFilter, $options: "i" };
+    if (zoneFilter) query.zone = { $regex: zoneFilter, $options: "i" };
+    if (districtFilter) query.district = { $regex: districtFilter, $options: "i" };
+    if (thanaFilter) query.thana = { $regex: thanaFilter, $options: "i" };
+    if (receiverFilter) query.receiverNumber = { $regex: receiverFilter, $options: "i" };
+    if (modelFilter) query["products.model"] = { $regex: modelFilter, $options: "i" };
+    if (productNameFilter) query["products.productName"] = { $regex: productNameFilter, $options: "i" };
+    if (dateFilter) {
+      const filterDate = new Date(dateFilter);
+      const nextDay = new Date(dateFilter);
+      nextDay.setDate(nextDay.getDate() + 1);
+      query.createdAt = { $gte: filterDate, $lt: nextDay };
+    }
 
     const [data, total] = await Promise.all([
       challanCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
       challanCollection.countDocuments(query),
     ]);
-
     res.send({
       data,
       pagination: {
-        total,
-        page,
-        limit,
+        total, page, limit,
         totalPages: Math.ceil(total / limit),
         hasNextPage: page < Math.ceil(total / limit),
         hasPrevPage: page > 1,
@@ -718,9 +645,61 @@ app.get("/challans", verifyToken, async (req, res) => {
   }
 });
 
-app.delete("/challan/:id", verifyToken,validate([
-    param('id').isMongoId().withMessage('Invalid ID'),
-  ]), async (req, res) => {
+app.get("/challans/filter-options", verifyToken, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const challanCollection = db.collection('challans');
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    if (!month || !year) {
+      const now = new Date();
+      month = now.getMonth() + 1;
+      year = now.getFullYear();
+    }
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0, 23, 59, 59);
+    const baseQuery = { createdAt: { $gte: startDate, $lte: endDate } };
+    const [result] = await challanCollection.aggregate([
+      { $match: baseQuery },
+      { $unwind: "$products" },
+      {
+        $group: {
+          _id: null,
+          customerNames: { $addToSet: "$customerName" },
+          zones: { $addToSet: "$zone" },
+          districts: { $addToSet: "$district" },
+          thanas: { $addToSet: "$thana" },
+          receivers: { $addToSet: "$receiverNumber" },
+          models: { $addToSet: "$products.model" },
+          productNames: { $addToSet: "$products.productName" },
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          customerNames: { $sortArray: { input: "$customerNames", sortBy: 1 } },
+          zones: { $sortArray: { input: "$zones", sortBy: 1 } },
+          districts: { $sortArray: { input: "$districts", sortBy: 1 } },
+          thanas: { $sortArray: { input: "$thanas", sortBy: 1 } },
+          receivers: { $sortArray: { input: "$receivers", sortBy: 1 } },
+          models: { $sortArray: { input: "$models", sortBy: 1 } },
+          productNames: { $sortArray: { input: "$productNames", sortBy: 1 } },
+        }
+      }
+    ]).toArray();
+    res.send({
+      success: true,
+      data: result || { customerNames: [], zones: [], districts: [], thanas: [], receivers: [], models: [], productNames: [] }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Failed to fetch filter options" });
+  }
+});
+
+app.delete("/challan/:id", verifyToken, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid ID'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -732,22 +711,20 @@ app.delete("/challan/:id", verifyToken,validate([
   }
 });
 
-app.patch('/challan/:id', verifyToken,validate([
-    param('id').isMongoId().withMessage('Invalid challan ID'),
-    body('customerName').trim().notEmpty().withMessage('Customer name required'),
-    body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
-  ]), async (req, res) => {
+app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid challan ID'),
+  body('customerName').trim().notEmpty().withMessage('Customer name required'),
+  body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt } = req.body;
-
     const setDoc = { customerName, address, thana, district, receiverNumber, zone, currentUser };
     if (createdAt) {
       setDoc.month = new Date(createdAt).getMonth() + 1;
       setDoc.year = new Date(createdAt).getFullYear();
     }
-
     await challanCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: setDoc });
     const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(req.params.id) });
     res.send({ success: true, data: updatedChallan });
@@ -757,18 +734,17 @@ app.patch('/challan/:id', verifyToken,validate([
   }
 });
 
-app.put('/challan/:challanId/product/:productId', verifyToken,validate([
-    param('challanId').isMongoId().withMessage('Invalid challan ID'),
-    body('productName').trim().notEmpty().withMessage('Product name required'),
-    body('model').trim().notEmpty().withMessage('Model required'),
-    body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
-  ]), async (req, res) => {
+app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId('challanId'), validate([
+  param('challanId').isMongoId().withMessage('Invalid challan ID'),
+  body('productName').trim().notEmpty().withMessage('Product name required'),
+  body('model').trim().notEmpty().withMessage('Model required'),
+  body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { challanId, productId } = req.params;
     const { productName, model, quantity } = req.body;
-
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(challanId), "products._id": productId },
       {
@@ -779,10 +755,8 @@ app.put('/challan/:challanId/product/:productId', verifyToken,validate([
         }
       }
     );
-
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Product not found" });
-
     const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(challanId) });
     res.send({ success: true, data: updatedChallan });
   } catch (err) {
@@ -791,17 +765,15 @@ app.put('/challan/:challanId/product/:productId', verifyToken,validate([
   }
 });
 
-app.delete("/challans/:challanId/product/:productId", verifyToken, async (req, res) => {
+app.delete("/challans/:challanId/product/:productId", verifyToken, validateObjectId('challanId'), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { challanId, productId } = req.params;
-
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(challanId) },
       { $pull: { products: { _id: productId } } }
     );
-
     if (result.modifiedCount > 0) {
       res.send({ success: true, message: "Product removed from challan" });
     } else {
@@ -813,17 +785,15 @@ app.delete("/challans/:challanId/product/:productId", verifyToken, async (req, r
   }
 });
 
-app.patch('/challans/:id', verifyToken, async (req, res) => {
+app.patch('/challans/:id', verifyToken, validateObjectId('id'), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { customerName, receiverNumber, zone, address, thana, district, products } = req.body;
-
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
       { $set: { customerName, receiverNumber, zone, address, thana, district, products } }
     );
-
     if (result.matchedCount > 0) {
       res.send({ success: true, message: "Challan and Products updated successfully" });
     } else {
@@ -837,11 +807,11 @@ app.patch('/challans/:id', verifyToken, async (req, res) => {
 
 // ── Vendors ────────────────────────────────────────────────────────────────────
 
-app.post("/vendors", verifyToken,validate([
-    body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
-    body('vendorPhone').trim().notEmpty().withMessage('Phone required'),
-    body('vendorAddress').trim().notEmpty().withMessage('Address required'),
-  ]), async (req, res) => {
+app.post("/vendors", verifyToken, validate([
+  body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
+  body('vendorPhone').trim().notEmpty().withMessage('Phone required'),
+  body('vendorAddress').trim().notEmpty().withMessage('Address required'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -869,7 +839,7 @@ app.get("/vendors", verifyToken, async (req, res) => {
   }
 });
 
-app.get("/vendors/:id", verifyToken, async (req, res) => {
+app.get("/vendors/:id", verifyToken, validateObjectId('id'), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -881,10 +851,10 @@ app.get("/vendors/:id", verifyToken, async (req, res) => {
   }
 });
 
-app.patch("/vendors/:id", verifyToken,validate([
-    param('id').isMongoId().withMessage('Invalid vendor ID'),
-    body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
-  ]), async (req, res) => {
+app.patch("/vendors/:id", verifyToken, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid vendor ID'),
+  body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -900,9 +870,9 @@ app.patch("/vendors/:id", verifyToken,validate([
   }
 });
 
-app.delete("/vendors/:id", verifyToken, verifyAdmin,validate([
-    param('id').isMongoId().withMessage('Invalid ID'),
-  ]), async (req, res) => {
+app.delete("/vendors/:id", verifyToken, verifyAdmin, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid ID'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -922,7 +892,6 @@ app.get("/vehicles/search", verifyToken, async (req, res) => {
     const vendorsCollection = db.collection('vendors');
     const search = req.query.search?.trim();
     if (!search) return res.send([]);
-
     const result = await vendorsCollection.aggregate([
       { $unwind: "$vehicles" },
       { $match: { "vehicles.vehicleNumber": { $regex: search, $options: "i" } } },
@@ -938,7 +907,6 @@ app.get("/vehicles/search", verifyToken, async (req, res) => {
       },
       { $limit: 10 }
     ]).toArray();
-
     res.send(result);
   } catch (err) {
     console.error(err);
@@ -946,26 +914,20 @@ app.get("/vehicles/search", verifyToken, async (req, res) => {
   }
 });
 
-app.post("/vehicles", verifyToken,validate([
-    body('vendorId').isMongoId().withMessage('Invalid vendor ID'),
-    body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
-    body('driverName').trim().notEmpty().withMessage('Driver name required'),
-    body('driverPhone').trim().notEmpty().withMessage('Driver phone required'),
-  ]), async (req, res) => {
+app.post("/vehicles", verifyToken, validate([
+  body('vendorId').isMongoId().withMessage('Invalid vendor ID'),
+  body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
+  body('driverName').trim().notEmpty().withMessage('Driver name required'),
+  body('driverPhone').trim().notEmpty().withMessage('Driver phone required'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
     const { vendorId, ...vehicleData } = req.body;
-
     const result = await vendorsCollection.updateOne(
       { _id: new ObjectId(vendorId) },
-      {
-        $push: {
-          vehicles: { _id: new ObjectId(), ...vehicleData, createdAt: new Date() }
-        }
-      }
+      { $push: { vehicles: { _id: new ObjectId(), ...vehicleData, createdAt: new Date() } } }
     );
-
     if (result.modifiedCount > 0) {
       res.send({ insertedId: true });
     } else {
@@ -977,58 +939,62 @@ app.post("/vehicles", verifyToken,validate([
   }
 });
 
-app.delete("/vehicles/:vendorId/:vehicleId", verifyToken, async (req, res) => {
-  try {
-    const db = await connectDB();
-    const vendorsCollection = db.collection('vendors');
-    const { vendorId, vehicleId } = req.params;
-
-    const result = await vendorsCollection.updateOne(
-      { _id: new ObjectId(vendorId) },
-      { $pull: { vehicles: { _id: new ObjectId(vehicleId) } } }
-    );
-
-    if (result.modifiedCount > 0) {
-      res.send({ deletedCount: 1 });
-    } else {
-      res.status(404).send({ error: "Vehicle or Vendor not found" });
+app.delete("/vehicles/:vendorId/:vehicleId", verifyToken,
+  validateObjectId('vendorId'),
+  validateObjectId('vehicleId'),
+  async (req, res) => {
+    try {
+      const db = await connectDB();
+      const vendorsCollection = db.collection('vendors');
+      const { vendorId, vehicleId } = req.params;
+      const result = await vendorsCollection.updateOne(
+        { _id: new ObjectId(vendorId) },
+        { $pull: { vehicles: { _id: new ObjectId(vehicleId) } } }
+      );
+      if (result.modifiedCount > 0) {
+        res.send({ deletedCount: 1 });
+      } else {
+        res.status(404).send({ error: "Vehicle or Vendor not found" });
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ error: "Failed to delete vehicle" });
     }
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ error: "Failed to delete vehicle" });
   }
-});
+);
 
-app.put("/vehicles/:vendorId/:vehicleId", verifyToken, async (req, res) => {
-  try {
-    const db = await connectDB();
-    const vendorsCollection = db.collection('vendors');
-    const { vendorId, vehicleId } = req.params;
-    const updatedData = req.body;
-
-    const result = await vendorsCollection.updateOne(
-      { _id: new ObjectId(vendorId) },
-      {
-        $set: {
-          "vehicles.$[elem].vehicleNumber": updatedData.vehicleNumber,
-          "vehicles.$[elem].vehicleModel": updatedData.vehicleModel,
-          "vehicles.$[elem].driverName": updatedData.driverName,
-          "vehicles.$[elem].driverPhone": updatedData.driverPhone,
-        }
-      },
-      { arrayFilters: [{ "elem._id": new ObjectId(vehicleId) }] }
-    );
-
-    if (result.modifiedCount > 0) {
-      res.send({ modifiedCount: 1 });
-    } else {
-      res.status(404).send({ error: "Nothing updated" });
+app.put("/vehicles/:vendorId/:vehicleId", verifyToken,
+  validateObjectId('vendorId'),
+  validateObjectId('vehicleId'),
+  async (req, res) => {
+    try {
+      const db = await connectDB();
+      const vendorsCollection = db.collection('vendors');
+      const { vendorId, vehicleId } = req.params;
+      const updatedData = req.body;
+      const result = await vendorsCollection.updateOne(
+        { _id: new ObjectId(vendorId) },
+        {
+          $set: {
+            "vehicles.$[elem].vehicleNumber": updatedData.vehicleNumber,
+            "vehicles.$[elem].vehicleModel": updatedData.vehicleModel,
+            "vehicles.$[elem].driverName": updatedData.driverName,
+            "vehicles.$[elem].driverPhone": updatedData.driverPhone,
+          }
+        },
+        { arrayFilters: [{ "elem._id": new ObjectId(vehicleId) }] }
+      );
+      if (result.modifiedCount > 0) {
+        res.send({ modifiedCount: 1 });
+      } else {
+        res.status(404).send({ error: "Nothing updated" });
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ error: "Failed to update vehicle" });
     }
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ error: "Failed to update vehicle" });
   }
-});
+);
 
 // ── Deliveries ─────────────────────────────────────────────────────────────────
 
@@ -1044,35 +1010,25 @@ app.post("/deliveries", verifyToken, validate([
     const deliveriesCollection = db.collection('deliveries');
     const challanCollection = db.collection('challans');
     const counterCollection = db.collection('counters');
-
     const deliveries = req.body;
-
     if (!Array.isArray(deliveries) || deliveries.length === 0) {
       return res.status(400).send({ success: false, message: "No deliveries provided" });
     }
-
-    // ✅ Transaction শুরু
     const session = cachedClient.startSession();
     let tripNumber;
     let result;
-
     try {
       await session.withTransaction(async () => {
-
-        // ✅ Atomic counter — transaction এর ভেতরে
         const counter = await counterCollection.findOneAndUpdate(
           { _id: "tripNumber" },
           { $inc: { seq: 1 } },
           { upsert: true, returnDocument: "after", session }
         );
-
         const seq = counter?.seq ?? counter?.value?.seq ?? 1;
         tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
-
         const challanIds = deliveries.map(d =>
           typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
         );
-
         const tripDocument = {
           tripNumber,
           vehicleNumber: deliveries[0].vehicleNumber,
@@ -1094,37 +1050,20 @@ app.post("/deliveries", verifyToken, validate([
           })),
           createdAt: new Date()
         };
-
-        // ✅ Insert আর update দুটোই transaction এ
         result = await deliveriesCollection.insertOne(tripDocument, { session });
-
         await challanCollection.updateMany(
           { _id: { $in: challanIds } },
           { $set: { status: "delivered", tripNumber } },
           { session }
         );
-
       });
-
-      res.send({
-        success: true,
-        insertedId: result.insertedId,
-        tripNumber,
-        totalChallan: deliveries.length
-      });
-
+      res.send({ success: true, insertedId: result.insertedId, tripNumber, totalChallan: deliveries.length });
     } finally {
-      // ✅ Session সবসময় end করো
       await session.endSession();
     }
-
   } catch (err) {
-    console.error("Delivery Error:", err);
-    res.status(500).send({
-      success: false,
-      message: "Delivery failed",
-      error: err.message
-    });
+    logger.error("Delivery failed", err);
+    res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
   }
 });
 
@@ -1132,16 +1071,13 @@ app.get("/deliveries", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
-
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     const search = req.query.search || "";
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
-
     let query = {};
-
     if (search) {
       query.$or = [
         { tripNumber: { $regex: search, $options: "i" } },
@@ -1161,19 +1097,14 @@ app.get("/deliveries", verifyToken, async (req, res) => {
       const endDate = new Date(year, month, 0, 23, 59, 59, 999);
       query.createdAt = { $gte: startDate, $lte: endDate };
     }
-
     const [data, total] = await Promise.all([
       deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
       deliveriesCollection.countDocuments(query),
     ]);
-
     res.send({
-      success: true,
-      data,
+      success: true, data,
       pagination: {
-        total,
-        page,
-        limit,
+        total, page, limit,
         totalPages: Math.ceil(total / limit),
         hasNextPage: page < Math.ceil(total / limit),
         hasPrevPage: page > 1,
@@ -1190,7 +1121,6 @@ app.patch("/deliveries/confirm", verifyToken, async (req, res) => {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripNumber, challanId, status, note, operator } = req.body;
-
     const result = await deliveriesCollection.updateOne(
       { tripNumber, "challans.challanId": String(challanId) },
       {
@@ -1214,7 +1144,6 @@ app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripNumber, challanId, status, operator } = req.body;
-
     const result = await deliveriesCollection.updateOne(
       { tripNumber, "challans.challanId": String(challanId) },
       {
@@ -1232,20 +1161,17 @@ app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
   }
 });
 
-// ── Global Error Handler ───────────────────────────────────────────────────────
 
+// ── Global Error Handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
-  console.error("💥 Error:", err.stack);
+  logger.error("Unhandled error", err);
   res.status(500).send({ message: "Internal Server Error" });
 });
 
-// ── Start Server ───────────────────────────────────────────────────────────────
-// ✅ Local:  NODE_ENV সেট না থাকলে normally listen করবে → node server.js
-// ✅ Vercel: module.exports = app → serverless function হিসেবে চলবে
-
+// ── Start Server ───────────────────────────────────────────────────
 if (process.env.NODE_ENV !== "production") {
   app.listen(port, () => {
-    console.log(`🚀 Server running on port ${port}`);
+    logger.info(`Server running`, { port });
   });
 }
 
