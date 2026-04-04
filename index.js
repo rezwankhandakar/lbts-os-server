@@ -385,6 +385,7 @@ app.get("/gate-pass", verifyToken, async (req, res) => {
         { tripDo: { $regex: search, $options: "i" } },
         { customerName: { $regex: search, $options: "i" } },
         { csd: { $regex: search, $options: "i" } },
+        { unit: { $regex: search, $options: "i" } },
         { vehicleNo: { $regex: search, $options: "i" } },
         { zone: { $regex: search, $options: "i" } },
         { "products.productName": { $regex: search, $options: "i" } },
@@ -599,6 +600,8 @@ app.get("/challans", verifyToken, async (req, res) => {
         { address: { $regex: search, $options: "i" } },
         { receiverNumber: { $regex: search, $options: "i" } },
         { zone: { $regex: search, $options: "i" } },
+        { thana: { $regex: search, $options: "i" } },
+        { district: { $regex: search, $options: "i" } },
         { "products.productName": { $regex: search, $options: "i" } },
         { "products.model": { $regex: search, $options: "i" } },
       ];
@@ -1067,6 +1070,7 @@ app.post("/deliveries", verifyToken, validate([
   }
 });
 
+
 app.get("/deliveries", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -1078,14 +1082,21 @@ app.get("/deliveries", verifyToken, async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
     let query = {};
+
     if (search) {
       query.$or = [
-        { tripNumber: { $regex: search, $options: "i" } },
-        { vendorName: { $regex: search, $options: "i" } },
-        { driverName: { $regex: search, $options: "i" } },
-        { vehicleNumber: { $regex: search, $options: "i" } },
-        { "challans.customerName": { $regex: search, $options: "i" } },
-        { "challans.zone": { $regex: search, $options: "i" } },
+        { tripNumber:                        { $regex: search, $options: "i" } },
+        { vendorName:                        { $regex: search, $options: "i" } },
+        { driverName:                        { $regex: search, $options: "i" } },
+        { vehicleNumber:                     { $regex: search, $options: "i" } },
+        { "challans.customerName":           { $regex: search, $options: "i" } },
+        { "challans.zone":                   { $regex: search, $options: "i" } },
+        { "challans.address":                { $regex: search, $options: "i" } },
+        { "challans.receiverNumber":         { $regex: search, $options: "i" } },
+        { "challans.district":               { $regex: search, $options: "i" } },
+        { "challans.thana":                  { $regex: search, $options: "i" } },
+        { "challans.products.productName":   { $regex: search, $options: "i" } },
+        { "challans.products.model":         { $regex: search, $options: "i" } },
       ];
     } else {
       if (!month || !year) {
@@ -1097,10 +1108,12 @@ app.get("/deliveries", verifyToken, async (req, res) => {
       const endDate = new Date(year, month, 0, 23, 59, 59, 999);
       query.createdAt = { $gte: startDate, $lte: endDate };
     }
+
     const [data, total] = await Promise.all([
       deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
       deliveriesCollection.countDocuments(query),
     ]);
+
     res.send({
       success: true, data,
       pagination: {
