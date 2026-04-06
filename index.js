@@ -737,6 +737,7 @@ app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
   }
 });
 
+
 app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId('challanId'), validate([
   param('challanId').isMongoId().withMessage('Invalid challan ID'),
   body('productName').trim().notEmpty().withMessage('Product name required'),
@@ -767,6 +768,7 @@ app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId(
     res.status(500).send({ message: "Failed to update product" });
   }
 });
+
 
 app.delete("/challans/:challanId/product/:productId", verifyToken, validateObjectId('challanId'), async (req, res) => {
   try {
