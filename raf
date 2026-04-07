@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require('express');
@@ -720,40 +721,15 @@ app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
 ]), async (req, res) => {
   try {
     const db = await connectDB();
-    const challanCollection   = db.collection('challans');
-    const deliveriesCollection = db.collection('deliveries');
- 
-    const challanId = req.params.id;
+    const challanCollection = db.collection('challans');
     const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt } = req.body;
- 
     const setDoc = { customerName, address, thana, district, receiverNumber, zone, currentUser };
     if (createdAt) {
       setDoc.month = new Date(createdAt).getMonth() + 1;
-      setDoc.year  = new Date(createdAt).getFullYear();
+      setDoc.year = new Date(createdAt).getFullYear();
     }
- 
-    // 1a. challans collection update
-    await challanCollection.updateOne(
-      { _id: new ObjectId(challanId) },
-      { $set: setDoc }
-    );
- 
-    // 1b. deliveries.challans[] nested sync
-    await deliveriesCollection.updateOne(
-      { "challans.challanId": challanId },
-      {
-        $set: {
-          "challans.$.customerName":   customerName,
-          "challans.$.address":        address,
-          "challans.$.thana":          thana,
-          "challans.$.district":       district,
-          "challans.$.receiverNumber": receiverNumber,
-          "challans.$.zone":           zone,
-        }
-      }
-    );
- 
-    const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(challanId) });
+    await challanCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: setDoc });
+    const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(req.params.id) });
     res.send({ success: true, data: updatedChallan });
   } catch (err) {
     console.error(err);
@@ -762,7 +738,6 @@ app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
 });
 
 
-// challans.products[] + deliveries.challans[].products[] দুটোই update করে
 app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId('challanId'), validate([
   param('challanId').isMongoId().withMessage('Invalid challan ID'),
   body('productName').trim().notEmpty().withMessage('Product name required'),
@@ -771,49 +746,21 @@ app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId(
 ]), async (req, res) => {
   try {
     const db = await connectDB();
-    const challanCollection    = db.collection('challans');
-    const deliveriesCollection = db.collection('deliveries');
- 
+    const challanCollection = db.collection('challans');
     const { challanId, productId } = req.params;
     const { productName, model, quantity } = req.body;
- 
-    // 2a. challans collection update
-    const challanResult = await challanCollection.updateOne(
+    const result = await challanCollection.updateOne(
       { _id: new ObjectId(challanId), "products._id": productId },
       {
         $set: {
           "products.$.productName": productName,
-          "products.$.model":       model,
-          "products.$.quantity":    Number(quantity),
+          "products.$.model": model,
+          "products.$.quantity": Number(quantity)
         }
       }
     );
- 
-    if (challanResult.matchedCount === 0) {
-      return res.status(404).send({ success: false, message: "Product not found in challan" });
-    }
- 
-    // 2b. deliveries nested sync — arrayFilters দিয়ে দুই স্তর deep update
-    await deliveriesCollection.updateOne(
-      {
-        "challans.challanId": challanId,
-        "challans.products._id": productId,
-      },
-      {
-        $set: {
-          "challans.$[challan].products.$[product].productName": productName,
-          "challans.$[challan].products.$[product].model":       model,
-          "challans.$[challan].products.$[product].quantity":    Number(quantity),
-        }
-      },
-      {
-        arrayFilters: [
-          { "challan.challanId": challanId },
-          { "product._id": productId },
-        ]
-      }
-    );
- 
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Product not found" });
     const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(challanId) });
     res.send({ success: true, data: updatedChallan });
   } catch (err) {
@@ -823,85 +770,47 @@ app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId(
 });
 
 
-// ── 3. DELETE /challans/:challanId/product/:productId ─────────────
-// challans.products[] + deliveries.challans[].products[] থেকে remove করে
 app.delete("/challans/:challanId/product/:productId", verifyToken, validateObjectId('challanId'), async (req, res) => {
   try {
     const db = await connectDB();
-    const challanCollection    = db.collection('challans');
-    const deliveriesCollection = db.collection('deliveries');
- 
+    const challanCollection = db.collection('challans');
     const { challanId, productId } = req.params;
- 
-    // 3a. challans collection থেকে remove
-    const challanResult = await challanCollection.updateOne(
+    const result = await challanCollection.updateOne(
       { _id: new ObjectId(challanId) },
       { $pull: { products: { _id: productId } } }
     );
- 
-    if (challanResult.modifiedCount === 0) {
-      return res.status(404).send({ success: false, message: "Product not found" });
+    if (result.modifiedCount > 0) {
+      res.send({ success: true, message: "Product removed from challan" });
+    } else {
+      res.status(404).send({ success: false, message: "Product not found" });
     }
- 
-    // 3b. deliveries nested array থেকে remove
-    await deliveriesCollection.updateOne(
-      { "challans.challanId": challanId },
-      {
-        $pull: {
-          "challans.$[challan].products": { _id: productId }
-        }
-      },
-      {
-        arrayFilters: [{ "challan.challanId": challanId }]
-      }
-    );
- 
-    res.send({ success: true, message: "Product removed" });
   } catch (err) {
     console.error(err);
     res.status(500).send({ message: "Failed to delete product" });
   }
 });
 
-
-// ── 4. PATCH /challans/:id ────────────────────────────────────────
-// Add product এর জন্য — full products array দুই জায়গায় sync করে
 app.patch('/challans/:id', verifyToken, validateObjectId('id'), async (req, res) => {
   try {
     const db = await connectDB();
-    const challanCollection    = db.collection('challans');
-    const deliveriesCollection = db.collection('deliveries');
- 
-    const challanId = req.params.id;
+    const challanCollection = db.collection('challans');
     const { customerName, receiverNumber, zone, address, thana, district, products } = req.body;
- 
-    // 4a. challans collection update
-    const challanResult = await challanCollection.updateOne(
-      { _id: new ObjectId(challanId) },
+    const result = await challanCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
       { $set: { customerName, receiverNumber, zone, address, thana, district, products } }
     );
- 
-    if (challanResult.matchedCount === 0) {
-      return res.status(404).send({ success: false, message: "Challan not found" });
+    if (result.matchedCount > 0) {
+      res.send({ success: true, message: "Challan and Products updated successfully" });
+    } else {
+      res.status(404).send({ success: false, message: "Challan not found" });
     }
- 
-    // 4b. deliveries.challans[].products sync
-    await deliveriesCollection.updateOne(
-      { "challans.challanId": challanId },
-      {
-        $set: {
-          "challans.$.products": products,
-        }
-      }
-    );
- 
-    res.send({ success: true, message: "Challan and products updated" });
   } catch (err) {
     console.error(err);
     res.status(500).send({ message: "Update failed" });
   }
 });
 
+// ── Vendors ────────────────────────────────────────────────────────────────────
 
 app.post("/vendors", verifyToken, validate([
   body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
@@ -1268,67 +1177,147 @@ app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
 });
 
 
-// ── 5. PATCH /deliveries/:id ──────────────────────────────────────
-// Trip level edit — deliveries + vendors + vehicles sync করে
-app.patch("/deliveries/:id", verifyToken, verifyAdmin, validateObjectId('id'), validate([
-  param('id').isMongoId().withMessage('Invalid delivery ID'),
-  body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
-  body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
-  body('vendorNumber').trim().notEmpty().withMessage('Vendor number required'),
-  body('driverName').trim().notEmpty().withMessage('Driver name required'),
-  body('driverNumber').trim().notEmpty().withMessage('Driver number required'),
-]), async (req, res) => {
+// ── Edit full challan info inside a trip ───────────────────────────
+app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
-    const vendorsCollection    = db.collection('vendors');
- 
-    const { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber } = req.body;
- 
-    const existingTrip = await deliveriesCollection.findOne({ _id: new ObjectId(req.params.id) });
-    if (!existingTrip) {
-      return res.status(404).send({ success: false, message: "Trip not found" });
-    }
- 
-    // deliveries update
-    await deliveriesCollection.updateOne(
-      { _id: new ObjectId(req.params.id) },
+    const { tripId, challanId } = req.params;
+    const { customerName, address, thana, district, receiverNumber, zone } = req.body;
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId), "challans.challanId": challanId },
       {
         $set: {
-          vehicleNumber, vendorName, vendorNumber, driverName, driverNumber,
-          updatedAt: new Date(),
+          "challans.$.customerName":    customerName,
+          "challans.$.address":         address,
+          "challans.$.thana":           thana,
+          "challans.$.district":        district,
+          "challans.$.receiverNumber":  receiverNumber,
+          "challans.$.zone":            zone,
         }
       }
     );
- 
-    // vendors top-level sync
-    const vendorUpdateResult = await vendorsCollection.updateOne(
-      { vendorPhone: existingTrip.vendorNumber },
-      { $set: { vendorName, vendorPhone: vendorNumber } }
-    );
- 
-    // vendors.vehicles[] nested sync
-    const vehicleUpdateResult = await vendorsCollection.updateOne(
-      { "vehicles.vehicleNumber": existingTrip.vehicleNumber },
-      {
-        $set: {
-          "vehicles.$.vehicleNumber": vehicleNumber,
-          "vehicles.$.driverName":    driverName,
-          "vehicles.$.driverPhone":   driverNumber,
-        }
-      }
-    );
- 
-    const updatedTrip = await deliveriesCollection.findOne({ _id: new ObjectId(req.params.id) });
-    res.send({
-      success: true,
-      data: updatedTrip,
-      vendorUpdated:  vendorUpdateResult.modifiedCount > 0,
-      vehicleUpdated: vehicleUpdateResult.modifiedCount > 0,
-    });
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Challan not found in trip" });
+    res.send({ success: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to update trip" });
+    logger.error("Edit trip challan failed", err);
+    res.status(500).send({ message: "Failed to update challan" });
+  }
+});
+
+// ── Edit a product inside a trip's challan ─────────────────────────
+app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId, productId } = req.params;
+    const { productName, model, quantity } = req.body;
+
+    // Fetch the trip, find challan index, update product in that challan
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+    const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
+    if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+    const productIndex = trip.challans[challanIndex].products.findIndex(p => p._id === productId);
+    if (productIndex === -1) return res.status(404).send({ success: false, message: "Product not found" });
+
+    const updateField = `challans.${challanIndex}.products.${productIndex}`;
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      { $set: {
+        [`${updateField}.productName`]: productName,
+        [`${updateField}.model`]:       model,
+        [`${updateField}.quantity`]:    Number(quantity),
+      }}
+    );
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err) {
+    logger.error("Edit trip product failed", err);
+    res.status(500).send({ message: "Failed to update product" });
+  }
+});
+
+// ── Delete a product inside a trip's challan ───────────────────────
+app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId, productId } = req.params;
+
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+    const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
+    if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+    if (trip.challans[challanIndex].products.length <= 1)
+      return res.status(400).send({ success: false, message: "Cannot remove last product" });
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      { $pull: { [`challans.${challanIndex}.products`]: { _id: productId } } }
+    );
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err) {
+    logger.error("Delete trip product failed", err);
+    res.status(500).send({ message: "Failed to delete product" });
+  }
+});
+
+// ── Add a product to a trip's challan ─────────────────────────────
+app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId } = req.params;
+    const { productName, model, quantity } = req.body;
+
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+    const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
+    if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+    const newProduct = { _id: new ObjectId().toString(), productName, model, quantity: Number(quantity) };
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      { $push: { [`challans.${challanIndex}.products`]: newProduct } }
+    );
+    res.send({ success: true, product: newProduct });
+  } catch (err) {
+    logger.error("Add trip product failed", err);
+    res.status(500).send({ message: "Failed to add product" });
+  }
+});
+
+// ── Delete a full challan from a trip ─────────────────────────────
+app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId } = req.params;
+
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+    if (trip.challans.length <= 1)
+      return res.status(400).send({ success: false, message: "Cannot remove last challan from trip" });
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      {
+        $pull: { challans: { challanId } },
+        $inc:  { totalChallan: -1 }
+      }
+    );
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err) {
+    logger.error("Delete trip challan failed", err);
+    res.status(500).send({ message: "Failed to delete challan" });
   }
 });
 

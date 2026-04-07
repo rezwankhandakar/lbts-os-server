@@ -1003,6 +1003,91 @@ app.put("/vehicles/:vendorId/:vehicleId", verifyToken,
 
 // ── Deliveries ─────────────────────────────────────────────────────────────────
 
+// app.post("/deliveries", verifyToken, validate([
+//   body().isArray({ min: 1 }).withMessage('At least one delivery required'),
+//   body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
+//   body('*.driverName').trim().notEmpty().withMessage('Driver name required'),
+//   body('*.customerName').trim().notEmpty().withMessage('Customer name required'),
+//   body('*.products').isArray({ min: 1 }).withMessage('Products required'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const challanCollection = db.collection('challans');
+//     const counterCollection = db.collection('counters');
+//     const deliveries = req.body;
+//     if (!Array.isArray(deliveries) || deliveries.length === 0) {
+//       return res.status(400).send({ success: false, message: "No deliveries provided" });
+//     }
+//     const session = cachedClient.startSession();
+//     let tripNumber;
+//     let result;
+//     try {
+//       await session.withTransaction(async () => {
+//         const counter = await counterCollection.findOneAndUpdate(
+//           { _id: "tripNumber" },
+//           { $inc: { seq: 1 } },
+//           { upsert: true, returnDocument: "after", session }
+//         );
+//         const seq = counter?.seq ?? counter?.value?.seq ?? 1;
+//         tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
+//         const challanIds = deliveries.map(d =>
+//           typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+//         );
+//         const tripDocument = {
+//           tripNumber,
+//           vehicleNumber: deliveries[0].vehicleNumber,
+//           vendorName: deliveries[0].vendorName,
+//           vendorNumber: deliveries[0].vendorNumber,
+//           driverName: deliveries[0].driverName,
+//           driverNumber: deliveries[0].driverNumber,
+//           createdBy: deliveries[0].createdBy || "unknown",
+//           totalChallan: deliveries.length,
+//           // challans: deliveries.map(d => ({
+//           //   challanId: d.challanId,
+//           //   customerName: d.customerName,
+//           //   zone: d.zone,
+//           //   address: d.address,
+//           //   thana: d.thana,
+//           //   district: d.district,
+//           //   receiverNumber: d.receiverNumber,
+//           //   products: d.products
+//           // })),
+//           challans: deliveries.map(d => ({
+//   challanId: d.challanId,
+//   customerName: d.customerName,
+//   zone: d.zone,
+//   address: d.address,
+//   thana: d.thana,
+//   district: d.district,
+//   receiverNumber: d.receiverNumber,
+//   // প্রতিটা product এ _id ensure করো
+//   products: (d.products || []).map(p => ({
+//     _id: p._id || new ObjectId().toString(),
+//     productName: p.productName,
+//     model: p.model,
+//     quantity: Number(p.quantity)
+//   }))
+// })),
+//           createdAt: new Date()
+//         };
+//         result = await deliveriesCollection.insertOne(tripDocument, { session });
+//         await challanCollection.updateMany(
+//           { _id: { $in: challanIds } },
+//           { $set: { status: "delivered", tripNumber } },
+//           { session }
+//         );
+//       });
+//       res.send({ success: true, insertedId: result.insertedId, tripNumber, totalChallan: deliveries.length });
+//     } finally {
+//       await session.endSession();
+//     }
+//   } catch (err) {
+//     logger.error("Delivery failed", err);
+//     res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
+//   }
+// });
+
 app.post("/deliveries", verifyToken, validate([
   body().isArray({ min: 1 }).withMessage('At least one delivery required'),
   body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
@@ -1031,9 +1116,23 @@ app.post("/deliveries", verifyToken, validate([
         );
         const seq = counter?.seq ?? counter?.value?.seq ?? 1;
         tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
+
         const challanIds = deliveries.map(d =>
           typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
         );
+
+        // ── Already delivered check ────────────────────────────────
+        const alreadyDelivered = await challanCollection.find(
+          { _id: { $in: challanIds }, status: "delivered" },
+          { session }
+        ).toArray();
+
+        if (alreadyDelivered.length > 0) {
+          const names = alreadyDelivered.map(c => c.customerName).join(", ");
+          throw new Error(`Already delivered: ${names}`);
+        }
+        // ──────────────────────────────────────────────────────────
+
         const tripDocument = {
           tripNumber,
           vehicleNumber: deliveries[0].vehicleNumber,
@@ -1051,10 +1150,16 @@ app.post("/deliveries", verifyToken, validate([
             thana: d.thana,
             district: d.district,
             receiverNumber: d.receiverNumber,
-            products: d.products
+            products: (d.products || []).map(p => ({
+              _id: p._id || new ObjectId().toString(),
+              productName: p.productName,
+              model: p.model,
+              quantity: Number(p.quantity)
+            }))
           })),
           createdAt: new Date()
         };
+
         result = await deliveriesCollection.insertOne(tripDocument, { session });
         await challanCollection.updateMany(
           { _id: { $in: challanIds } },
@@ -1068,6 +1173,10 @@ app.post("/deliveries", verifyToken, validate([
     }
   } catch (err) {
     logger.error("Delivery failed", err);
+    // already delivered error টা আলাদাভাবে handle করো
+    if (err.message?.startsWith("Already delivered:")) {
+      return res.status(400).send({ success: false, message: err.message });
+    }
     res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
   }
 });
@@ -1173,6 +1282,298 @@ app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send({ message: "Challan return update failed" });
+  }
+});
+
+
+// ── Edit full challan info inside a trip ───────────────────────────
+app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId } = req.params;
+    const { customerName, address, thana, district, receiverNumber, zone } = req.body;
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId), "challans.challanId": challanId },
+      {
+        $set: {
+          "challans.$.customerName":    customerName,
+          "challans.$.address":         address,
+          "challans.$.thana":           thana,
+          "challans.$.district":        district,
+          "challans.$.receiverNumber":  receiverNumber,
+          "challans.$.zone":            zone,
+        }
+      }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Challan not found in trip" });
+    res.send({ success: true });
+  } catch (err) {
+    logger.error("Edit trip challan failed", err);
+    res.status(500).send({ message: "Failed to update challan" });
+  }
+});
+
+// ── Edit a product inside a trip's challan ─────────────────────────
+app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId, productId } = req.params;
+    const { productName, model, quantity } = req.body;
+
+    // Fetch the trip, find challan index, update product in that challan
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+    const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
+    if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+    const productIndex = trip.challans[challanIndex].products.findIndex(p => p._id === productId);
+    if (productIndex === -1) return res.status(404).send({ success: false, message: "Product not found" });
+
+    const updateField = `challans.${challanIndex}.products.${productIndex}`;
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      { $set: {
+        [`${updateField}.productName`]: productName,
+        [`${updateField}.model`]:       model,
+        [`${updateField}.quantity`]:    Number(quantity),
+      }}
+    );
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err) {
+    logger.error("Edit trip product failed", err);
+    res.status(500).send({ message: "Failed to update product" });
+  }
+});
+
+// ── Delete a product inside a trip's challan ───────────────────────
+app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId, productId } = req.params;
+
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+    const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
+    if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+    if (trip.challans[challanIndex].products.length <= 1)
+      return res.status(400).send({ success: false, message: "Cannot remove last product" });
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      { $pull: { [`challans.${challanIndex}.products`]: { _id: productId } } }
+    );
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err) {
+    logger.error("Delete trip product failed", err);
+    res.status(500).send({ message: "Failed to delete product" });
+  }
+});
+
+// ── Add a product to a trip's challan ─────────────────────────────
+app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId } = req.params;
+    const { productName, model, quantity } = req.body;
+
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+    const challanIndex = trip.challans.findIndex(c =>
+      c.challanId === challanId || c.challanId?.toString() === challanId
+    );
+    if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+    const newProduct = {
+      _id: new ObjectId().toString(),
+      productName,
+      model,
+      quantity: Number(quantity)
+    };
+
+    await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      { $push: { [`challans.${challanIndex}.products`]: newProduct } }
+    );
+    res.send({ success: true, product: newProduct });
+  } catch (err) {
+    logger.error("Add trip product failed", err);
+    res.status(500).send({ message: "Failed to add product" });
+  }
+});
+
+// ── Delete a full challan from a trip ─────────────────────────────
+app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId } = req.params;
+
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+    if (trip.challans.length <= 1)
+      return res.status(400).send({ success: false, message: "Cannot remove last challan from trip" });
+
+    // challan টা আসলে DB তে কোন format এ আছে সেটা দেখো
+    const targetChallan = trip.challans.find(c => 
+      c.challanId === challanId || c.challanId?.toString() === challanId
+    );
+    if (!targetChallan)
+      return res.status(404).send({ success: false, message: "Challan not found in trip" });
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      {
+        $pull: { challans: { challanId: targetChallan.challanId } },
+        $inc: { totalChallan: -1 }
+      }
+    );
+    res.send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err) {
+    logger.error("Delete trip challan failed", err);
+    res.status(500).send({ message: "Failed to delete challan" });
+  }
+});
+
+// ── Edit trip vehicle/driver/vendor info ───────────────────────────
+app.patch("/deliveries/:tripId/trip-info", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId } = req.params;
+    const { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber } = req.body;
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      { $set: { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber } }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Trip not found" });
+
+    res.send({ success: true });
+  } catch (err) {
+    logger.error("Edit trip info failed", err);
+    res.status(500).send({ message: "Failed to update trip info" });
+  }
+});
+
+
+// ── Add/Update return products for a challan ───────────────────────
+app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId } = req.params;
+    const { returnedProducts, returnNote } = req.body;
+    // returnedProducts: [{ _id, productName, model, returnQty }]
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId), "challans.challanId": challanId },
+      {
+        $set: {
+          "challans.$.returnedProducts": returnedProducts,
+          "challans.$.returnNote":       returnNote || "",
+          "challans.$.returnedAt":       new Date(),
+        }
+      }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Challan not found" });
+    res.send({ success: true });
+  } catch (err) {
+    logger.error("Return update failed", err);
+    res.status(500).send({ message: "Failed to update return" });
+  }
+});
+
+// ── Add/Update note for a challan ──────────────────────────────────
+app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId } = req.params;
+    const { note } = req.body;
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId), "challans.challanId": challanId },
+      { $set: { "challans.$.note": note, "challans.$.noteUpdatedAt": new Date() } }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Challan not found" });
+    res.send({ success: true });
+  } catch (err) {
+    logger.error("Note update failed", err);
+    res.status(500).send({ message: "Failed to update note" });
+  }
+});
+
+// ── Add return challan to trip ─────────────────────────────────────
+app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId } = req.params;
+    const { originalChallanId, customerName, zone, address, thana, district, receiverNumber, returnedProducts, returnNote } = req.body;
+
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+    // Return challan object
+    const returnChallan = {
+      challanId:        `return_${originalChallanId}_${Date.now()}`,
+      isReturn:         true,
+      originalChallanId,
+      customerName,
+      zone,
+      address,
+      thana,
+      district,
+      receiverNumber,
+      products:         returnedProducts.map(p => ({
+        _id:         p._id || new ObjectId().toString(),
+        productName: p.productName,
+        model:       p.model,
+        quantity:    Number(p.returnQty || p.quantity),
+      })),
+      returnNote:       returnNote || "",
+      returnedAt:       new Date(),
+      deliveryStatus:   "return",
+      challanReturnStatus: null,
+    };
+
+    await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      {
+        $push: { challans: returnChallan },
+        $inc:  { totalChallan: 1 }
+      }
+    );
+
+    // Also update original challan's returnedProducts
+    await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId), "challans.challanId": originalChallanId },
+      {
+        $set: {
+          "challans.$.returnedProducts": returnedProducts,
+          "challans.$.returnNote":       returnNote || "",
+          "challans.$.returnedAt":       new Date(),
+        }
+      }
+    );
+
+    res.send({ success: true, returnChallan });
+  } catch (err) {
+    logger.error("Return challan add failed", err);
+    res.status(500).send({ message: "Failed to add return challan" });
   }
 });
 
