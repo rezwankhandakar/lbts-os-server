@@ -1003,91 +1003,6 @@ app.put("/vehicles/:vendorId/:vehicleId", verifyToken,
 
 // ── Deliveries ─────────────────────────────────────────────────────────────────
 
-// app.post("/deliveries", verifyToken, validate([
-//   body().isArray({ min: 1 }).withMessage('At least one delivery required'),
-//   body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
-//   body('*.driverName').trim().notEmpty().withMessage('Driver name required'),
-//   body('*.customerName').trim().notEmpty().withMessage('Customer name required'),
-//   body('*.products').isArray({ min: 1 }).withMessage('Products required'),
-// ]), async (req, res) => {
-//   try {
-//     const db = await connectDB();
-//     const deliveriesCollection = db.collection('deliveries');
-//     const challanCollection = db.collection('challans');
-//     const counterCollection = db.collection('counters');
-//     const deliveries = req.body;
-//     if (!Array.isArray(deliveries) || deliveries.length === 0) {
-//       return res.status(400).send({ success: false, message: "No deliveries provided" });
-//     }
-//     const session = cachedClient.startSession();
-//     let tripNumber;
-//     let result;
-//     try {
-//       await session.withTransaction(async () => {
-//         const counter = await counterCollection.findOneAndUpdate(
-//           { _id: "tripNumber" },
-//           { $inc: { seq: 1 } },
-//           { upsert: true, returnDocument: "after", session }
-//         );
-//         const seq = counter?.seq ?? counter?.value?.seq ?? 1;
-//         tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
-//         const challanIds = deliveries.map(d =>
-//           typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-//         );
-//         const tripDocument = {
-//           tripNumber,
-//           vehicleNumber: deliveries[0].vehicleNumber,
-//           vendorName: deliveries[0].vendorName,
-//           vendorNumber: deliveries[0].vendorNumber,
-//           driverName: deliveries[0].driverName,
-//           driverNumber: deliveries[0].driverNumber,
-//           createdBy: deliveries[0].createdBy || "unknown",
-//           totalChallan: deliveries.length,
-//           // challans: deliveries.map(d => ({
-//           //   challanId: d.challanId,
-//           //   customerName: d.customerName,
-//           //   zone: d.zone,
-//           //   address: d.address,
-//           //   thana: d.thana,
-//           //   district: d.district,
-//           //   receiverNumber: d.receiverNumber,
-//           //   products: d.products
-//           // })),
-//           challans: deliveries.map(d => ({
-//   challanId: d.challanId,
-//   customerName: d.customerName,
-//   zone: d.zone,
-//   address: d.address,
-//   thana: d.thana,
-//   district: d.district,
-//   receiverNumber: d.receiverNumber,
-//   // প্রতিটা product এ _id ensure করো
-//   products: (d.products || []).map(p => ({
-//     _id: p._id || new ObjectId().toString(),
-//     productName: p.productName,
-//     model: p.model,
-//     quantity: Number(p.quantity)
-//   }))
-// })),
-//           createdAt: new Date()
-//         };
-//         result = await deliveriesCollection.insertOne(tripDocument, { session });
-//         await challanCollection.updateMany(
-//           { _id: { $in: challanIds } },
-//           { $set: { status: "delivered", tripNumber } },
-//           { session }
-//         );
-//       });
-//       res.send({ success: true, insertedId: result.insertedId, tripNumber, totalChallan: deliveries.length });
-//     } finally {
-//       await session.endSession();
-//     }
-//   } catch (err) {
-//     logger.error("Delivery failed", err);
-//     res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
-//   }
-// });
-
 app.post("/deliveries", verifyToken, validate([
   body().isArray({ min: 1 }).withMessage('At least one delivery required'),
   body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
@@ -1577,6 +1492,76 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
   }
 });
 
+// ── Car Rent ───────────────────────────────────────────────────────────────────
+
+app.get("/car-rents", verifyToken, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    let month = parseInt(req.query.month);
+    let year  = parseInt(req.query.year);
+    const search = req.query.search || "";
+    const page  = parseInt(req.query.page)  || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const skip  = (page - 1) * limit;
+
+    let query = {};
+    if (search) {
+      query.$or = [
+        { tripNumber:    { $regex: search, $options: "i" } },
+        { vendorName:    { $regex: search, $options: "i" } },
+        { driverName:    { $regex: search, $options: "i" } },
+        { vehicleNumber: { $regex: search, $options: "i" } },
+      ];
+    } else {
+      if (!month || !year) {
+        const now = new Date();
+        month = now.getMonth() + 1;
+        year  = now.getFullYear();
+      }
+      const startDate = new Date(year, month - 1, 1);
+      const endDate   = new Date(year, month, 0, 23, 59, 59, 999);
+      query.createdAt = { $gte: startDate, $lte: endDate };
+    }
+
+    const [data, total] = await Promise.all([
+      deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      deliveriesCollection.countDocuments(query),
+    ]);
+
+    res.send({
+      success: true, data,
+      pagination: { total, page, limit,
+        totalPages: Math.ceil(total / limit),
+        hasNextPage: page < Math.ceil(total / limit),
+        hasPrevPage: page > 1,
+      }
+    });
+  } catch (err) {
+    logger.error("Car rent fetch failed", err);
+    res.status(500).send({ success: false, message: "Failed to fetch car rents" });
+  }
+});
+
+// ── Update rent & leborBill for a trip ─────────────────────────────
+app.patch("/car-rents/:tripId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { rent, leborBill } = req.body;
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(req.params.tripId) },
+      { $set: { rent, leborBill } }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Trip not found" });
+    const updated = await deliveriesCollection.findOne({ _id: new ObjectId(req.params.tripId) });
+    res.send({ success: true, data: updated });
+  } catch (err) {
+    logger.error("Car rent update failed", err);
+    res.status(500).send({ message: "Failed to update" });
+  }
+});
 
 // ── Global Error Handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
