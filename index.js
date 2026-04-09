@@ -1563,6 +1563,27 @@ app.patch("/car-rents/:tripId", verifyToken, validateObjectId('tripId'), async (
   }
 });
 
+
+// ── Update advance amount for a trip ──────────────────────────────
+app.patch("/deliveries/:tripId/advance", verifyToken, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { advance } = req.body;
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(req.params.tripId) },
+      { $set: { advance: advance !== undefined ? Number(advance) : null } }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Trip not found" });
+    const updated = await deliveriesCollection.findOne({ _id: new ObjectId(req.params.tripId) });
+    res.send({ success: true, data: updated });
+  } catch (err) {
+    logger.error("Advance update failed", err);
+    res.status(500).send({ message: "Failed to update advance" });
+  }
+});
+
 // ── Global Error Handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
   logger.error("Unhandled error", err);
