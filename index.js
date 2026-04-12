@@ -1,4 +1,3 @@
-
 // require("dotenv").config();
 
 // const express = require('express');
@@ -1634,22 +1633,22 @@
 
 
 require("dotenv").config();
-
+ 
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET;
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-
+ 
 const app = express();
 const port = process.env.PORT || 3000;
-
+ 
 const multer = require('multer');
 const FormData = require('form-data');
 const axios = require('axios');
 const helmet = require('helmet');
-
+ 
 const multerUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -1662,9 +1661,9 @@ const multerUpload = multer({
     }
   }
 });
-
+ 
 const { body, param, query, validationResult } = require('express-validator');
-
+ 
 const validate = (validations) => async (req, res, next) => {
   await Promise.all(validations.map(v => v.run(req)));
   const errors = validationResult(req);
@@ -1677,7 +1676,7 @@ const validate = (validations) => async (req, res, next) => {
   }
   next();
 };
-
+ 
 // ── Simple Logger ──────────────────────────────────────────────────
 const logger = {
   info: (msg, data = {}) => console.log(JSON.stringify({
@@ -1693,7 +1692,7 @@ const logger = {
     level: "warn", msg, ...data, time: new Date().toISOString()
   })),
 };
-
+ 
 // ── Rate Limiters ──────────────────────────────────────────────────
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -1703,12 +1702,12 @@ const authLimiter = rateLimit({
   validate: { xForwardedForHeader: false },
   message: { success: false, message: 'Too many login attempts, please try again after 15 minutes' }
 });
-
+ 
 // ── CORS ───────────────────────────────────────────────────────────
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : ['http://localhost:5173'];
-
+ 
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin)) {
@@ -1719,28 +1718,28 @@ app.use(cors({
   },
   credentials: true
 }));
-
+ 
 // ── Security Headers ───────────────────────────────────────────────
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }, // imgbb image load এর জন্য
 }));
-
+ 
 app.use(express.json());
-
+ 
 // ── MongoDB ────────────────────────────────────────────────────────
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
-
+ 
 let cachedClient = null;
 let cachedDb = null;
-
+ 
 async function connectDB() {
   if (cachedDb) return cachedDb;
-
+ 
   if (cachedClient) {
     cachedDb = cachedClient.db('LBTS-OS-DB');
     return cachedDb;
   }
-
+ 
   cachedClient = new MongoClient(uri, {
     serverApi: {
       version: ServerApiVersion.v1,
@@ -1754,23 +1753,23 @@ async function connectDB() {
     socketTimeoutMS: 45000,
     connectTimeoutMS: 10000,
   });
-
+ 
   await cachedClient.connect();
   cachedDb = cachedClient.db('LBTS-OS-DB');
   logger.info("MongoDB Connected");
   return cachedDb;
 }
-
+ 
 // ── JWT Verify Middleware ──────────────────────────────────────────
 function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
-
+ 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).send({ message: 'Unauthorized: No token provided' });
   }
-
+ 
   const token = authHeader.split(' ')[1];
-
+ 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
@@ -1779,7 +1778,7 @@ function verifyToken(req, res, next) {
     return res.status(401).send({ message: 'Unauthorized: Invalid or expired token' });
   }
 }
-
+ 
 // ── Admin only middleware ──────────────────────────────────────────
 function verifyAdmin(req, res, next) {
   if (req.user?.role !== 'admin' || req.user?.status !== 'approved') {
@@ -1787,13 +1786,13 @@ function verifyAdmin(req, res, next) {
   }
   next();
 }
-
-
+ 
+ 
 // ── ObjectId Validation Helper ─────────────────────────────────────
 function isValidObjectId(id) {
   return ObjectId.isValid(id) && String(new ObjectId(id)) === id;
 }
-
+ 
 function validateObjectId(paramName = 'id') {
   return (req, res, next) => {
     const id = req.params[paramName];
@@ -1806,35 +1805,35 @@ function validateObjectId(paramName = 'id') {
     next();
   };
 }
-
+ 
 // ── Health Check ───────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.send('LBTS-OS Server is running ✅');
 });
-
+ 
 // ── Image Upload ───────────────────────────────────────────────────
 app.post('/upload-image', verifyToken, multerUpload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).send({ success: false, message: 'No image provided' });
     }
-
+ 
     const formData = new FormData();
     formData.append('image', req.file.buffer.toString('base64'));
-
+ 
     const response = await axios.post(
       `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
       formData,
       { headers: formData.getHeaders() }
     );
-
+ 
     res.send({ success: true, url: response.data.data.url });
   } catch (err) {
     logger.error("Image upload failed", err);
     res.status(500).send({ success: false, message: 'Image upload failed' });
   }
 });
-
+ 
 // ── JWT Token Issue ────────────────────────────────────────────────
 app.post('/jwt', authLimiter, validate([
   body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
@@ -1843,16 +1842,16 @@ app.post('/jwt', authLimiter, validate([
     const db = await connectDB();
     const userCollection = db.collection('users');
     const { email } = req.body;
-
+ 
     if (!email) return res.status(400).send({ message: 'Email required' });
-
+ 
     const user = await userCollection.findOne({ email });
     const payload = {
       email,
       role: user?.role || 'user',
       status: user?.status || 'pending',
     };
-
+ 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
     res.send({ token });
   } catch (err) {
@@ -1860,11 +1859,11 @@ app.post('/jwt', authLimiter, validate([
     res.status(500).send({ message: 'Token generation failed' });
   }
 });
-
+ 
 // ── Users ──────────────────────────────────────────────────────────────────────
-
+ 
 // ── Users ──────────────────────────────────────────────────────────────────────
-
+ 
 app.post('/users', authLimiter, validate([
   body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
   body('displayName').trim().notEmpty().withMessage('Name required'),
@@ -1884,7 +1883,7 @@ app.post('/users', authLimiter, validate([
     res.status(500).send({ message: 'Failed to add user' });
   }
 });
-
+ 
 app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = await connectDB();
@@ -1896,7 +1895,7 @@ app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
     res.status(500).send({ message: 'Failed to fetch users' });
   }
 });
-
+ 
 app.get('/users/:email/role', verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -1909,10 +1908,10 @@ app.get('/users/:email/role', verifyToken, async (req, res) => {
     res.status(500).send({ message: 'Failed to fetch user role' });
   }
 });
-
+ 
 app.patch('/users/role/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid user ID'),
-  body('role').isIn(['admin', 'manager', 'operator', 'user']).withMessage('Invalid role'),
+  body('role').isIn(['admin', 'manager', 'operator', 'user', 'ceo']).withMessage('Invalid role'),
 ]), async (req, res) => {
   try {
     const db = await connectDB();
@@ -1928,7 +1927,7 @@ app.patch('/users/role/:id', verifyToken, verifyAdmin, validateObjectId('id'), v
     res.status(500).send({ message: 'Failed to update role' });
   }
 });
-
+ 
 app.patch('/users/status/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid user ID'),
   body('status').isIn(['approved', 'pending', 'rejected']).withMessage('Invalid status'),
@@ -1947,7 +1946,7 @@ app.patch('/users/status/:id', verifyToken, verifyAdmin, validateObjectId('id'),
     res.status(500).send({ message: 'Failed to update status' });
   }
 });
-
+ 
 app.delete('/users/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid user ID'),
 ]), async (req, res) => {
@@ -1965,9 +1964,9 @@ app.delete('/users/:id', verifyToken, verifyAdmin, validateObjectId('id'), valid
     res.status(500).send({ message: 'Failed to delete user' });
   }
 });
-
+ 
 // ── Gate Pass ──────────────────────────────────────────────────────────────────
-
+ 
 app.post('/gate-pass', verifyToken, validate([
   body('tripDo').trim().notEmpty().withMessage('Trip Do required'),
   body('tripDate').isISO8601().withMessage('Valid date required'),
@@ -2002,7 +2001,7 @@ app.post('/gate-pass', verifyToken, validate([
     res.status(500).send({ message: 'Failed to add gate pass' });
   }
 });
-
+ 
 app.get("/gate-pass", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2052,7 +2051,7 @@ app.get("/gate-pass", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Failed to fetch gate passes" });
   }
 });
-
+ 
 app.patch('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid gate pass ID'),
   body('customerName').trim().notEmpty().withMessage('Customer name required'),
@@ -2079,7 +2078,7 @@ app.patch('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
     res.status(500).send({ message: "Failed to update gate pass" });
   }
 });
-
+ 
 app.put('/gate-pass/:gatePassId/product/:productId', verifyToken, validateObjectId('gatePassId'), validate([
   param('gatePassId').isMongoId().withMessage('Invalid gate pass ID'),
   body('productName').trim().notEmpty().withMessage('Product name required'),
@@ -2110,7 +2109,7 @@ app.put('/gate-pass/:gatePassId/product/:productId', verifyToken, validateObject
     res.status(500).send({ message: "Failed to update product" });
   }
 });
-
+ 
 app.delete('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid ID'),
 ]), async (req, res) => {
@@ -2126,9 +2125,9 @@ app.delete('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
     res.status(500).send({ message: "Failed to delete gate pass" });
   }
 });
-
+ 
 // ── Autocomplete ───────────────────────────────────────────────────────────────
-
+ 
 app.get("/autocomplete", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2160,9 +2159,9 @@ app.get("/autocomplete", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Autocomplete failed" });
   }
 });
-
+ 
 // ── Challan ────────────────────────────────────────────────────────────────────
-
+ 
 app.post("/challan", verifyToken, validate([
   body('customerName').trim().notEmpty().withMessage('Customer name required'),
   body('address').trim().notEmpty().withMessage('Address required'),
@@ -2193,7 +2192,7 @@ app.post("/challan", verifyToken, validate([
     res.status(500).send({ message: "Failed to add challan" });
   }
 });
-
+ 
 app.get("/challan/recent", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2205,7 +2204,7 @@ app.get("/challan/recent", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Failed to fetch recent challan" });
   }
 });
-
+ 
 app.get("/challans", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2216,7 +2215,7 @@ app.get("/challans", verifyToken, async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
-
+ 
     // ── Server-side column filters ─────────────────────────────────
     const customerFilter = req.query.customer || "";
     const zoneFilter = req.query.zone || "";
@@ -2226,7 +2225,7 @@ app.get("/challans", verifyToken, async (req, res) => {
     const modelFilter = req.query.model || "";
     const productNameFilter = req.query.productName || "";
     const dateFilter = req.query.date || "";
-
+ 
     let query = {};
     if (search) {
       query.$or = [
@@ -2262,7 +2261,7 @@ app.get("/challans", verifyToken, async (req, res) => {
       nextDay.setDate(nextDay.getDate() + 1);
       query.createdAt = { $gte: filterDate, $lt: nextDay };
     }
-
+ 
     const [data, total] = await Promise.all([
       challanCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
       challanCollection.countDocuments(query),
@@ -2281,7 +2280,7 @@ app.get("/challans", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Failed to fetch challans" });
   }
 });
-
+ 
 app.get("/challans/filter-options", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2333,7 +2332,7 @@ app.get("/challans/filter-options", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Failed to fetch filter options" });
   }
 });
-
+ 
 app.delete("/challan/:id", verifyToken, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid ID'),
 ]), async (req, res) => {
@@ -2347,7 +2346,7 @@ app.delete("/challan/:id", verifyToken, validateObjectId('id'), validate([
     res.status(500).send({ message: "Failed to delete challan" });
   }
 });
-
+ 
 app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid challan ID'),
   body('customerName').trim().notEmpty().withMessage('Customer name required'),
@@ -2370,8 +2369,8 @@ app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
     res.status(500).send({ message: "Failed to update challan" });
   }
 });
-
-
+ 
+ 
 app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId('challanId'), validate([
   param('challanId').isMongoId().withMessage('Invalid challan ID'),
   body('productName').trim().notEmpty().withMessage('Product name required'),
@@ -2402,8 +2401,8 @@ app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId(
     res.status(500).send({ message: "Failed to update product" });
   }
 });
-
-
+ 
+ 
 app.delete("/challans/:challanId/product/:productId", verifyToken, validateObjectId('challanId'), async (req, res) => {
   try {
     const db = await connectDB();
@@ -2423,7 +2422,7 @@ app.delete("/challans/:challanId/product/:productId", verifyToken, validateObjec
     res.status(500).send({ message: "Failed to delete product" });
   }
 });
-
+ 
 app.patch('/challans/:id', verifyToken, validateObjectId('id'), async (req, res) => {
   try {
     const db = await connectDB();
@@ -2443,9 +2442,9 @@ app.patch('/challans/:id', verifyToken, validateObjectId('id'), async (req, res)
     res.status(500).send({ message: "Update failed" });
   }
 });
-
+ 
 // ── Vendors ────────────────────────────────────────────────────────────────────
-
+ 
 app.post("/vendors", verifyToken, validate([
   body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
   body('vendorPhone').trim().notEmpty().withMessage('Phone required'),
@@ -2465,7 +2464,7 @@ app.post("/vendors", verifyToken, validate([
     res.status(500).send({ message: "Failed to add vendor" });
   }
 });
-
+ 
 app.get("/vendors", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2477,7 +2476,7 @@ app.get("/vendors", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Failed to fetch vendors" });
   }
 });
-
+ 
 app.get("/vendors/:id", verifyToken, validateObjectId('id'), async (req, res) => {
   try {
     const db = await connectDB();
@@ -2489,7 +2488,7 @@ app.get("/vendors/:id", verifyToken, validateObjectId('id'), async (req, res) =>
     res.status(500).send({ message: "Failed to fetch vendor" });
   }
 });
-
+ 
 app.patch("/vendors/:id", verifyToken, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid vendor ID'),
   body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
@@ -2508,7 +2507,7 @@ app.patch("/vendors/:id", verifyToken, validateObjectId('id'), validate([
     res.status(500).send({ message: "Failed to update vendor" });
   }
 });
-
+ 
 app.delete("/vendors/:id", verifyToken, verifyAdmin, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid ID'),
 ]), async (req, res) => {
@@ -2522,9 +2521,9 @@ app.delete("/vendors/:id", verifyToken, verifyAdmin, validateObjectId('id'), val
     res.status(500).send({ message: "Failed to delete vendor" });
   }
 });
-
+ 
 // ── Vehicles ───────────────────────────────────────────────────────────────────
-
+ 
 app.get("/vehicles/search", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2552,7 +2551,7 @@ app.get("/vehicles/search", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Server Error" });
   }
 });
-
+ 
 app.post("/vehicles", verifyToken, validate([
   body('vendorId').isMongoId().withMessage('Invalid vendor ID'),
   body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
@@ -2577,7 +2576,7 @@ app.post("/vehicles", verifyToken, validate([
     res.status(500).send({ error: "Failed to add vehicle" });
   }
 });
-
+ 
 app.delete("/vehicles/:vendorId/:vehicleId", verifyToken,
   validateObjectId('vendorId'),
   validateObjectId('vehicleId'),
@@ -2601,7 +2600,7 @@ app.delete("/vehicles/:vendorId/:vehicleId", verifyToken,
     }
   }
 );
-
+ 
 app.put("/vehicles/:vendorId/:vehicleId", verifyToken,
   validateObjectId('vendorId'),
   validateObjectId('vehicleId'),
@@ -2634,9 +2633,9 @@ app.put("/vehicles/:vendorId/:vehicleId", verifyToken,
     }
   }
 );
-
+ 
 // ── Deliveries ─────────────────────────────────────────────────────────────────
-
+ 
 app.post("/deliveries", verifyToken, validate([
   body().isArray({ min: 1 }).withMessage('At least one delivery required'),
   body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
@@ -2665,23 +2664,23 @@ app.post("/deliveries", verifyToken, validate([
         );
         const seq = counter?.seq ?? counter?.value?.seq ?? 1;
         tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
-
+ 
         const challanIds = deliveries.map(d =>
           typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
         );
-
+ 
         // ── Already delivered check ────────────────────────────────
         const alreadyDelivered = await challanCollection.find(
           { _id: { $in: challanIds }, status: "delivered" },
           { session }
         ).toArray();
-
+ 
         if (alreadyDelivered.length > 0) {
           const names = alreadyDelivered.map(c => c.customerName).join(", ");
           throw new Error(`Already delivered: ${names}`);
         }
         // ──────────────────────────────────────────────────────────
-
+ 
         const tripDocument = {
           tripNumber,
           vehicleNumber: deliveries[0].vehicleNumber,
@@ -2708,7 +2707,7 @@ app.post("/deliveries", verifyToken, validate([
           })),
           createdAt: new Date()
         };
-
+ 
         result = await deliveriesCollection.insertOne(tripDocument, { session });
         await challanCollection.updateMany(
           { _id: { $in: challanIds } },
@@ -2729,8 +2728,8 @@ app.post("/deliveries", verifyToken, validate([
     res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
   }
 });
-
-
+ 
+ 
 app.get("/deliveries", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2742,7 +2741,7 @@ app.get("/deliveries", verifyToken, async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
     let query = {};
-
+ 
     if (search) {
       query.$or = [
         { tripNumber:                        { $regex: search, $options: "i" } },
@@ -2768,12 +2767,12 @@ app.get("/deliveries", verifyToken, async (req, res) => {
       const endDate = new Date(year, month, 0, 23, 59, 59, 999);
       query.createdAt = { $gte: startDate, $lte: endDate };
     }
-
+ 
     const [data, total] = await Promise.all([
       deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
       deliveriesCollection.countDocuments(query),
     ]);
-
+ 
     res.send({
       success: true, data,
       pagination: {
@@ -2788,7 +2787,7 @@ app.get("/deliveries", verifyToken, async (req, res) => {
     res.status(500).send({ success: false, message: "Failed to fetch deliveries" });
   }
 });
-
+ 
 app.patch("/deliveries/confirm", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2811,7 +2810,7 @@ app.patch("/deliveries/confirm", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Confirm failed" });
   }
 });
-
+ 
 app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -2833,8 +2832,8 @@ app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Challan return update failed" });
   }
 });
-
-
+ 
+ 
 // ── Edit full challan info inside a trip ───────────────────────────
 app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
@@ -2842,7 +2841,7 @@ app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectI
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
     const { customerName, address, thana, district, receiverNumber, zone, updatedBy } = req.body; // ← updatedBy নাও
-
+ 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
       {
@@ -2860,7 +2859,7 @@ app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectI
     );
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Challan not found in trip" });
-
+ 
     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     res.send({ success: true, data: updated }); // ← data return করো
   } catch (err) {
@@ -2868,7 +2867,7 @@ app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectI
     res.status(500).send({ message: "Failed to update challan" });
   }
 });
-
+ 
 // ── Edit a product inside a trip's challan ─────────────────────────
 app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
@@ -2876,17 +2875,17 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId, productId } = req.params;
     const { productName, model, quantity } = req.body;
-
+ 
     // Fetch the trip, find challan index, update product in that challan
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
-
+ 
     const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
     if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
-
+ 
     const productIndex = trip.challans[challanIndex].products.findIndex(p => p._id === productId);
     if (productIndex === -1) return res.status(404).send({ success: false, message: "Product not found" });
-
+ 
     const updateField = `challans.${challanIndex}.products.${productIndex}`;
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
@@ -2902,23 +2901,23 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
     res.status(500).send({ message: "Failed to update product" });
   }
 });
-
+ 
 // ── Delete a product inside a trip's challan ───────────────────────
 app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId, productId } = req.params;
-
+ 
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
-
+ 
     const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
     if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
-
+ 
     if (trip.challans[challanIndex].products.length <= 1)
       return res.status(400).send({ success: false, message: "Cannot remove last product" });
-
+ 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
       { $pull: { [`challans.${challanIndex}.products`]: { _id: productId } } }
@@ -2929,7 +2928,7 @@ app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTo
     res.status(500).send({ message: "Failed to delete product" });
   }
 });
-
+ 
 // ── Add a product to a trip's challan ─────────────────────────────
 app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
@@ -2937,22 +2936,22 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, validate
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
     const { productName, model, quantity } = req.body;
-
+ 
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
-
+ 
     const challanIndex = trip.challans.findIndex(c =>
       c.challanId === challanId || c.challanId?.toString() === challanId
     );
     if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
-
+ 
     const newProduct = {
       _id: new ObjectId().toString(),
       productName,
       model,
       quantity: Number(quantity)
     };
-
+ 
     await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
       { $push: { [`challans.${challanIndex}.products`]: newProduct } }
@@ -2963,26 +2962,26 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, validate
     res.status(500).send({ message: "Failed to add product" });
   }
 });
-
+ 
 // ── Delete a full challan from a trip ─────────────────────────────
 app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-
+ 
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
     if (trip.challans.length <= 1)
       return res.status(400).send({ success: false, message: "Cannot remove last challan from trip" });
-
+ 
     // challan টা আসলে DB তে কোন format এ আছে সেটা দেখো
     const targetChallan = trip.challans.find(c => 
       c.challanId === challanId || c.challanId?.toString() === challanId
     );
     if (!targetChallan)
       return res.status(404).send({ success: false, message: "Challan not found in trip" });
-
+ 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
       {
@@ -2996,7 +2995,7 @@ app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, validateObject
     res.status(500).send({ message: "Failed to delete challan" });
   }
 });
-
+ 
 // ── Edit trip vehicle/driver/vendor info ───────────────────────────
 app.patch("/deliveries/:tripId/trip-info", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
@@ -3004,7 +3003,7 @@ app.patch("/deliveries/:tripId/trip-info", verifyToken, validateObjectId('tripId
     const deliveriesCollection = db.collection('deliveries');
     const { tripId } = req.params;
     const { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber, updatedBy } = req.body;
-
+ 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
       {
@@ -3018,7 +3017,7 @@ app.patch("/deliveries/:tripId/trip-info", verifyToken, validateObjectId('tripId
     );
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Trip not found" });
-
+ 
     // ← data return করো, frontend এটা serverData হিসেবে পাবে
     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     res.send({ success: true, data: updated });
@@ -3027,8 +3026,8 @@ app.patch("/deliveries/:tripId/trip-info", verifyToken, validateObjectId('tripId
     res.status(500).send({ message: "Failed to update trip info" });
   }
 });
-
-
+ 
+ 
 // ── Add/Update return products for a challan ───────────────────────
 app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
@@ -3037,7 +3036,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, validate
     const { tripId, challanId } = req.params;
     const { returnedProducts, returnNote,updatedBy  } = req.body;
     // returnedProducts: [{ _id, productName, model, returnQty }]
-
+ 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
       {
@@ -3058,7 +3057,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, validate
     res.status(500).send({ message: "Failed to update return" });
   }
 });
-
+ 
 // ── Add/Update note for a challan ──────────────────────────────────
 app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
@@ -3066,7 +3065,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, validateOb
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
     const { note,updatedBy  } = req.body;
-
+ 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
       { $set: { "challans.$.note": note, "challans.$.noteUpdatedAt": new Date(),
@@ -3082,7 +3081,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, validateOb
     res.status(500).send({ message: "Failed to update note" });
   }
 });
-
+ 
 // ── Add return challan to trip ─────────────────────────────────────
 app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
@@ -3097,7 +3096,7 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
 } = req.body;
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
-
+ 
     // Return challan object
     const returnChallan = {
       challanId:        `return_${originalChallanId}_${Date.now()}`,
@@ -3120,7 +3119,7 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
       deliveryStatus:   "return",
       challanReturnStatus: null,
     };
-
+ 
     await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
       {
@@ -3128,7 +3127,7 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
         $inc:  { totalChallan: 1 }
       }
     );
-
+ 
     // Also update original challan's returnedProducts
     await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": originalChallanId },
@@ -3142,16 +3141,16 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
         }
       }
     );
-
+ 
     res.send({ success: true, returnChallan });
   } catch (err) {
     logger.error("Return challan add failed", err);
     res.status(500).send({ message: "Failed to add return challan" });
   }
 });
-
+ 
 // ── Car Rent ───────────────────────────────────────────────────────────────────
-
+ 
 app.get("/car-rents", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -3162,7 +3161,7 @@ app.get("/car-rents", verifyToken, async (req, res) => {
     const page  = parseInt(req.query.page)  || 1;
     const limit = parseInt(req.query.limit) || 50;
     const skip  = (page - 1) * limit;
-
+ 
     let query = {};
     if (search) {
       query.$or = [
@@ -3181,12 +3180,12 @@ app.get("/car-rents", verifyToken, async (req, res) => {
       const endDate   = new Date(year, month, 0, 23, 59, 59, 999);
       query.createdAt = { $gte: startDate, $lte: endDate };
     }
-
+ 
     const [data, total] = await Promise.all([
       deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
       deliveriesCollection.countDocuments(query),
     ]);
-
+ 
     res.send({
       success: true, data,
       pagination: { total, page, limit,
@@ -3200,7 +3199,7 @@ app.get("/car-rents", verifyToken, async (req, res) => {
     res.status(500).send({ success: false, message: "Failed to fetch car rents" });
   }
 });
-
+ 
 // ── Update rent & leborBill for a trip ─────────────────────────────
 app.patch("/car-rents/:tripId", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
@@ -3222,15 +3221,15 @@ app.patch("/car-rents/:tripId", verifyToken, validateObjectId('tripId'), async (
     res.status(500).send({ message: "Failed to update" });
   }
 });
-
-
+ 
+ 
 // ── Update advance amount for a trip ──────────────────────────────
 app.patch("/deliveries/:tripId/advance", verifyToken, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { advance, updatedBy } = req.body;
-
+ 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(req.params.tripId) },
       {
@@ -3243,7 +3242,7 @@ app.patch("/deliveries/:tripId/advance", verifyToken, validateObjectId('tripId')
     );
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Trip not found" });
-
+ 
     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(req.params.tripId) });
     res.send({ success: true, data: updated });
   } catch (err) {
@@ -3267,7 +3266,7 @@ app.patch("/deliveries/:tripId/advance", verifyToken, validateObjectId('tripId')
 //    createdBy:   string
 //    createdAt:   Date
 //  }
-
+ 
 app.post("/accounts", verifyToken, validate([
   body("type").isIn(["income","expense","vendor_payment","auto_advance","manual_advance","advance_adjust","carry_forward"]).withMessage("Invalid type"),
   body("amount").isFloat().withMessage("Amount must be a number"), // advance_adjust negative হতে পারে
@@ -3299,7 +3298,7 @@ app.post("/accounts", verifyToken, validate([
     res.status(500).send({ message: "Failed to add transaction" });
   }
 });
-
+ 
 app.get("/accounts", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
@@ -3318,23 +3317,93 @@ app.get("/accounts", verifyToken, async (req, res) => {
     res.status(500).send({ message: "Failed to fetch transactions" });
   }
 });
-
+ 
 app.delete("/accounts/:id", verifyToken, validateObjectId("id"), async (req, res) => {
   try {
     const db = await connectDB();
     const col = db.collection("accounts");
-    // auto_advance গুলো delete করা যাবে না
+    const auditCol = db.collection("audit_logs");
+ 
     const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
     if (!doc) return res.status(404).send({ success: false, message: "Transaction not found" });
-    if (doc.type === "auto_advance") return res.status(403).send({ success: false, message: "Auto transactions cannot be deleted" }); // manual_advance delete করা যাবে
+    if (doc.type === "auto_advance") return res.status(403).send({ success: false, message: "Auto transactions cannot be deleted" });
+ 
+    // ── Delete reason (optional — frontend থেকে পাঠাতে পারবে)
+    const reason = req.body?.reason?.trim() || "";
+ 
+    // ── Audit log save করো delete করার আগে
+    await auditCol.insertOne({
+      action: "DELETE_TRANSACTION",
+      collectionName: "accounts",
+      documentId: doc._id,
+      deletedDocument: doc,          // পুরো document টা save করো
+      reason,
+      performedBy: {
+        email: req.user?.email || "unknown",
+        role:  req.user?.role  || "unknown",
+      },
+      performedAt: new Date(),
+      ipAddress: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown",
+    });
+ 
     await col.deleteOne({ _id: new ObjectId(req.params.id) });
+    logger.info("Account tx deleted with audit log", { id: req.params.id, by: req.user?.email });
     res.send({ success: true });
   } catch (err) {
     logger.error("Account tx delete failed", err);
     res.status(500).send({ message: "Failed to delete transaction" });
   }
 });
-
+ 
+// ── Get Audit Logs ─────────────────────────────────────────────────
+app.get("/audit-logs", verifyToken, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection("audit_logs");
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
+    const skip  = (page - 1) * limit;
+ 
+    // Filter options
+    const filter = {};
+    if (req.query.action)      filter.action       = req.query.action;
+    if (req.query.performedBy) filter["performedBy.email"] = { $regex: req.query.performedBy, $options: "i" };
+ 
+    const [data, total] = await Promise.all([
+      col.find(filter).sort({ performedAt: -1 }).skip(skip).limit(limit).toArray(),
+      col.countDocuments(filter),
+    ]);
+    res.send({ success: true, data, total, page, limit });
+  } catch (err) {
+    logger.error("Audit log fetch failed", err);
+    res.status(500).send({ message: "Failed to fetch audit logs" });
+  }
+});
+ 
+// ── Mark audit log entry as restored ──────────────────────────────
+app.patch("/audit-logs/:id/restored", verifyToken, validateObjectId("id"), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection("audit_logs");
+    const { restoredDocumentId } = req.body; // নতুন insert হওয়া document এর _id
+    const result = await col.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: {
+        isRestored: true,
+        restoredAt: new Date(),
+        restoredBy: { email: req.user?.email || "unknown", role: req.user?.role || "unknown" },
+        restoredDocumentId: restoredDocumentId || null,
+      }}
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Audit log not found" });
+    res.send({ success: true });
+  } catch (err) {
+    logger.error("Audit log restore mark failed", err);
+    res.status(500).send({ message: "Failed to mark as restored" });
+  }
+});
+ 
 // ── Mark manual advance as paid/unpaid ────────────────────────────
 app.patch("/accounts/:id/status", verifyToken, validateObjectId("id"), async (req, res) => {
   try {
@@ -3356,18 +3425,145 @@ app.patch("/accounts/:id/status", verifyToken, validateObjectId("id"), async (re
     res.status(500).send({ message: "Failed to update status" });
   }
 });
-
+ 
+// ── Dashboard Stats ────────────────────────────────────────────────
+app.get("/dashboard-stats", verifyToken, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const now = new Date();
+    const month = now.getMonth() + 1;
+    const year  = now.getFullYear();
+    const monthStart = new Date(year, month - 1, 1);
+    const monthEnd   = new Date(year, month, 1);
+ 
+    const [
+      gpModelAgg, gpMonthCount, gpTotalCount,
+      challanProductAgg, challanStatusAgg, challanTotalCount,
+      deliveryProductAgg, tripMonthCount, tripTotalCount, activeTripCount,
+      vendorCount, userCount,
+      accountsTxs, carRentThisMonth,
+      recentGatePasses, recentChallans,
+    ] = await Promise.all([
+ 
+      // Gate Pass: model-wise qty এই মাসে
+      db.collection('gate-pass').aggregate([
+        { $match: { tripMonth: month, tripYear: year } },
+        { $unwind: '$products' },
+        { $group: { _id: '$products.model', qty: { $sum: '$products.quantity' } } },
+        { $sort: { qty: -1 } },
+        { $limit: 8 },
+      ]).toArray(),
+      db.collection('gate-pass').countDocuments({ tripMonth: month, tripYear: year }),
+      db.collection('gate-pass').countDocuments(),
+ 
+      // Challan: productName-wise qty এই মাসে
+      db.collection('challans').aggregate([
+        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+        { $unwind: '$products' },
+        { $group: { _id: '$products.productName', qty: { $sum: '$products.quantity' } } },
+        { $sort: { qty: -1 } },
+        { $limit: 8 },
+      ]).toArray(),
+      // Challan status breakdown
+      db.collection('challans').aggregate([
+        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]).toArray(),
+      db.collection('challans').countDocuments(),
+ 
+      // Delivery: productName-wise qty এই মাসে
+      db.collection('deliveries').aggregate([
+        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+        { $unwind: '$challans' },
+        { $unwind: '$challans.products' },
+        { $group: { _id: '$challans.products.productName', qty: { $sum: '$challans.products.quantity' } } },
+        { $sort: { qty: -1 } },
+        { $limit: 8 },
+      ]).toArray(),
+      db.collection('deliveries').countDocuments({ createdAt: { $gte: monthStart, $lt: monthEnd } }),
+      db.collection('deliveries').countDocuments(),
+      db.collection('deliveries').countDocuments({
+        $or: [{ status: { $exists: false } }, { status: { $in: ['pending', 'in_progress'] } }]
+      }),
+ 
+      db.collection('vendors').countDocuments(),
+      db.collection('users').countDocuments(),
+ 
+      // Accounts এই মাসের
+      db.collection('accounts').find({ month, year }).toArray(),
+      // Car rent এই মাসের (advance জন্য)
+      db.collection('deliveries').find(
+        { createdAt: { $gte: monthStart, $lt: monthEnd } },
+        { projection: { advance: 1 } }
+      ).toArray(),
+ 
+      db.collection('gate-pass').find().sort({ createdAt: -1 }).limit(5).toArray(),
+      db.collection('challans').find().sort({ createdAt: -1 }).limit(5).toArray(),
+    ]);
+ 
+    // Challan status map
+    const csMap = {};
+    challanStatusAgg.forEach(s => { csMap[s._id || 'pending'] = s.count; });
+ 
+    // Accounts summary
+    const n = (v) => (v != null ? Number(v) : 0);
+    const income        = accountsTxs.filter(t => t.type === 'income').reduce((s,t) => s + n(t.amount), 0);
+    const expense       = accountsTxs.filter(t => t.type === 'expense').reduce((s,t) => s + n(t.amount), 0);
+    const vendorPayment = accountsTxs.filter(t => t.type === 'vendor_payment').reduce((s,t) => s + n(t.amount), 0);
+    const manualAdv     = accountsTxs.filter(t => t.type === 'manual_advance').reduce((s,t) => s + n(t.amount), 0);
+    const autoAdv       = carRentThisMonth.reduce((s,t) => s + n(t.advance), 0);
+    const totalExpense  = expense + vendorPayment + manualAdv + autoAdv;
+    const netBalance    = income - totalExpense;
+ 
+    res.send({
+      success: true,
+      data: {
+        currentMonth: month,
+        currentYear:  year,
+        gatePass: {
+          totalCount:      gpTotalCount,
+          monthCount:      gpMonthCount,
+          modelBreakdown:  gpModelAgg,        // [{ _id: 'WFR-120', qty: 48 }, ...]
+        },
+        challan: {
+          totalCount:       challanTotalCount,
+          monthTotal:       challanStatusAgg.reduce((s,x) => s + x.count, 0),
+          delivered:        csMap['delivered'] || 0,
+          pending:          csMap['pending']   || 0,
+          returned:         csMap['returned']  || 0,
+          productBreakdown: challanProductAgg, // [{ _id: 'Refrigerator', qty: 200 }, ...]
+        },
+        trip: {
+          totalCount:       tripTotalCount,
+          monthCount:       tripMonthCount,
+          activeCount:      activeTripCount,
+          productBreakdown: deliveryProductAgg,
+        },
+        vendor: { totalCount: vendorCount },
+        user:   { totalCount: userCount },
+        accounts: { income, totalExpense, netBalance, vendorPayment, autoAdv, manualAdv },
+        recentGatePasses,
+        recentChallans,
+      }
+    });
+  } catch (err) {
+    logger.error("Dashboard stats failed", err);
+    res.status(500).send({ message: "Failed to fetch stats" });
+  }
+});
+ 
+ 
 // ── Global Error Handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
   logger.error("Unhandled error", err);
   res.status(500).send({ message: "Internal Server Error" });
 });
-
+ 
 // ── Start Server ───────────────────────────────────────────────────
 if (process.env.NODE_ENV !== "production") {
   app.listen(port, () => {
     logger.info(`Server running`, { port });
   });
 }
-
+ 
 module.exports = app;
