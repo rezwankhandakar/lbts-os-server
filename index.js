@@ -3435,27 +3435,34 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
     const year  = now.getFullYear();
     const monthStart = new Date(year, month - 1, 1);
     const monthEnd   = new Date(year, month, 1);
- 
+
     const [
-      gpModelAgg, gpMonthCount, gpTotalCount,
+      gpUnitAgg, gpMonthCount, gpTotalCount,
       challanProductAgg, challanStatusAgg, challanTotalCount,
       deliveryProductAgg, tripMonthCount, tripTotalCount, activeTripCount,
       vendorCount, userCount,
       accountsTxs, carRentThisMonth,
-      recentGatePasses, recentChallans,
+      topDeliveryPoints,
     ] = await Promise.all([
- 
-      // Gate Pass: model-wise qty এই মাসে
+
+      // Gate Pass: unit-wise total qty এই মাসে (unit = top-level field, e.g. "WFR")
       db.collection('gate-pass').aggregate([
         { $match: { tripMonth: month, tripYear: year } },
         { $unwind: '$products' },
-        { $group: { _id: '$products.model', qty: { $sum: '$products.quantity' } } },
+        {
+          $group: {
+            _id: '$unit',
+            qty: { $sum: '$products.quantity' },
+            passCount: { $addToSet: '$_id' },
+          }
+        },
+        { $addFields: { passCount: { $size: '$passCount' } } },
         { $sort: { qty: -1 } },
-        { $limit: 8 },
+        { $limit: 10 },
       ]).toArray(),
       db.collection('gate-pass').countDocuments({ tripMonth: month, tripYear: year }),
       db.collection('gate-pass').countDocuments(),
- 
+
       // Challan: productName-wise qty এই মাসে
       db.collection('challans').aggregate([
         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
@@ -3470,7 +3477,7 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
         { $group: { _id: '$status', count: { $sum: 1 } } },
       ]).toArray(),
       db.collection('challans').countDocuments(),
- 
+
       // Delivery: productName-wise qty এই মাসে
       db.collection('deliveries').aggregate([
         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
@@ -3485,10 +3492,10 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
       db.collection('deliveries').countDocuments({
         $or: [{ status: { $exists: false } }, { status: { $in: ['pending', 'in_progress'] } }]
       }),
- 
+
       db.collection('vendors').countDocuments(),
       db.collection('users').countDocuments(),
- 
+
       // Accounts এই মাসের
       db.collection('accounts').find({ month, year }).toArray(),
       // Car rent এই মাসের (advance জন্য)
@@ -3496,15 +3503,20 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
         { createdAt: { $gte: monthStart, $lt: monthEnd } },
         { projection: { advance: 1 } }
       ).toArray(),
- 
-      db.collection('gate-pass').find().sort({ createdAt: -1 }).limit(5).toArray(),
-      db.collection('challans').find().sort({ createdAt: -1 }).limit(5).toArray(),
+
+      // Top delivery zones/points এই মাসে (challan zone-wise count)
+      db.collection('challans').aggregate([
+        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+        { $group: { _id: '$zone', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 5 },
+      ]).toArray(),
     ]);
- 
+
     // Challan status map
     const csMap = {};
     challanStatusAgg.forEach(s => { csMap[s._id || 'pending'] = s.count; });
- 
+
     // Accounts summary
     const n = (v) => (v != null ? Number(v) : 0);
     const income        = accountsTxs.filter(t => t.type === 'income').reduce((s,t) => s + n(t.amount), 0);
@@ -3514,16 +3526,16 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
     const autoAdv       = carRentThisMonth.reduce((s,t) => s + n(t.advance), 0);
     const totalExpense  = expense + vendorPayment + manualAdv + autoAdv;
     const netBalance    = income - totalExpense;
- 
+
     res.send({
       success: true,
       data: {
         currentMonth: month,
         currentYear:  year,
         gatePass: {
-          totalCount:      gpTotalCount,
-          monthCount:      gpMonthCount,
-          modelBreakdown:  gpModelAgg,        // [{ _id: 'WFR-120', qty: 48 }, ...]
+          totalCount:    gpTotalCount,
+          monthCount:    gpMonthCount,
+          unitBreakdown: gpUnitAgg,   // [{ _id: 'WFR', qty: 230, passCount: 5 }, ...]
         },
         challan: {
           totalCount:       challanTotalCount,
@@ -3531,7 +3543,7 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
           delivered:        csMap['delivered'] || 0,
           pending:          csMap['pending']   || 0,
           returned:         csMap['returned']  || 0,
-          productBreakdown: challanProductAgg, // [{ _id: 'Refrigerator', qty: 200 }, ...]
+          productBreakdown: challanProductAgg,
         },
         trip: {
           totalCount:       tripTotalCount,
@@ -3542,8 +3554,7 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
         vendor: { totalCount: vendorCount },
         user:   { totalCount: userCount },
         accounts: { income, totalExpense, netBalance, vendorPayment, autoAdv, manualAdv },
-        recentGatePasses,
-        recentChallans,
+        topDeliveryPoints,
       }
     });
   } catch (err) {
