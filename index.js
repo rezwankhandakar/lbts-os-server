@@ -1,3 +1,2244 @@
+// require("dotenv").config();
+
+// const express = require('express');
+// const cors = require('cors');
+// const rateLimit = require('express-rate-limit');
+// const jwt = require('jsonwebtoken');
+// const JWT_SECRET = process.env.JWT_SECRET;
+
+// const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+
+// // ── Firebase Admin SDK (for secure ID token verification) ──
+// const { initFirebaseAdmin, verifyFirebaseIdToken } = require('./config/firebaseAdmin');
+// initFirebaseAdmin(); // Fail fast on startup if credentials missing
+
+// const app = express();
+// const port = process.env.PORT || 3000;
+
+// const multer = require('multer');
+// const FormData = require('form-data');
+// const axios = require('axios');
+// const helmet = require('helmet');
+
+// const multerUpload = multer({
+//   storage: multer.memoryStorage(),
+//   limits: { fileSize: 5 * 1024 * 1024 },
+//   fileFilter: (req, file, cb) => {
+//     const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+//     if (allowed.includes(file.mimetype)) {
+//       cb(null, true);
+//     } else {
+//       cb(new Error('Only JPEG, PNG, WEBP allowed'));
+//     }
+//   }
+// });
+
+// const { body, param, query, validationResult } = require('express-validator');
+
+// const validate = (validations) => async (req, res, next) => {
+//   await Promise.all(validations.map(v => v.run(req)));
+//   const errors = validationResult(req);
+//   if (!errors.isEmpty()) {
+//     return res.status(400).send({
+//       success: false,
+//       message: 'Validation failed',
+//       errors: errors.array().map(e => ({ field: e.path, message: e.msg }))
+//     });
+//   }
+//   next();
+// };
+
+// // ── Simple Logger ──────────────────────────────────────────────────
+// const logger = {
+//   info: (msg, data = {}) => console.log(JSON.stringify({
+//     level: "info", msg, ...data, time: new Date().toISOString()
+//   })),
+//   error: (msg, err = {}) => console.error(JSON.stringify({
+//     level: "error", msg,
+//     error: err?.message || String(err),
+//     stack: err?.stack,
+//     time: new Date().toISOString()
+//   })),
+//   warn: (msg, data = {}) => console.warn(JSON.stringify({
+//     level: "warn", msg, ...data, time: new Date().toISOString()
+//   })),
+// };
+
+// // ── Rate Limiters ──────────────────────────────────────────────────
+// const authLimiter = rateLimit({
+//   windowMs: 15 * 60 * 1000,
+//   max: 20,
+//   standardHeaders: true,
+//   legacyHeaders: false,
+//   validate: { xForwardedForHeader: false },
+//   message: { success: false, message: 'Too many login attempts, please try again after 15 minutes' }
+// });
+
+// // ── CORS ───────────────────────────────────────────────────────────
+// const allowedOrigins = process.env.ALLOWED_ORIGINS
+//   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+//   : ['http://localhost:5173'];
+
+// app.use(cors({
+//   origin: (origin, callback) => {
+//     if (!origin || allowedOrigins.includes(origin)) {
+//       callback(null, true);
+//     } else {
+//       callback(new Error(`CORS blocked: ${origin}`));
+//     }
+//   },
+//   credentials: true
+// }));
+
+// // ── Security Headers ───────────────────────────────────────────────
+// app.use(helmet({
+//   crossOriginResourcePolicy: { policy: "cross-origin" }, // imgbb image load এর জন্য
+// }));
+
+// app.use(express.json());
+
+// // ── Environment Validation (Fail Fast on Startup) ──────────────────
+
+// const REQUIRED_ENV = [
+//   'DB_USER',
+//   'DB_PASS',
+//   'JWT_SECRET',
+//   // Firebase Admin (at least one group required — checked by firebaseAdmin.js)
+// ];
+
+
+// // Firebase env check happens inside initFirebaseAdmin() — will throw descriptive error
+
+// const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+// if (missingEnv.length > 0) {
+//   throw new Error(
+//     `Missing required environment variables: ${missingEnv.join(', ')}. ` +
+//     `Please set them in .env file or Vercel dashboard.`
+//   );
+// }
+
+// // ── MongoDB Connection (Serverless-Optimized) ──────────────────────
+// const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority&appName=LBTS-OS`;
+
+// // Cached across serverless warm invocations
+// let cachedConnection = null;
+// let connectionPromise = null;
+
+// async function getConnection() {
+//   // 1️⃣ If already connected and healthy, reuse
+//   if (cachedConnection) {
+//     try {
+//       // Quick ping to verify connection is still alive (costs ~5ms)
+//       await cachedConnection.client.db('admin').command({ ping: 1 });
+//       return cachedConnection;
+//     } catch (err) {
+//       logger.warn('Cached MongoDB connection unhealthy, reconnecting', {
+//         error: err.message
+//       });
+//       // Fire-and-forget cleanup; don't await
+//       cachedConnection.client.close().catch(() => { });
+//       cachedConnection = null;
+//       connectionPromise = null;
+//     }
+//   }
+
+//   // 2️⃣ If connection already in progress, wait for it (prevents race condition)
+//   if (connectionPromise) {
+//     return connectionPromise;
+//   }
+
+//   // 3️⃣ Start new connection
+//   connectionPromise = (async () => {
+//     const client = new MongoClient(uri, {
+//       serverApi: {
+//         version: ServerApiVersion.v1,
+//         strict: false,           // false: allows transactions, sessions, all ops
+//         deprecationErrors: true,
+//       },
+//       // ── Serverless-tuned pool settings for MongoDB Atlas M0 (Free) ──
+//       // M0 hard cap: 500 connections. With 20 warm Vercel instances × 3 = 60 conn used (safe).
+//       maxPoolSize: 3,
+//       minPoolSize: 0,              // No idle connections kept
+//       maxIdleTimeMS: 10000,        // Close idle after 10s (was 30s — too long for serverless)
+//       serverSelectionTimeoutMS: 5000,
+//       socketTimeoutMS: 45000,
+//       connectTimeoutMS: 10000,
+//       waitQueueTimeoutMS: 5000,    // Don't let requests queue forever
+//       retryWrites: true,
+//       retryReads: true,
+//     });
+
+//     try {
+//       await client.connect();
+//       const db = client.db('LBTS-OS-DB');
+//       logger.info('MongoDB Connected', {
+//         poolSize: 3,
+//         appName: 'LBTS-OS',
+//       });
+//       cachedConnection = { client, db };
+//       return cachedConnection;
+//     } catch (err) {
+//       logger.error('MongoDB Connection failed', err);
+//       throw err;
+//     }
+//   })();
+
+//   try {
+//     return await connectionPromise;
+//   } catch (err) {
+//     connectionPromise = null;     // Reset so next request retries fresh
+//     throw err;
+//   }
+// }
+
+// // ── Backward-compatible helper — returns db only (used by all existing routes) ──
+// async function connectDB() {
+//   const { db } = await getConnection();
+//   return db;
+// }
+
+// // ── Graceful shutdown (Vercel SIGTERM handling) ────────────────────
+// const gracefulShutdown = async (signal) => {
+//   logger.info(`${signal} received, closing MongoDB connection`);
+//   if (cachedConnection?.client) {
+//     try {
+//       await cachedConnection.client.close();
+//       logger.info('MongoDB connection closed cleanly');
+//     } catch (err) {
+//       logger.error('Error closing MongoDB', err);
+//     }
+//   }
+//   process.exit(0);
+// };
+// process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+// process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// // ── JWT Verify Middleware ──────────────────────────────────────────
+// function verifyToken(req, res, next) {
+//   const authHeader = req.headers.authorization;
+
+//   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+//     return res.status(401).send({ message: 'Unauthorized: No token provided' });
+//   }
+
+//   const token = authHeader.split(' ')[1];
+
+//   try {
+//     const decoded = jwt.verify(token, JWT_SECRET);
+//     req.user = decoded;
+//     next();
+//   } catch (err) {
+//     return res.status(401).send({ message: 'Unauthorized: Invalid or expired token' });
+//   }
+// }
+
+// // ── Admin only middleware ──────────────────────────────────────────
+// function verifyAdmin(req, res, next) {
+//   if (req.user?.role !== 'admin' || req.user?.status !== 'approved') {
+//     return res.status(403).send({ message: 'Forbidden: Admins only' });
+//   }
+//   next();
+// }
+
+
+// // ── ObjectId Validation Helper ─────────────────────────────────────
+// function isValidObjectId(id) {
+//   return ObjectId.isValid(id) && String(new ObjectId(id)) === id;
+// }
+
+// function validateObjectId(paramName = 'id') {
+//   return (req, res, next) => {
+//     const id = req.params[paramName];
+//     if (!isValidObjectId(id)) {
+//       return res.status(400).send({
+//         success: false,
+//         message: `Invalid ID format: ${paramName}`
+//       });
+//     }
+//     next();
+//   };
+// }
+
+// // ── Health Check ───────────────────────────────────────────────────
+// app.get('/', (req, res) => {
+//   res.send('LBTS-OS Server is running ✅');
+// });
+
+// // ── Image Upload ───────────────────────────────────────────────────
+// app.post('/upload-image', verifyToken, multerUpload.single('image'), async (req, res) => {
+//   try {
+//     if (!req.file) {
+//       return res.status(400).send({ success: false, message: 'No image provided' });
+//     }
+
+//     const formData = new FormData();
+//     formData.append('image', req.file.buffer.toString('base64'));
+
+//     const response = await axios.post(
+//       `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+//       formData,
+//       { headers: formData.getHeaders() }
+//     );
+
+//     res.send({ success: true, url: response.data.data.url });
+//   } catch (err) {
+//     logger.error("Image upload failed", err);
+//     res.status(500).send({ success: false, message: 'Image upload failed' });
+//   }
+// });
+
+// // ═══════════════════════════════════════════════════════════════════
+// // /jwt — Issue Application JWT after Firebase ID Token Verification
+// // ═══════════════════════════════════════════════════════════════════
+// //
+// // SECURITY MODEL:
+// //   Client sends Firebase ID token (proof they logged in via Firebase)
+// //   Server verifies token cryptographically using firebase-admin
+// //   Only then does server issue its own JWT for API calls
+// //
+// // Why app JWT instead of just using Firebase ID token for all API calls?
+// //   - Firebase ID tokens expire every 1 hour (frequent refresh needed)
+// //   - Our app JWT lasts 7 days (better UX, less overhead)
+// //   - App JWT carries role/status from our DB (Firebase doesn't know roles)
+// //
+// app.post('/jwt', authLimiter, async (req, res) => {
+//   try {
+//     // ── 1. Extract Firebase ID token ──
+//     // Support both body.idToken (preferred) and Authorization header
+//     let idToken = req.body?.idToken;
+//     if (!idToken) {
+//       const authHeader = req.headers.authorization;
+//       if (authHeader?.startsWith('Bearer ')) {
+//         idToken = authHeader.split(' ')[1];
+//       }
+//     }
+
+//     if (!idToken) {
+//       return res.status(400).send({
+//         success: false,
+//         message: 'Firebase ID token required',
+//         code: 'missing-token',
+//       });
+//     }
+
+//     // ── 2. Cryptographically verify the token ──
+//     const verification = await verifyFirebaseIdToken(idToken);
+
+//     if (!verification.valid) {
+//       logger.warn('Firebase ID token verification failed', {
+//         error: verification.error,
+//         message: verification.message,
+//         ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress,
+//       });
+
+//       // Return appropriate status code based on error type
+//       const isExpired = verification.error === 'auth/id-token-expired';
+//       return res.status(401).send({
+//         success: false,
+//         message: isExpired
+//           ? 'Session expired. Please refresh to continue.'
+//           : 'Invalid session. Please log in again.',
+//         code: verification.error,
+//       });
+//     }
+
+//     // ── 3. Get verified email (from Firebase, NOT client body) ──
+//     // This is the critical security point: email comes from the verified
+//     // token, not from whatever the client sent. Client CANNOT spoof email.
+//     const email = verification.email;
+
+//     if (!email) {
+//       return res.status(400).send({
+//         success: false,
+//         message: 'No email in Firebase session',
+//         code: 'no-email',
+//       });
+//     }
+
+//     // ── 4. Lookup user in our DB for role/status ──
+//     const db = await connectDB();
+//     const userCollection = db.collection('users');
+//     const user = await userCollection.findOne({ email });
+
+//     // ── 5. Build JWT payload ──
+//     // Role/status come from DB (not client). UID from verified token.
+//     const payload = {
+//       uid: verification.uid,
+//       email,
+//       role: user?.role || 'user',
+//       status: user?.status || 'pending',
+//       ...(user?.vendorName ? { vendorName: user.vendorName } : {}),
+//     };
+
+//     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+
+//     // ── 6. Return token + user info ──
+//     res.send({
+//       success: true,
+//       token,
+//       user: {
+//         email,
+//         role: payload.role,
+//         status: payload.status,
+//         uid: payload.uid,
+//         ...(payload.vendorName ? { vendorName: payload.vendorName } : {}),
+//       },
+//     });
+//   } catch (err) {
+//     logger.error('JWT issuance failed', err);
+//     res.status(500).send({
+//       success: false,
+//       message: 'Token generation failed',
+//     });
+//   }
+// });
+
+// // ── Users ──────────────────────────────────────────────────────────────────────
+
+// // ── Users ──────────────────────────────────────────────────────────────────────
+
+// app.post('/users', authLimiter, validate([
+//   body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
+//   body('displayName').trim().notEmpty().withMessage('Name required'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const userCollection = db.collection('users');
+//     const user = req.body;
+//     const exists = await userCollection.findOne({ email: user.email });
+//     if (exists) return res.send({ message: 'User already exists' });
+//     user.role = 'user';
+//     user.status = 'pending';
+//     const result = await userCollection.insertOne(user);
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: 'Failed to add user' });
+//   }
+// });
+
+// app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const userCollection = db.collection('users');
+//     const result = await userCollection.find().toArray();
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: 'Failed to fetch users' });
+//   }
+// });
+
+// app.get('/users/:email/role', verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const userCollection = db.collection('users');
+//     const user = await userCollection.findOne({ email: req.params.email });
+//     if (!user) return res.status(404).send({ message: 'User not found' });
+//     res.send({
+//       role: user.role,
+//       status: user.status,
+//       vendorName: user.vendorName || null,  // ← ADD
+//     });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: 'Failed to fetch user role' });
+//   }
+// });
+
+// // app.patch('/users/role/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
+// //   param('id').isMongoId().withMessage('Invalid user ID'),
+// //   body('role').isIn(['admin', 'manager', 'operator', 'user', 'ceo','vendor']).withMessage('Invalid role'),
+// // ]), async (req, res) => {
+// //   try {
+// //     const db = await connectDB();
+// //     const userCollection = db.collection('users');
+// //     const { role } = req.body;
+// //     const result = await userCollection.updateOne(
+// //       { _id: new ObjectId(req.params.id) },
+// //       { $set: { role } }
+// //     );
+// //     res.send(result);
+// //   } catch (err) {
+// //     console.error(err);
+// //     res.status(500).send({ message: 'Failed to update role' });
+// //   }
+// // });
+
+// app.patch('/users/role/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid user ID'),
+//   body('role').isIn(['admin', 'manager', 'operator', 'user', 'ceo', 'vendor']).withMessage('Invalid role'),
+//   body('vendorName').optional().trim(),  // ← ADD
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const userCollection = db.collection('users');
+//     const { role, vendorName } = req.body;  // ← vendorName নাও
+//     const setDoc = { role };
+//     if (role === 'vendor' && vendorName) setDoc.vendorName = vendorName;  // ← vendor হলে save করো
+//     const result = await userCollection.updateOne(
+//       { _id: new ObjectId(req.params.id) },
+//       { $set: setDoc }
+//     );
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: 'Failed to update role' });
+//   }
+// });
+
+// app.patch('/users/status/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid user ID'),
+//   body('status').isIn(['approved', 'pending', 'rejected']).withMessage('Invalid status'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const userCollection = db.collection('users');
+//     const { status } = req.body;
+//     const result = await userCollection.updateOne(
+//       { _id: new ObjectId(req.params.id) },
+//       { $set: { status } }
+//     );
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: 'Failed to update status' });
+//   }
+// });
+
+// app.delete('/users/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid user ID'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const userCollection = db.collection('users');
+//     const result = await userCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+//     if (result.deletedCount === 1) {
+//       res.send({ success: true, message: 'User deleted successfully' });
+//     } else {
+//       res.status(404).send({ success: false, message: 'User not found' });
+//     }
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: 'Failed to delete user' });
+//   }
+// });
+
+// // ── Gate Pass ──────────────────────────────────────────────────────────────────
+
+// app.post('/gate-pass', verifyToken, validate([
+//   body('tripDo').trim().notEmpty().withMessage('Trip Do required'),
+//   body('tripDate').isISO8601().withMessage('Valid date required'),
+//   body('customerName').trim().notEmpty().withMessage('Customer name required'),
+//   body('csd').trim().notEmpty().withMessage('CSD required'),
+//   body('vehicleNo').trim().notEmpty().withMessage('Vehicle number required'),
+//   body('zone').trim().notEmpty().withMessage('Zone required'),
+//   body('products').isArray({ min: 1 }).withMessage('At least one product required'),
+//   body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
+//   body('products.*.model').trim().notEmpty().withMessage('Model required'),
+//   body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const gatePassCollection = db.collection('gate-pass');
+//     const gatePass = req.body;
+//     if (gatePass.products && Array.isArray(gatePass.products)) {
+//       gatePass.products = gatePass.products.map(p => ({
+//         _id: new ObjectId().toString(),
+//         productName: p.productName,
+//         model: p.model,
+//         quantity: Number(p.quantity)
+//       }));
+//     }
+//     gatePass.createdAt = new Date();
+//     gatePass.tripMonth = new Date(gatePass.tripDate).getMonth() + 1;
+//     gatePass.tripYear = new Date(gatePass.tripDate).getFullYear();
+//     const result = await gatePassCollection.insertOne(gatePass);
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: 'Failed to add gate pass' });
+//   }
+// });
+
+// app.get("/gate-pass", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const gatePassCollection = db.collection('gate-pass');
+//     let month = parseInt(req.query.month);
+//     let year = parseInt(req.query.year);
+//     const search = req.query.search || "";
+//     const page = parseInt(req.query.page) || 1;
+//     const limit = parseInt(req.query.limit) || 50;
+//     const skip = (page - 1) * limit;
+//     let query = {};
+//     if (search) {
+//       query.$or = [
+//         { tripDo: { $regex: search, $options: "i" } },
+//         { customerName: { $regex: search, $options: "i" } },
+//         { csd: { $regex: search, $options: "i" } },
+//         { unit: { $regex: search, $options: "i" } },
+//         { vehicleNo: { $regex: search, $options: "i" } },
+//         { zone: { $regex: search, $options: "i" } },
+//         { "products.productName": { $regex: search, $options: "i" } },
+//         { "products.model": { $regex: search, $options: "i" } },
+//       ];
+//     } else {
+//       if (!month || !year) {
+//         const now = new Date();
+//         month = now.getMonth() + 1;
+//         year = now.getFullYear();
+//       }
+//       query.tripMonth = month;
+//       query.tripYear = year;
+//     }
+//     const [data, total] = await Promise.all([
+//       gatePassCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+//       gatePassCollection.countDocuments(query),
+//     ]);
+//     res.send({
+//       data,
+//       pagination: {
+//         total, page, limit,
+//         totalPages: Math.ceil(total / limit),
+//         hasNextPage: page < Math.ceil(total / limit),
+//         hasPrevPage: page > 1,
+//       }
+//     });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to fetch gate passes" });
+//   }
+// });
+
+// app.patch('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid gate pass ID'),
+//   body('customerName').trim().notEmpty().withMessage('Customer name required'),
+//   body('tripDate').isISO8601().withMessage('Valid date required'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const gatePassCollection = db.collection('gate-pass');
+//     const { tripDo, tripDate, customerName, csd, unit, vehicleNo, zone, currentUser } = req.body;
+//     await gatePassCollection.updateOne(
+//       { _id: new ObjectId(req.params.id) },
+//       {
+//         $set: {
+//           tripDo, tripDate, customerName, csd, unit, vehicleNo, zone, currentUser,
+//           tripMonth: new Date(tripDate).getMonth() + 1,
+//           tripYear: new Date(tripDate).getFullYear()
+//         }
+//       }
+//     );
+//     const updatedGatePass = await gatePassCollection.findOne({ _id: new ObjectId(req.params.id) });
+//     res.send({ success: true, data: updatedGatePass });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to update gate pass" });
+//   }
+// });
+
+// app.put('/gate-pass/:gatePassId/product/:productId', verifyToken, validateObjectId('gatePassId'), validate([
+//   param('gatePassId').isMongoId().withMessage('Invalid gate pass ID'),
+//   body('productName').trim().notEmpty().withMessage('Product name required'),
+//   body('model').trim().notEmpty().withMessage('Model required'),
+//   body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const gatePassCollection = db.collection('gate-pass');
+//     const { gatePassId, productId } = req.params;
+//     const { productName, model, quantity } = req.body;
+//     const result = await gatePassCollection.updateOne(
+//       { _id: new ObjectId(gatePassId), "products._id": productId },
+//       {
+//         $set: {
+//           "products.$.productName": productName,
+//           "products.$.model": model,
+//           "products.$.quantity": Number(quantity)
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Product not found" });
+//     const updatedGatePass = await gatePassCollection.findOne({ _id: new ObjectId(gatePassId) });
+//     res.send({ success: true, data: updatedGatePass });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to update product" });
+//   }
+// });
+
+// app.delete('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid ID'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const gatePassCollection = db.collection('gate-pass');
+//     const result = await gatePassCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+//     if (result.deletedCount === 0)
+//       return res.status(404).send({ success: false, message: "Gate Pass not found" });
+//     res.send({ success: true, message: "Gate Pass deleted successfully" });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to delete gate pass" });
+//   }
+// });
+
+// // ── Autocomplete ───────────────────────────────────────────────────────────────
+
+// app.get("/autocomplete", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const gatePassCollection = db.collection('gate-pass');
+//     const challanCollection = db.collection('challans');
+//     const { field, search, collection } = req.query;
+//     const targetCollection = collection === "challan" ? challanCollection : gatePassCollection;
+//     let pipeline = [];
+//     if (field === "productName" || field === "model") {
+//       pipeline = [
+//         { $unwind: "$products" },
+//         { $match: { [`products.${field}`]: { $regex: search || "", $options: "i" } } },
+//         { $group: { _id: `$products.${field}` } },
+//         { $project: { _id: 0, value: "$_id" } },
+//         { $limit: 5 },
+//       ];
+//     } else {
+//       pipeline = [
+//         { $match: { [field]: { $regex: search || "", $options: "i" } } },
+//         { $group: { _id: `$${field}` } },
+//         { $project: { _id: 0, value: "$_id" } },
+//         { $limit: 5 },
+//       ];
+//     }
+//     const result = await targetCollection.aggregate(pipeline).toArray();
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Autocomplete failed" });
+//   }
+// });
+
+// // ── Challan ────────────────────────────────────────────────────────────────────
+
+// app.post("/challan", verifyToken, validate([
+//   body('customerName').trim().notEmpty().withMessage('Customer name required'),
+//   body('address').trim().notEmpty().withMessage('Address required'),
+//   body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
+//   body('zone').trim().notEmpty().withMessage('Zone required'),
+//   body('products').isArray({ min: 1 }).withMessage('At least one product required'),
+//   body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
+//   body('products.*.model').trim().notEmpty().withMessage('Model required'),
+//   body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     const challan = req.body;
+//     if (challan.products && Array.isArray(challan.products)) {
+//       challan.products = challan.products.map(p => ({
+//         _id: new ObjectId().toString(),
+//         productName: p.productName,
+//         model: p.model,
+//         quantity: Number(p.quantity)
+//       }));
+//     }
+//     challan.createdAt = new Date();
+//     const result = await challanCollection.insertOne(challan);
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to add challan" });
+//   }
+// });
+
+// app.get("/challan/recent", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     const result = await challanCollection.find().sort({ createdAt: -1 }).limit(1).toArray();
+//     res.send({ data: result });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to fetch recent challan" });
+//   }
+// });
+
+// app.get("/challans", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     let month = parseInt(req.query.month);
+//     let year = parseInt(req.query.year);
+//     const search = req.query.search || "";
+//     const page = parseInt(req.query.page) || 1;
+//     const limit = parseInt(req.query.limit) || 50;
+//     const skip = (page - 1) * limit;
+
+//     // ── Server-side column filters ─────────────────────────────────
+//     const customerFilter = req.query.customer || "";
+//     const zoneFilter = req.query.zone || "";
+//     const districtFilter = req.query.district || "";
+//     const thanaFilter = req.query.thana || "";
+//     const receiverFilter = req.query.receiver || "";
+//     const modelFilter = req.query.model || "";
+//     const productNameFilter = req.query.productName || "";
+//     const dateFilter = req.query.date || "";
+
+//     let query = {};
+//     if (search) {
+//       query.$or = [
+//         { customerName: { $regex: search, $options: "i" } },
+//         { address: { $regex: search, $options: "i" } },
+//         { receiverNumber: { $regex: search, $options: "i" } },
+//         { zone: { $regex: search, $options: "i" } },
+//         { thana: { $regex: search, $options: "i" } },
+//         { district: { $regex: search, $options: "i" } },
+//         { "products.productName": { $regex: search, $options: "i" } },
+//         { "products.model": { $regex: search, $options: "i" } },
+//       ];
+//     } else {
+//       if (!month || !year) {
+//         const now = new Date();
+//         month = now.getMonth() + 1;
+//         year = now.getFullYear();
+//       }
+//       const startDate = new Date(year, month - 1, 1);
+//       const endDate = new Date(year, month, 0, 23, 59, 59);
+//       query.createdAt = { $gte: startDate, $lte: endDate };
+//     }
+//     if (customerFilter) query.customerName = { $regex: customerFilter, $options: "i" };
+//     if (zoneFilter) query.zone = { $regex: zoneFilter, $options: "i" };
+//     if (districtFilter) query.district = { $regex: districtFilter, $options: "i" };
+//     if (thanaFilter) query.thana = { $regex: thanaFilter, $options: "i" };
+//     if (receiverFilter) query.receiverNumber = { $regex: receiverFilter, $options: "i" };
+//     if (modelFilter) query["products.model"] = { $regex: modelFilter, $options: "i" };
+//     if (productNameFilter) query["products.productName"] = { $regex: productNameFilter, $options: "i" };
+//     if (dateFilter) {
+//       const filterDate = new Date(dateFilter);
+//       const nextDay = new Date(dateFilter);
+//       nextDay.setDate(nextDay.getDate() + 1);
+//       query.createdAt = { $gte: filterDate, $lt: nextDay };
+//     }
+
+//     const [data, total] = await Promise.all([
+//       challanCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+//       challanCollection.countDocuments(query),
+//     ]);
+//     res.send({
+//       data,
+//       pagination: {
+//         total, page, limit,
+//         totalPages: Math.ceil(total / limit),
+//         hasNextPage: page < Math.ceil(total / limit),
+//         hasPrevPage: page > 1,
+//       }
+//     });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to fetch challans" });
+//   }
+// });
+
+// app.get("/challans/filter-options", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     let month = parseInt(req.query.month);
+//     let year = parseInt(req.query.year);
+//     if (!month || !year) {
+//       const now = new Date();
+//       month = now.getMonth() + 1;
+//       year = now.getFullYear();
+//     }
+//     const startDate = new Date(year, month - 1, 1);
+//     const endDate = new Date(year, month, 0, 23, 59, 59);
+//     const baseQuery = { createdAt: { $gte: startDate, $lte: endDate } };
+//     const [result] = await challanCollection.aggregate([
+//       { $match: baseQuery },
+//       { $unwind: "$products" },
+//       {
+//         $group: {
+//           _id: null,
+//           customerNames: { $addToSet: "$customerName" },
+//           zones: { $addToSet: "$zone" },
+//           districts: { $addToSet: "$district" },
+//           thanas: { $addToSet: "$thana" },
+//           receivers: { $addToSet: "$receiverNumber" },
+//           models: { $addToSet: "$products.model" },
+//           productNames: { $addToSet: "$products.productName" },
+//         }
+//       },
+//       {
+//         $project: {
+//           _id: 0,
+//           customerNames: { $sortArray: { input: "$customerNames", sortBy: 1 } },
+//           zones: { $sortArray: { input: "$zones", sortBy: 1 } },
+//           districts: { $sortArray: { input: "$districts", sortBy: 1 } },
+//           thanas: { $sortArray: { input: "$thanas", sortBy: 1 } },
+//           receivers: { $sortArray: { input: "$receivers", sortBy: 1 } },
+//           models: { $sortArray: { input: "$models", sortBy: 1 } },
+//           productNames: { $sortArray: { input: "$productNames", sortBy: 1 } },
+//         }
+//       }
+//     ]).toArray();
+//     res.send({
+//       success: true,
+//       data: result || { customerNames: [], zones: [], districts: [], thanas: [], receivers: [], models: [], productNames: [] }
+//     });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to fetch filter options" });
+//   }
+// });
+
+// app.delete("/challan/:id", verifyToken, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid ID'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     const result = await challanCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to delete challan" });
+//   }
+// });
+
+// app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid challan ID'),
+//   body('customerName').trim().notEmpty().withMessage('Customer name required'),
+//   body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt } = req.body;
+//     const setDoc = { customerName, address, thana, district, receiverNumber, zone, currentUser };
+//     if (createdAt) {
+//       setDoc.month = new Date(createdAt).getMonth() + 1;
+//       setDoc.year = new Date(createdAt).getFullYear();
+//     }
+//     await challanCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: setDoc });
+//     const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(req.params.id) });
+//     res.send({ success: true, data: updatedChallan });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to update challan" });
+//   }
+// });
+
+
+// app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId('challanId'), validate([
+//   param('challanId').isMongoId().withMessage('Invalid challan ID'),
+//   body('productName').trim().notEmpty().withMessage('Product name required'),
+//   body('model').trim().notEmpty().withMessage('Model required'),
+//   body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     const { challanId, productId } = req.params;
+//     const { productName, model, quantity } = req.body;
+//     const result = await challanCollection.updateOne(
+//       { _id: new ObjectId(challanId), "products._id": productId },
+//       {
+//         $set: {
+//           "products.$.productName": productName,
+//           "products.$.model": model,
+//           "products.$.quantity": Number(quantity)
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Product not found" });
+//     const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(challanId) });
+//     res.send({ success: true, data: updatedChallan });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to update product" });
+//   }
+// });
+
+
+// app.delete("/challans/:challanId/product/:productId", verifyToken, validateObjectId('challanId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     const { challanId, productId } = req.params;
+//     const result = await challanCollection.updateOne(
+//       { _id: new ObjectId(challanId) },
+//       { $pull: { products: { _id: productId } } }
+//     );
+//     if (result.modifiedCount > 0) {
+//       res.send({ success: true, message: "Product removed from challan" });
+//     } else {
+//       res.status(404).send({ success: false, message: "Product not found" });
+//     }
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to delete product" });
+//   }
+// });
+
+// app.patch('/challans/:id', verifyToken, validateObjectId('id'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const challanCollection = db.collection('challans');
+//     const { customerName, receiverNumber, zone, address, thana, district, products } = req.body;
+//     const result = await challanCollection.updateOne(
+//       { _id: new ObjectId(req.params.id) },
+//       { $set: { customerName, receiverNumber, zone, address, thana, district, products } }
+//     );
+//     if (result.matchedCount > 0) {
+//       res.send({ success: true, message: "Challan and Products updated successfully" });
+//     } else {
+//       res.status(404).send({ success: false, message: "Challan not found" });
+//     }
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Update failed" });
+//   }
+// });
+
+// // ── Vendors ────────────────────────────────────────────────────────────────────
+
+// app.post("/vendors", verifyToken, validate([
+//   body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
+//   body('vendorPhone').trim().notEmpty().withMessage('Phone required'),
+//   body('vendorAddress').trim().notEmpty().withMessage('Address required'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const vendorsCollection = db.collection('vendors');
+//     const result = await vendorsCollection.insertOne({
+//       ...req.body,
+//       vehicles: [],
+//       createdAt: new Date(),
+//     });
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to add vendor" });
+//   }
+// });
+
+// // app.get("/vendors", verifyToken, async (req, res) => {
+// //   try {
+// //     const db = await connectDB();
+// //     const vendorsCollection = db.collection('vendors');
+// //     const result = await vendorsCollection.find().toArray();
+// //     res.send(result);
+// //   } catch (err) {
+// //     console.error(err);
+// //     res.status(500).send({ message: "Failed to fetch vendors" });
+// //   }
+// // });
+
+// app.get("/vendors", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const vendorsCollection = db.collection('vendors');
+
+//     // vendor role হলে শুধু নিজের vendor দেখাবে
+//     let query = {};
+//     if (req.user?.role === 'vendor') {
+//       if (!req.user?.vendorName) return res.send([]);
+//       query.vendorName = { $regex: `^${req.user.vendorName}$`, $options: 'i' };
+//     }
+
+//     const result = await vendorsCollection.find(query).toArray();
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to fetch vendors" });
+//   }
+// });
+
+// app.get("/vendors/:id", verifyToken, validateObjectId('id'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const vendorsCollection = db.collection('vendors');
+//     const vendor = await vendorsCollection.findOne({ _id: new ObjectId(req.params.id) });
+//     res.send(vendor);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to fetch vendor" });
+//   }
+// });
+
+// app.patch("/vendors/:id", verifyToken, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid vendor ID'),
+//   body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const vendorsCollection = db.collection('vendors');
+//     const { vendorName, vendorImg, vendorAddress, vendorPhone } = req.body;
+//     const result = await vendorsCollection.updateOne(
+//       { _id: new ObjectId(req.params.id) },
+//       { $set: { vendorName, vendorImg, vendorAddress, vendorPhone } }
+//     );
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to update vendor" });
+//   }
+// });
+
+// app.delete("/vendors/:id", verifyToken, verifyAdmin, validateObjectId('id'), validate([
+//   param('id').isMongoId().withMessage('Invalid ID'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const vendorsCollection = db.collection('vendors');
+//     const result = await vendorsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Failed to delete vendor" });
+//   }
+// });
+
+// // ── Vehicles ───────────────────────────────────────────────────────────────────
+
+// app.get("/vehicles/search", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const vendorsCollection = db.collection('vendors');
+//     const search = req.query.search?.trim();
+//     if (!search) return res.send([]);
+//     const result = await vendorsCollection.aggregate([
+//       { $unwind: "$vehicles" },
+//       { $match: { "vehicles.vehicleNumber": { $regex: search, $options: "i" } } },
+//       {
+//         $project: {
+//           _id: 0,
+//           vendorName: 1,
+//           vendorPhone: 1,
+//           vehicleNumber: "$vehicles.vehicleNumber",
+//           driverName: "$vehicles.driverName",
+//           driverPhone: "$vehicles.driverPhone",
+//         }
+//       },
+//       { $limit: 10 }
+//     ]).toArray();
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Server Error" });
+//   }
+// });
+
+// app.post("/vehicles", verifyToken, validate([
+//   body('vendorId').isMongoId().withMessage('Invalid vendor ID'),
+//   body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
+//   body('driverName').trim().notEmpty().withMessage('Driver name required'),
+//   body('driverPhone').trim().notEmpty().withMessage('Driver phone required'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const vendorsCollection = db.collection('vendors');
+//     const { vendorId, ...vehicleData } = req.body;
+//     const result = await vendorsCollection.updateOne(
+//       { _id: new ObjectId(vendorId) },
+//       { $push: { vehicles: { _id: new ObjectId(), ...vehicleData, createdAt: new Date() } } }
+//     );
+//     if (result.modifiedCount > 0) {
+//       res.send({ insertedId: true });
+//     } else {
+//       res.status(404).send({ error: "Vendor not found" });
+//     }
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ error: "Failed to add vehicle" });
+//   }
+// });
+
+// app.delete("/vehicles/:vendorId/:vehicleId", verifyToken,
+//   validateObjectId('vendorId'),
+//   validateObjectId('vehicleId'),
+//   async (req, res) => {
+//     try {
+//       const db = await connectDB();
+//       const vendorsCollection = db.collection('vendors');
+//       const { vendorId, vehicleId } = req.params;
+//       const result = await vendorsCollection.updateOne(
+//         { _id: new ObjectId(vendorId) },
+//         { $pull: { vehicles: { _id: new ObjectId(vehicleId) } } }
+//       );
+//       if (result.modifiedCount > 0) {
+//         res.send({ deletedCount: 1 });
+//       } else {
+//         res.status(404).send({ error: "Vehicle or Vendor not found" });
+//       }
+//     } catch (err) {
+//       console.error(err);
+//       res.status(500).send({ error: "Failed to delete vehicle" });
+//     }
+//   }
+// );
+
+// app.put("/vehicles/:vendorId/:vehicleId", verifyToken,
+//   validateObjectId('vendorId'),
+//   validateObjectId('vehicleId'),
+//   async (req, res) => {
+//     try {
+//       const db = await connectDB();
+//       const vendorsCollection = db.collection('vendors');
+//       const { vendorId, vehicleId } = req.params;
+//       const updatedData = req.body;
+//       const result = await vendorsCollection.updateOne(
+//         { _id: new ObjectId(vendorId) },
+//         {
+//           $set: {
+//             "vehicles.$[elem].vehicleNumber": updatedData.vehicleNumber,
+//             "vehicles.$[elem].vehicleModel": updatedData.vehicleModel,
+//             "vehicles.$[elem].driverName": updatedData.driverName,
+//             "vehicles.$[elem].driverPhone": updatedData.driverPhone,
+//           }
+//         },
+//         { arrayFilters: [{ "elem._id": new ObjectId(vehicleId) }] }
+//       );
+//       if (result.modifiedCount > 0) {
+//         res.send({ modifiedCount: 1 });
+//       } else {
+//         res.status(404).send({ error: "Nothing updated" });
+//       }
+//     } catch (err) {
+//       console.error(err);
+//       res.status(500).send({ error: "Failed to update vehicle" });
+//     }
+//   }
+// );
+
+// // ── Deliveries ─────────────────────────────────────────────────────────────────
+
+// app.post("/deliveries", verifyToken, validate([
+//   body().isArray({ min: 1 }).withMessage('At least one delivery required'),
+//   body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
+//   body('*.driverName').trim().notEmpty().withMessage('Driver name required'),
+//   body('*.customerName').trim().notEmpty().withMessage('Customer name required'),
+//   body('*.products').isArray({ min: 1 }).withMessage('Products required'),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const challanCollection = db.collection('challans');
+//     const counterCollection = db.collection('counters');
+//     const deliveries = req.body;
+//     if (!Array.isArray(deliveries) || deliveries.length === 0) {
+//       return res.status(400).send({ success: false, message: "No deliveries provided" });
+//     }
+
+//     const { client } = await getConnection();
+//     const session = client.startSession();
+//     let tripNumber;
+//     let result;
+//     try {
+//       await session.withTransaction(async () => {
+//         const counter = await counterCollection.findOneAndUpdate(
+//           { _id: "tripNumber" },
+//           { $inc: { seq: 1 } },
+//           { upsert: true, returnDocument: "after", session }
+//         );
+//         const seq = counter?.seq ?? counter?.value?.seq ?? 1;
+//         tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
+
+//         const challanIds = deliveries.map(d =>
+//           typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+//         );
+
+//         // ── Already delivered check ────────────────────────────────
+//         const alreadyDelivered = await challanCollection.find(
+//           { _id: { $in: challanIds }, status: "delivered" },
+//           { session }
+//         ).toArray();
+
+//         if (alreadyDelivered.length > 0) {
+//           const names = alreadyDelivered.map(c => c.customerName).join(", ");
+//           throw new Error(`Already delivered: ${names}`);
+//         }
+//         // ──────────────────────────────────────────────────────────
+
+//         const tripDocument = {
+//           tripNumber,
+//           vehicleNumber: deliveries[0].vehicleNumber,
+//           vendorName: deliveries[0].vendorName,
+//           vendorNumber: deliveries[0].vendorNumber,
+//           driverName: deliveries[0].driverName,
+//           driverNumber: deliveries[0].driverNumber,
+//           createdBy: deliveries[0].createdBy || "unknown",
+//           totalChallan: deliveries.length,
+//           challans: deliveries.map(d => ({
+//             challanId: d.challanId,
+//             customerName: d.customerName,
+//             zone: d.zone,
+//             address: d.address,
+//             thana: d.thana,
+//             district: d.district,
+//             receiverNumber: d.receiverNumber,
+//             products: (d.products || []).map(p => ({
+//               _id: p._id || new ObjectId().toString(),
+//               productName: p.productName,
+//               model: p.model,
+//               quantity: Number(p.quantity)
+//             }))
+//           })),
+//           createdAt: new Date()
+//         };
+
+//         result = await deliveriesCollection.insertOne(tripDocument, { session });
+//         await challanCollection.updateMany(
+//           { _id: { $in: challanIds } },
+//           { $set: { status: "delivered", tripNumber } },
+//           { session }
+//         );
+//       });
+//       res.send({ success: true, insertedId: result.insertedId, tripNumber, totalChallan: deliveries.length });
+//     } finally {
+//       await session.endSession();
+//     }
+//   } catch (err) {
+//     logger.error("Delivery failed", err);
+//     // already delivered error টা আলাদাভাবে handle করো
+//     if (err.message?.startsWith("Already delivered:")) {
+//       return res.status(400).send({ success: false, message: err.message });
+//     }
+//     res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
+//   }
+// });
+
+
+// app.get("/deliveries", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     let month = parseInt(req.query.month);
+//     let year = parseInt(req.query.year);
+//     const search = req.query.search || "";
+//     const page = parseInt(req.query.page) || 1;
+//     const limit = parseInt(req.query.limit) || 50;
+//     const skip = (page - 1) * limit;
+//     let query = {};
+
+//     if (search) {
+//       query.$or = [
+//         { tripNumber: { $regex: search, $options: "i" } },
+//         { vendorName: { $regex: search, $options: "i" } },
+//         { driverName: { $regex: search, $options: "i" } },
+//         { vehicleNumber: { $regex: search, $options: "i" } },
+//         { "challans.customerName": { $regex: search, $options: "i" } },
+//         { "challans.zone": { $regex: search, $options: "i" } },
+//         { "challans.address": { $regex: search, $options: "i" } },
+//         { "challans.receiverNumber": { $regex: search, $options: "i" } },
+//         { "challans.district": { $regex: search, $options: "i" } },
+//         { "challans.thana": { $regex: search, $options: "i" } },
+//         { "challans.products.productName": { $regex: search, $options: "i" } },
+//         { "challans.products.model": { $regex: search, $options: "i" } },
+//       ];
+//     } else {
+//       if (!month || !year) {
+//         const now = new Date();
+//         month = now.getMonth() + 1;
+//         year = now.getFullYear();
+//       }
+//       const startDate = new Date(year, month - 1, 1);
+//       const endDate = new Date(year, month, 0, 23, 59, 59, 999);
+//       query.createdAt = { $gte: startDate, $lte: endDate };
+//     }
+
+//     const [data, total] = await Promise.all([
+//       deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+//       deliveriesCollection.countDocuments(query),
+//     ]);
+
+//     res.send({
+//       success: true, data,
+//       pagination: {
+//         total, page, limit,
+//         totalPages: Math.ceil(total / limit),
+//         hasNextPage: page < Math.ceil(total / limit),
+//         hasPrevPage: page > 1,
+//       }
+//     });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ success: false, message: "Failed to fetch deliveries" });
+//   }
+// });
+
+// app.patch("/deliveries/confirm", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripNumber, challanId, status, note, operator } = req.body;
+//     const result = await deliveriesCollection.updateOne(
+//       { tripNumber, "challans.challanId": String(challanId) },
+//       {
+//         $set: {
+//           "challans.$.deliveryStatus": status,
+//           "challans.$.operatorNote": note || "",
+//           "challans.$.confirmedBy": operator,
+//           "challans.$.confirmedAt": new Date()
+//         }
+//       }
+//     );
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Confirm failed" });
+//   }
+// });
+
+// app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripNumber, challanId, status, operator } = req.body;
+//     const result = await deliveriesCollection.updateOne(
+//       { tripNumber, "challans.challanId": String(challanId) },
+//       {
+//         $set: {
+//           "challans.$.challanReturnStatus": status,
+//           "challans.$.challanReturnedAt": new Date(),
+//           "challans.$.challanReceivedBy": operator
+//         }
+//       }
+//     );
+//     res.send(result);
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).send({ message: "Challan return update failed" });
+//   }
+// });
+
+
+// // ── Edit full challan info inside a trip ───────────────────────────
+// app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId, challanId } = req.params;
+//     const { customerName, address, thana, district, receiverNumber, zone, updatedBy } = req.body; // ← updatedBy নাও
+
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId), "challans.challanId": challanId },
+//       {
+//         $set: {
+//           "challans.$.customerName": customerName,
+//           "challans.$.address": address,
+//           "challans.$.thana": thana,
+//           "challans.$.district": district,
+//           "challans.$.receiverNumber": receiverNumber,
+//           "challans.$.zone": zone,
+//           lastUpdatedBy: updatedBy || null, // ← নতুন
+//           lastUpdatedAt: new Date(),         // ← নতুন
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Challan not found in trip" });
+
+//     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+//     res.send({ success: true, data: updated }); // ← data return করো
+//   } catch (err) {
+//     logger.error("Edit trip challan failed", err);
+//     res.status(500).send({ message: "Failed to update challan" });
+//   }
+// });
+
+// // ── Edit a product inside a trip's challan ─────────────────────────
+// app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId, challanId, productId } = req.params;
+//     const { productName, model, quantity } = req.body;
+
+//     // Fetch the trip, find challan index, update product in that challan
+//     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+//     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+//     const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
+//     if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+//     const productIndex = trip.challans[challanIndex].products.findIndex(p => p._id === productId);
+//     if (productIndex === -1) return res.status(404).send({ success: false, message: "Product not found" });
+
+//     const updateField = `challans.${challanIndex}.products.${productIndex}`;
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId) },
+//       {
+//         $set: {
+//           [`${updateField}.productName`]: productName,
+//           [`${updateField}.model`]: model,
+//           [`${updateField}.quantity`]: Number(quantity),
+//         }
+//       }
+//     );
+//     res.send({ success: true, modifiedCount: result.modifiedCount });
+//   } catch (err) {
+//     logger.error("Edit trip product failed", err);
+//     res.status(500).send({ message: "Failed to update product" });
+//   }
+// });
+
+// // ── Delete a product inside a trip's challan ───────────────────────
+// app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId, challanId, productId } = req.params;
+
+//     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+//     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+//     const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
+//     if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+//     if (trip.challans[challanIndex].products.length <= 1)
+//       return res.status(400).send({ success: false, message: "Cannot remove last product" });
+
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId) },
+//       { $pull: { [`challans.${challanIndex}.products`]: { _id: productId } } }
+//     );
+//     res.send({ success: true, modifiedCount: result.modifiedCount });
+//   } catch (err) {
+//     logger.error("Delete trip product failed", err);
+//     res.status(500).send({ message: "Failed to delete product" });
+//   }
+// });
+
+// // ── Add a product to a trip's challan ─────────────────────────────
+// app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId, challanId } = req.params;
+//     const { productName, model, quantity } = req.body;
+
+//     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+//     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+//     const challanIndex = trip.challans.findIndex(c =>
+//       c.challanId === challanId || c.challanId?.toString() === challanId
+//     );
+//     if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+//     const newProduct = {
+//       _id: new ObjectId().toString(),
+//       productName,
+//       model,
+//       quantity: Number(quantity)
+//     };
+
+//     await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId) },
+//       { $push: { [`challans.${challanIndex}.products`]: newProduct } }
+//     );
+//     res.send({ success: true, product: newProduct });
+//   } catch (err) {
+//     logger.error("Add trip product failed", err);
+//     res.status(500).send({ message: "Failed to add product" });
+//   }
+// });
+
+// // ── Delete a full challan from a trip ─────────────────────────────
+// app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId, challanId } = req.params;
+
+//     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+//     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+//     if (trip.challans.length <= 1)
+//       return res.status(400).send({ success: false, message: "Cannot remove last challan from trip" });
+
+//     // challan টা আসলে DB তে কোন format এ আছে সেটা দেখো
+//     const targetChallan = trip.challans.find(c =>
+//       c.challanId === challanId || c.challanId?.toString() === challanId
+//     );
+//     if (!targetChallan)
+//       return res.status(404).send({ success: false, message: "Challan not found in trip" });
+
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId) },
+//       {
+//         $pull: { challans: { challanId: targetChallan.challanId } },
+//         $inc: { totalChallan: -1 }
+//       }
+//     );
+//     res.send({ success: true, modifiedCount: result.modifiedCount });
+//   } catch (err) {
+//     logger.error("Delete trip challan failed", err);
+//     res.status(500).send({ message: "Failed to delete challan" });
+//   }
+// });
+
+// // ── Edit trip vehicle/driver/vendor info ───────────────────────────
+// app.patch("/deliveries/:tripId/trip-info", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId } = req.params;
+//     const { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber, updatedBy } = req.body;
+
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId) },
+//       {
+//         $set: {
+//           vehicleNumber, vendorName, vendorNumber, driverName, driverNumber,
+//           lastUpdatedBy: updatedBy || null,  // ← trip info updater
+//           lastUpdatedAt: new Date(),
+//           // advanceSavedBy touch করছে না
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Trip not found" });
+
+//     // ← data return করো, frontend এটা serverData হিসেবে পাবে
+//     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+//     res.send({ success: true, data: updated });
+//   } catch (err) {
+//     logger.error("Edit trip info failed", err);
+//     res.status(500).send({ message: "Failed to update trip info" });
+//   }
+// });
+
+
+// // ── Add/Update return products for a challan ───────────────────────
+// app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId, challanId } = req.params;
+//     const { returnedProducts, returnNote, updatedBy } = req.body;
+//     // returnedProducts: [{ _id, productName, model, returnQty }]
+
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId), "challans.challanId": challanId },
+//       {
+//         $set: {
+//           "challans.$.returnedProducts": returnedProducts,
+//           "challans.$.returnNote": returnNote || "",
+//           "challans.$.returnedAt": new Date(),
+//           lastUpdatedBy: updatedBy || null, // ← নতুন
+//           lastUpdatedAt: new Date(),
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Challan not found" });
+//     res.send({ success: true });
+//   } catch (err) {
+//     logger.error("Return update failed", err);
+//     res.status(500).send({ message: "Failed to update return" });
+//   }
+// });
+
+// // ── Add/Update note for a challan ──────────────────────────────────
+// app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId, challanId } = req.params;
+//     const { note, updatedBy } = req.body;
+
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId), "challans.challanId": challanId },
+//       {
+//         $set: {
+//           "challans.$.note": note, "challans.$.noteUpdatedAt": new Date(),
+//           lastUpdatedBy: updatedBy || null, // ← নতুন
+//           lastUpdatedAt: new Date(),
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Challan not found" });
+//     res.send({ success: true });
+//   } catch (err) {
+//     logger.error("Note update failed", err);
+//     res.status(500).send({ message: "Failed to update note" });
+//   }
+// });
+
+// // ── Add return challan to trip ─────────────────────────────────────
+// app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { tripId } = req.params;
+//     const {
+//       originalChallanId, customerName, zone, address,
+//       thana, district, receiverNumber,
+//       returnedProducts, returnNote,
+//       updatedBy
+//     } = req.body;
+//     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+//     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+//     // Return challan object
+//     const returnChallan = {
+//       challanId: `return_${originalChallanId}_${Date.now()}`,
+//       isReturn: true,
+//       originalChallanId,
+//       customerName,
+//       zone,
+//       address,
+//       thana,
+//       district,
+//       receiverNumber,
+//       products: returnedProducts.map(p => ({
+//         _id: p._id || new ObjectId().toString(),
+//         productName: p.productName,
+//         model: p.model,
+//         quantity: Number(p.returnQty || p.quantity),
+//       })),
+//       returnNote: returnNote || "",
+//       returnedAt: new Date(),
+//       deliveryStatus: "return",
+//       challanReturnStatus: null,
+//     };
+
+//     await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId) },
+//       {
+//         $push: { challans: returnChallan },
+//         $inc: { totalChallan: 1 }
+//       }
+//     );
+
+//     // Also update original challan's returnedProducts
+//     await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(tripId), "challans.challanId": originalChallanId },
+//       {
+//         $set: {
+//           "challans.$.returnedProducts": returnedProducts,
+//           "challans.$.returnNote": returnNote || "",
+//           "challans.$.returnedAt": new Date(),
+//           lastUpdatedBy: updatedBy || null, // ← নতুন
+//           lastUpdatedAt: new Date(),
+//         }
+//       }
+//     );
+
+//     res.send({ success: true, returnChallan });
+//   } catch (err) {
+//     logger.error("Return challan add failed", err);
+//     res.status(500).send({ message: "Failed to add return challan" });
+//   }
+// });
+
+// // ── Car Rent ───────────────────────────────────────────────────────────────────
+
+// // app.get("/car-rents", verifyToken, async (req, res) => {
+// //   try {
+// //     const db = await connectDB();
+// //     const deliveriesCollection = db.collection('deliveries');
+// //     let month = parseInt(req.query.month);
+// //     let year  = parseInt(req.query.year);
+// //     const search = req.query.search || "";
+// //     const page  = parseInt(req.query.page)  || 1;
+// //     const limit = parseInt(req.query.limit) || 50;
+// //     const skip  = (page - 1) * limit;
+
+// //     let query = {};
+// //     if (search) {
+// //       query.$or = [
+// //         { tripNumber:    { $regex: search, $options: "i" } },
+// //         { vendorName:    { $regex: search, $options: "i" } },
+// //         { driverName:    { $regex: search, $options: "i" } },
+// //         { vehicleNumber: { $regex: search, $options: "i" } },
+// //       ];
+// //     } else {
+// //       if (!month || !year) {
+// //         const now = new Date();
+// //         month = now.getMonth() + 1;
+// //         year  = now.getFullYear();
+// //       }
+// //       const startDate = new Date(year, month - 1, 1);
+// //       const endDate   = new Date(year, month, 0, 23, 59, 59, 999);
+// //       query.createdAt = { $gte: startDate, $lte: endDate };
+// //     }
+
+// //     const [data, total] = await Promise.all([
+// //       deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+// //       deliveriesCollection.countDocuments(query),
+// //     ]);
+
+// //     res.send({
+// //       success: true, data,
+// //       pagination: { total, page, limit,
+// //         totalPages: Math.ceil(total / limit),
+// //         hasNextPage: page < Math.ceil(total / limit),
+// //         hasPrevPage: page > 1,
+// //       }
+// //     });
+// //   } catch (err) {
+// //     logger.error("Car rent fetch failed", err);
+// //     res.status(500).send({ success: false, message: "Failed to fetch car rents" });
+// //   }
+// // });
+
+// app.get("/car-rents", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     let month = parseInt(req.query.month);
+//     let year = parseInt(req.query.year);
+//     const search = req.query.search || "";
+//     const page = parseInt(req.query.page) || 1;
+//     const limit = parseInt(req.query.limit) || 50;
+//     const skip = (page - 1) * limit;
+
+//     let query = {};
+
+//     if (search) {
+//       query.$or = [
+//         { tripNumber: { $regex: search, $options: "i" } },
+//         { vendorName: { $regex: search, $options: "i" } },
+//         { driverName: { $regex: search, $options: "i" } },
+//         { vehicleNumber: { $regex: search, $options: "i" } },
+//       ];
+//     } else {
+//       if (!month || !year) {
+//         const now = new Date();
+//         month = now.getMonth() + 1;
+//         year = now.getFullYear();
+//       }
+//       const startDate = new Date(year, month - 1, 1);
+//       const endDate = new Date(year, month, 0, 23, 59, 59, 999);
+//       query.createdAt = { $gte: startDate, $lte: endDate };
+//     }
+
+//     // vendor role হলে শুধু নিজের vendorName এর trips দেখাবে
+//     if (req.user?.role === "vendor") {
+//       if (!req.user?.vendorName) {
+//         return res.send({
+//           success: true, data: [],
+//           pagination: { total: 0, page, limit, totalPages: 0, hasNextPage: false, hasPrevPage: false },
+//         });
+//       }
+//       query.vendorName = { $regex: `^${req.user.vendorName}$`, $options: "i" };
+//     }
+
+//     const [data, total] = await Promise.all([
+//       deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+//       deliveriesCollection.countDocuments(query),
+//     ]);
+
+//     res.send({
+//       success: true, data,
+//       pagination: {
+//         total, page, limit,
+//         totalPages: Math.ceil(total / limit),
+//         hasNextPage: page < Math.ceil(total / limit),
+//         hasPrevPage: page > 1,
+//       }
+//     });
+//   } catch (err) {
+//     logger.error("Car rent fetch failed", err);
+//     res.status(500).send({ success: false, message: "Failed to fetch car rents" });
+//   }
+// });
+
+// // ── Update rent & leborBill for a trip ─────────────────────────────
+// app.patch("/car-rents/:tripId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { rent, leborBill, updatedBy } = req.body;
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(req.params.tripId) },
+//       {
+//         $set: {
+//           rent, leborBill,
+//           rentSavedBy: updatedBy || null,
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Trip not found" });
+//     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(req.params.tripId) });
+//     res.send({ success: true, data: updated });
+//   } catch (err) {
+//     logger.error("Car rent update failed", err);
+//     res.status(500).send({ message: "Failed to update" });
+//   }
+// });
+
+
+// // ── Update advance amount for a trip ──────────────────────────────
+// app.patch("/deliveries/:tripId/advance", verifyToken, validateObjectId('tripId'), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const deliveriesCollection = db.collection('deliveries');
+//     const { advance, updatedBy } = req.body;
+
+//     const result = await deliveriesCollection.updateOne(
+//       { _id: new ObjectId(req.params.tripId) },
+//       {
+//         $set: {
+//           advance: advance !== undefined ? Number(advance) : null,
+//           advanceSavedBy: updatedBy || null,  // ← শুধু এটাই
+//           // lastUpdatedBy touch করছে না!
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Trip not found" });
+
+//     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(req.params.tripId) });
+//     res.send({ success: true, data: updated });
+//   } catch (err) {
+//     logger.error("Advance update failed", err);
+//     res.status(500).send({ message: "Failed to update advance" });
+//   }
+// });
+// // ── Accounts ───────────────────────────────────────────────────────
+// //
+// //  collection: accounts
+// //  document shape:
+// //  {
+// //    type:        "income" | "expense" | "vendor_payment" | "auto_advance"
+// //    description: string
+// //    amount:      number
+// //    date:        string  (YYYY-MM-DD)
+// //    note:        string  (optional)
+// //    vendorName:  string  (vendor_payment only)
+// //    month:       number
+// //    year:        number
+// //    createdBy:   string
+// //    createdAt:   Date
+// //  }
+
+// app.post("/accounts", verifyToken, validate([
+//   body("type").isIn(["income", "expense", "vendor_payment", "auto_advance", "manual_advance", "advance_adjust", "carry_forward"]).withMessage("Invalid type"),
+//   body("amount").isFloat().withMessage("Amount must be a number"), // advance_adjust negative হতে পারে
+//   body("date").isISO8601().withMessage("Valid date required"),
+//   body("description").trim().notEmpty().withMessage("Description required"),
+// ]), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const col = db.collection("accounts");
+//     const { type, description, amount, date, note, vendorName, recipientName } = req.body;
+//     const d = new Date(date);
+//     const doc = {
+//       type,
+//       description: description.trim(),
+//       amount: Number(amount),
+//       date,
+//       note: note?.trim() || "",
+//       vendorName: vendorName?.trim() || "",
+//       recipientName: recipientName?.trim() || "",
+//       month: d.getMonth() + 1,
+//       year: d.getFullYear(),
+//       createdBy: req.user?.email || "unknown",
+//       createdAt: new Date(),
+//     };
+//     const result = await col.insertOne(doc);
+//     res.send({ success: true, insertedId: result.insertedId, data: { ...doc, _id: result.insertedId } });
+//   } catch (err) {
+//     logger.error("Account tx insert failed", err);
+//     res.status(500).send({ message: "Failed to add transaction" });
+//   }
+// });
+
+// app.get("/accounts", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const col = db.collection("accounts");
+//     let month = parseInt(req.query.month);
+//     let year = parseInt(req.query.year);
+//     if (!month || !year) {
+//       const now = new Date();
+//       month = now.getMonth() + 1;
+//       year = now.getFullYear();
+//     }
+//     const data = await col.find({ month, year }).sort({ date: -1, createdAt: -1 }).toArray();
+//     res.send({ success: true, data });
+//   } catch (err) {
+//     logger.error("Account tx fetch failed", err);
+//     res.status(500).send({ message: "Failed to fetch transactions" });
+//   }
+// });
+
+// app.delete("/accounts/:id", verifyToken, validateObjectId("id"), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const col = db.collection("accounts");
+//     const auditCol = db.collection("audit_logs");
+
+//     const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
+//     if (!doc) return res.status(404).send({ success: false, message: "Transaction not found" });
+//     if (doc.type === "auto_advance") return res.status(403).send({ success: false, message: "Auto transactions cannot be deleted" });
+
+//     // ── Delete reason (optional — frontend থেকে পাঠাতে পারবে)
+//     const reason = req.body?.reason?.trim() || "";
+
+//     // ── Audit log save করো delete করার আগে
+//     await auditCol.insertOne({
+//       action: "DELETE_TRANSACTION",
+//       collectionName: "accounts",
+//       documentId: doc._id,
+//       deletedDocument: doc,          // পুরো document টা save করো
+//       reason,
+//       performedBy: {
+//         email: req.user?.email || "unknown",
+//         role: req.user?.role || "unknown",
+//       },
+//       performedAt: new Date(),
+//       ipAddress: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown",
+//     });
+
+//     await col.deleteOne({ _id: new ObjectId(req.params.id) });
+//     logger.info("Account tx deleted with audit log", { id: req.params.id, by: req.user?.email });
+//     res.send({ success: true });
+//   } catch (err) {
+//     logger.error("Account tx delete failed", err);
+//     res.status(500).send({ message: "Failed to delete transaction" });
+//   }
+// });
+
+// // ── Get Audit Logs ─────────────────────────────────────────────────
+// app.get("/audit-logs", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const col = db.collection("audit_logs");
+//     const page = Math.max(1, parseInt(req.query.page) || 1);
+//     const limit = Math.min(100, parseInt(req.query.limit) || 50);
+//     const skip = (page - 1) * limit;
+
+//     // Filter options
+//     const filter = {};
+//     if (req.query.action) filter.action = req.query.action;
+//     if (req.query.performedBy) filter["performedBy.email"] = { $regex: req.query.performedBy, $options: "i" };
+
+//     const [data, total] = await Promise.all([
+//       col.find(filter).sort({ performedAt: -1 }).skip(skip).limit(limit).toArray(),
+//       col.countDocuments(filter),
+//     ]);
+//     res.send({ success: true, data, total, page, limit });
+//   } catch (err) {
+//     logger.error("Audit log fetch failed", err);
+//     res.status(500).send({ message: "Failed to fetch audit logs" });
+//   }
+// });
+
+// // ── Mark audit log entry as restored ──────────────────────────────
+// app.patch("/audit-logs/:id/restored", verifyToken, validateObjectId("id"), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const col = db.collection("audit_logs");
+//     const { restoredDocumentId } = req.body; // নতুন insert হওয়া document এর _id
+//     const result = await col.updateOne(
+//       { _id: new ObjectId(req.params.id) },
+//       {
+//         $set: {
+//           isRestored: true,
+//           restoredAt: new Date(),
+//           restoredBy: { email: req.user?.email || "unknown", role: req.user?.role || "unknown" },
+//           restoredDocumentId: restoredDocumentId || null,
+//         }
+//       }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Audit log not found" });
+//     res.send({ success: true });
+//   } catch (err) {
+//     logger.error("Audit log restore mark failed", err);
+//     res.status(500).send({ message: "Failed to mark as restored" });
+//   }
+// });
+
+// // ── Mark manual advance as paid/unpaid ────────────────────────────
+// app.patch("/accounts/:id/status", verifyToken, validateObjectId("id"), async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const col = db.collection("accounts");
+//     const { status } = req.body; // "paid" | "unpaid"
+//     if (!["paid", "unpaid"].includes(status))
+//       return res.status(400).send({ success: false, message: "Invalid status" });
+//     const result = await col.updateOne(
+//       { _id: new ObjectId(req.params.id), type: "manual_advance" },
+//       { $set: { status, statusUpdatedAt: new Date() } }
+//     );
+//     if (result.matchedCount === 0)
+//       return res.status(404).send({ success: false, message: "Advance not found" });
+//     const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+//     res.send({ success: true, data: updated });
+//   } catch (err) {
+//     logger.error("Advance status update failed", err);
+//     res.status(500).send({ message: "Failed to update status" });
+//   }
+// });
+
+// // ── Dashboard Stats ────────────────────────────────────────────────
+// app.get("/dashboard-stats", verifyToken, async (req, res) => {
+//   try {
+//     const db = await connectDB();
+//     const now = new Date();
+//     const month = now.getMonth() + 1;
+//     const year = now.getFullYear();
+//     const monthStart = new Date(year, month - 1, 1);
+//     const monthEnd = new Date(year, month, 1);
+
+//     const [
+//       gpUnitAgg, gpMonthCount, gpTotalCount,
+//       challanProductAgg, challanStatusAgg, challanTotalCount,
+//       deliveryProductAgg, tripMonthCount, tripTotalCount, activeTripCount,
+//       vendorCount, userCount,
+//       accountsTxs, carRentThisMonth,
+//       topDeliveryPoints,
+//     ] = await Promise.all([
+
+//       // Gate Pass: unit-wise total qty এই মাসে (unit = top-level field, e.g. "WFR")
+//       db.collection('gate-pass').aggregate([
+//         { $match: { tripMonth: month, tripYear: year } },
+//         { $unwind: '$products' },
+//         {
+//           $group: {
+//             _id: '$unit',
+//             qty: { $sum: '$products.quantity' },
+//             passCount: { $addToSet: '$_id' },
+//           }
+//         },
+//         { $addFields: { passCount: { $size: '$passCount' } } },
+//         { $sort: { qty: -1 } },
+//         { $limit: 10 },
+//       ]).toArray(),
+//       db.collection('gate-pass').countDocuments({ tripMonth: month, tripYear: year }),
+//       db.collection('gate-pass').countDocuments(),
+
+//       // Challan: productName-wise qty এই মাসে
+//       db.collection('challans').aggregate([
+//         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+//         { $unwind: '$products' },
+//         { $group: { _id: '$products.productName', qty: { $sum: '$products.quantity' } } },
+//         { $sort: { qty: -1 } },
+//         { $limit: 8 },
+//       ]).toArray(),
+//       // Challan status breakdown
+//       db.collection('challans').aggregate([
+//         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+//         { $group: { _id: '$status', count: { $sum: 1 } } },
+//       ]).toArray(),
+//       db.collection('challans').countDocuments(),
+
+//       // Delivery: productName-wise qty এই মাসে
+//       db.collection('deliveries').aggregate([
+//         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+//         { $unwind: '$challans' },
+//         { $unwind: '$challans.products' },
+//         { $group: { _id: '$challans.products.productName', qty: { $sum: '$challans.products.quantity' } } },
+//         { $sort: { qty: -1 } },
+//         { $limit: 8 },
+//       ]).toArray(),
+//       db.collection('deliveries').countDocuments({ createdAt: { $gte: monthStart, $lt: monthEnd } }),
+//       db.collection('deliveries').countDocuments(),
+//       db.collection('deliveries').countDocuments({
+//         $or: [{ status: { $exists: false } }, { status: { $in: ['pending', 'in_progress'] } }]
+//       }),
+
+//       db.collection('vendors').countDocuments(),
+//       db.collection('users').countDocuments(),
+
+//       // Accounts এই মাসের
+//       db.collection('accounts').find({ month, year }).toArray(),
+//       // Car rent এই মাসের (advance জন্য)
+//       db.collection('deliveries').find(
+//         { createdAt: { $gte: monthStart, $lt: monthEnd } },
+//         { projection: { advance: 1 } }
+//       ).toArray(),
+
+//       // Top delivery zones/points এই মাসে (challan zone-wise count)
+//       db.collection('challans').aggregate([
+//         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+//         { $group: { _id: '$zone', count: { $sum: 1 } } },
+//         { $sort: { count: -1 } },
+//         { $limit: 5 },
+//       ]).toArray(),
+//     ]);
+
+//     // Challan status map
+//     const csMap = {};
+//     challanStatusAgg.forEach(s => { csMap[s._id || 'pending'] = s.count; });
+
+//     // Accounts summary
+//     const n = (v) => (v != null ? Number(v) : 0);
+//     const income = accountsTxs.filter(t => t.type === 'income').reduce((s, t) => s + n(t.amount), 0);
+//     const expense = accountsTxs.filter(t => t.type === 'expense').reduce((s, t) => s + n(t.amount), 0);
+//     const vendorPayment = accountsTxs.filter(t => t.type === 'vendor_payment').reduce((s, t) => s + n(t.amount), 0);
+//     const manualAdv = accountsTxs.filter(t => t.type === 'manual_advance').reduce((s, t) => s + n(t.amount), 0);
+//     const autoAdv = carRentThisMonth.reduce((s, t) => s + n(t.advance), 0);
+//     const totalExpense = expense + vendorPayment + manualAdv + autoAdv;
+//     const netBalance = income - totalExpense;
+
+//     res.send({
+//       success: true,
+//       data: {
+//         currentMonth: month,
+//         currentYear: year,
+//         gatePass: {
+//           totalCount: gpTotalCount,
+//           monthCount: gpMonthCount,
+//           unitBreakdown: gpUnitAgg,   // [{ _id: 'WFR', qty: 230, passCount: 5 }, ...]
+//         },
+//         challan: {
+//           totalCount: challanTotalCount,
+//           monthTotal: challanStatusAgg.reduce((s, x) => s + x.count, 0),
+//           delivered: csMap['delivered'] || 0,
+//           pending: csMap['pending'] || 0,
+//           returned: csMap['returned'] || 0,
+//           productBreakdown: challanProductAgg,
+//         },
+//         trip: {
+//           totalCount: tripTotalCount,
+//           monthCount: tripMonthCount,
+//           activeCount: activeTripCount,
+//           productBreakdown: deliveryProductAgg,
+//         },
+//         vendor: { totalCount: vendorCount },
+//         user: { totalCount: userCount },
+//         accounts: { income, totalExpense, netBalance, vendorPayment, autoAdv, manualAdv },
+//         topDeliveryPoints,
+//       }
+//     });
+//   } catch (err) {
+//     logger.error("Dashboard stats failed", err);
+//     res.status(500).send({ message: "Failed to fetch stats" });
+//   }
+// });
+
+
+// // ── Global Error Handler ───────────────────────────────────────────
+// app.use((err, req, res, next) => {
+//   logger.error("Unhandled error", err);
+//   res.status(500).send({ message: "Internal Server Error" });
+// });
+
+// // ── Start Server ───────────────────────────────────────────────────
+// if (process.env.NODE_ENV !== "production") {
+//   app.listen(port, () => {
+//     logger.info(`Server running`, { port });
+//   });
+// }
+
+// module.exports = app;
+
+
+
+
+
+
+
+
 require("dotenv").config();
 
 const express = require('express');
@@ -10,7 +2251,7 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 
 // ── Firebase Admin SDK (for secure ID token verification) ──
 const { initFirebaseAdmin, verifyFirebaseIdToken } = require('./config/firebaseAdmin');
-initFirebaseAdmin(); // Fail fast on startup if credentials missing
+initFirebaseAdmin();
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -19,6 +2260,16 @@ const multer = require('multer');
 const FormData = require('form-data');
 const axios = require('axios');
 const helmet = require('helmet');
+
+// ═══════════════════════════════════════════════════════════════════
+// FIX #3 — Regex escape helper (prevents ReDoS + regex injection)
+// ═══════════════════════════════════════════════════════════════════
+function escapeRegex(str) {
+  if (typeof str !== 'string') return '';
+  // Limit length to prevent abuse (search should be under 100 chars)
+  const safe = str.slice(0, 100);
+  return safe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 const multerUpload = multer({
   storage: multer.memoryStorage(),
@@ -32,6 +2283,22 @@ const multerUpload = multer({
     }
   }
 });
+
+// FIX #30 — Magic-byte image validation
+// Multer mimetype check is client-reported and spoofable. These
+// magic bytes are the actual file format signature at byte 0.
+function isRealImage(buffer) {
+  if (!buffer || buffer.length < 12) return false;
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'jpeg';
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47 &&
+      buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A) return 'png';
+  // WEBP: RIFF....WEBP (bytes 0-3 'RIFF', bytes 8-11 'WEBP')
+  if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+      buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) return 'webp';
+  return false;
+}
 
 const { body, param, query, validationResult } = require('express-validator');
 
@@ -64,7 +2331,79 @@ const logger = {
   })),
 };
 
+// ═══════════════════════════════════════════════════════════════════
+// FIX #48 — Audit Log Helper (used for all delete/sensitive-edit operations)
+// ═══════════════════════════════════════════════════════════════════
+// Records who did what, when, and why. 365-day TTL index in setupIndexes.
+// Returns inserted doc id or null if logging failed (never throws — audit
+// failure must not block the primary operation).
+async function recordAudit({ db, action, collectionName, documentId, oldDoc, newDoc, reason, req }) {
+  try {
+    const auditCol = db.collection('audit_logs');
+    const entry = {
+      action,                    // e.g., 'DELETE_CHALLAN', 'EDIT_DELIVERY', 'BULK_DELETE_GATEPASS'
+      collectionName,
+      documentId,
+      ...(oldDoc ? { deletedDocument: oldDoc } : {}),
+      ...(newDoc ? { updatedDocument: newDoc } : {}),
+      reason: reason || '',
+      performedBy: {
+        email: req?.user?.email || 'unknown',
+        role: req?.user?.role || 'unknown',
+      },
+      performedAt: new Date(),
+      ipAddress: req?.headers?.['x-forwarded-for'] || req?.socket?.remoteAddress || 'unknown',
+    };
+    const result = await auditCol.insertOne(entry);
+    return result.insertedId;
+  } catch (err) {
+    logger.error('Audit log insert failed', err);
+    return null;
+  }
+}
+// ═══════════════════════════════════════════════════════════════════
+// FIX #29 — Asia/Dhaka Timezone Helpers
+// ═══════════════════════════════════════════════════════════════════
+// Server runs UTC (Vercel), users work in Dhaka time (UTC+6).
+// `new Date(year, month-1, 1)` creates in server TZ — wrong for queries.
+// These helpers produce UTC Date objects that correspond exactly to
+// Dhaka month boundaries.
+const DHAKA_OFFSET_HOURS = 6;
+const DHAKA_OFFSET_MS = DHAKA_OFFSET_HOURS * 60 * 60 * 1000;
+
+/** Get current month/year as interpreted in Asia/Dhaka timezone. */
+function getDhakaCurrentMonthYear() {
+  const dhakaNow = new Date(Date.now() + DHAKA_OFFSET_MS);
+  return {
+    month: dhakaNow.getUTCMonth() + 1,
+    year: dhakaNow.getUTCFullYear(),
+  };
+}
+
+/** Dhaka-local month start/end, returned as UTC Date for MongoDB queries. */
+function getDhakaMonthRange(year, month) {
+  // Dhaka's Jan 1 00:00 = UTC Dec 31 18:00 (previous day)
+  // So Dhaka start of month in UTC = Date.UTC(y, m-1, 1) - 6 hours
+  const startDate = new Date(Date.UTC(year, month - 1, 1) - DHAKA_OFFSET_MS);
+  // Dhaka end of month in UTC = Date.UTC(y, m, 1) - 6 hours
+  const endDate = new Date(Date.UTC(year, month, 1) - DHAKA_OFFSET_MS);
+  return { startDate, endDate };
+}
+
 // ── Rate Limiters ──────────────────────────────────────────────────
+// FIX #20 — Three-tier rate limiting:
+//   1. Global: 1000 req / 15 min / IP (generous but blocks DDoS)
+//   2. Auth: 20 req / 15 min / IP (protects /jwt login attempts)
+//   3. Upload: 30 req / 15 min / IP (protects /upload-image from abuse)
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  message: { success: false, message: 'Too many requests from this IP, please try again later' }
+});
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -74,10 +2413,24 @@ const authLimiter = rateLimit({
   message: { success: false, message: 'Too many login attempts, please try again after 15 minutes' }
 });
 
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  message: { success: false, message: 'Too many upload requests, please slow down' }
+});
+
 // ── CORS ───────────────────────────────────────────────────────────
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : ['http://localhost:5173'];
+
+// FIX #19 — Fail fast if production without proper CORS
+if (process.env.NODE_ENV === 'production' && !process.env.ALLOWED_ORIGINS) {
+  logger.warn('ALLOWED_ORIGINS not set in production — only localhost:5173 allowed. Set it on Vercel.');
+}
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -92,23 +2445,19 @@ app.use(cors({
 
 // ── Security Headers ───────────────────────────────────────────────
 app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" }, // imgbb image load এর জন্য
+  crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+
+// FIX #20 — Apply global rate limit to ALL routes (exempts health check)
+app.use((req, res, next) => {
+  if (req.path === '/') return next(); // skip health check
+  return globalLimiter(req, res, next);
+});
 
 // ── Environment Validation (Fail Fast on Startup) ──────────────────
-
-const REQUIRED_ENV = [
-  'DB_USER',
-  'DB_PASS',
-  'JWT_SECRET',
-  // Firebase Admin (at least one group required — checked by firebaseAdmin.js)
-];
-
-
-// Firebase env check happens inside initFirebaseAdmin() — will throw descriptive error
-
+const REQUIRED_ENV = ['DB_USER', 'DB_PASS', 'JWT_SECRET'];
 const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missingEnv.length > 0) {
   throw new Error(
@@ -120,50 +2469,51 @@ if (missingEnv.length > 0) {
 // ── MongoDB Connection (Serverless-Optimized) ──────────────────────
 const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority&appName=LBTS-OS`;
 
-// Cached across serverless warm invocations
 let cachedConnection = null;
 let connectionPromise = null;
+let lastPingTime = 0;
+const PING_CACHE_MS = 30 * 1000; // FIX #23 — Only ping every 30s, not every request
 
 async function getConnection() {
-  // 1️⃣ If already connected and healthy, reuse
+  // If already connected, reuse (ping only if stale)
   if (cachedConnection) {
+    const now = Date.now();
+    if (now - lastPingTime < PING_CACHE_MS) {
+      return cachedConnection;
+    }
     try {
-      // Quick ping to verify connection is still alive (costs ~5ms)
       await cachedConnection.client.db('admin').command({ ping: 1 });
+      lastPingTime = now;
       return cachedConnection;
     } catch (err) {
       logger.warn('Cached MongoDB connection unhealthy, reconnecting', {
         error: err.message
       });
-      // Fire-and-forget cleanup; don't await
       cachedConnection.client.close().catch(() => { });
       cachedConnection = null;
       connectionPromise = null;
+      lastPingTime = 0;
     }
   }
 
-  // 2️⃣ If connection already in progress, wait for it (prevents race condition)
   if (connectionPromise) {
     return connectionPromise;
   }
 
-  // 3️⃣ Start new connection
   connectionPromise = (async () => {
     const client = new MongoClient(uri, {
       serverApi: {
         version: ServerApiVersion.v1,
-        strict: false,           // false: allows transactions, sessions, all ops
+        strict: false,
         deprecationErrors: true,
       },
-      // ── Serverless-tuned pool settings for MongoDB Atlas M0 (Free) ──
-      // M0 hard cap: 500 connections. With 20 warm Vercel instances × 3 = 60 conn used (safe).
       maxPoolSize: 3,
-      minPoolSize: 0,              // No idle connections kept
-      maxIdleTimeMS: 10000,        // Close idle after 10s (was 30s — too long for serverless)
+      minPoolSize: 0,
+      maxIdleTimeMS: 10000,
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
       connectTimeoutMS: 10000,
-      waitQueueTimeoutMS: 5000,    // Don't let requests queue forever
+      waitQueueTimeoutMS: 5000,
       retryWrites: true,
       retryReads: true,
     });
@@ -171,11 +2521,9 @@ async function getConnection() {
     try {
       await client.connect();
       const db = client.db('LBTS-OS-DB');
-      logger.info('MongoDB Connected', {
-        poolSize: 3,
-        appName: 'LBTS-OS',
-      });
+      logger.info('MongoDB Connected', { poolSize: 3, appName: 'LBTS-OS' });
       cachedConnection = { client, db };
+      lastPingTime = Date.now();
       return cachedConnection;
     } catch (err) {
       logger.error('MongoDB Connection failed', err);
@@ -186,18 +2534,17 @@ async function getConnection() {
   try {
     return await connectionPromise;
   } catch (err) {
-    connectionPromise = null;     // Reset so next request retries fresh
+    connectionPromise = null;
     throw err;
   }
 }
 
-// ── Backward-compatible helper — returns db only (used by all existing routes) ──
 async function connectDB() {
   const { db } = await getConnection();
   return db;
 }
 
-// ── Graceful shutdown (Vercel SIGTERM handling) ────────────────────
+// ── Graceful shutdown ──────────────────────────────────────────────
 const gracefulShutdown = async (signal) => {
   logger.info(`${signal} received, closing MongoDB connection`);
   if (cachedConnection?.client) {
@@ -213,12 +2560,14 @@ const gracefulShutdown = async (signal) => {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// ── JWT Verify Middleware ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Auth Middlewares
+// ═══════════════════════════════════════════════════════════════════
 function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).send({ message: 'Unauthorized: No token provided' });
+    return res.status(401).send({ success: false, message: 'Unauthorized: No token provided' });
   }
 
   const token = authHeader.split(' ')[1];
@@ -228,18 +2577,51 @@ function verifyToken(req, res, next) {
     req.user = decoded;
     next();
   } catch (err) {
-    return res.status(401).send({ message: 'Unauthorized: Invalid or expired token' });
+    return res.status(401).send({ success: false, message: 'Unauthorized: Invalid or expired token' });
   }
 }
 
-// ── Admin only middleware ──────────────────────────────────────────
-function verifyAdmin(req, res, next) {
-  if (req.user?.role !== 'admin' || req.user?.status !== 'approved') {
-    return res.status(403).send({ message: 'Forbidden: Admins only' });
+// FIX #5 — Require approved status (blocks pending/rejected users)
+function verifyApproved(req, res, next) {
+  if (req.user?.status !== 'approved') {
+    return res.status(403).send({ success: false, message: 'Forbidden: Account not approved' });
   }
   next();
 }
 
+// FIX #5 — Role-based middleware factory
+function verifyRole(...allowedRoles) {
+  return (req, res, next) => {
+    if (req.user?.status !== 'approved') {
+      return res.status(403).send({ success: false, message: 'Forbidden: Account not approved' });
+    }
+    if (!allowedRoles.includes(req.user?.role)) {
+      return res.status(403).send({
+        success: false,
+        message: `Forbidden: Requires role ${allowedRoles.join(' or ')}`
+      });
+    }
+    next();
+  };
+}
+
+function verifyAdmin(req, res, next) {
+  if (req.user?.role !== 'admin' || req.user?.status !== 'approved') {
+    return res.status(403).send({ success: false, message: 'Forbidden: Admins only' });
+  }
+  next();
+}
+
+// Non-vendor approved users (for pages vendor can't access)
+function verifyNonVendor(req, res, next) {
+  if (req.user?.status !== 'approved') {
+    return res.status(403).send({ success: false, message: 'Forbidden: Account not approved' });
+  }
+  if (req.user?.role === 'vendor') {
+    return res.status(403).send({ success: false, message: 'Forbidden: Vendor role not allowed here' });
+  }
+  next();
+}
 
 // ── ObjectId Validation Helper ─────────────────────────────────────
 function isValidObjectId(id) {
@@ -265,10 +2647,29 @@ app.get('/', (req, res) => {
 });
 
 // ── Image Upload ───────────────────────────────────────────────────
-app.post('/upload-image', verifyToken, multerUpload.single('image'), async (req, res) => {
+app.post('/upload-image', verifyToken, uploadLimiter, multerUpload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).send({ success: false, message: 'No image provided' });
+    }
+
+    // FIX #30 — Verify file is actually an image (not just renamed extension)
+    const realFormat = isRealImage(req.file.buffer);
+    if (!realFormat) {
+      logger.warn('Fake image upload blocked', {
+        user: req.user?.email,
+        claimed: req.file.mimetype,
+        size: req.file.size,
+      });
+      return res.status(400).send({
+        success: false,
+        message: 'File is not a valid JPEG, PNG, or WEBP image'
+      });
+    }
+
+    if (!process.env.IMGBB_API_KEY) {
+      logger.error('IMGBB_API_KEY missing');
+      return res.status(500).send({ success: false, message: 'Image service not configured' });
     }
 
     const formData = new FormData();
@@ -277,12 +2678,19 @@ app.post('/upload-image', verifyToken, multerUpload.single('image'), async (req,
     const response = await axios.post(
       `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
       formData,
-      { headers: formData.getHeaders() }
+      { headers: formData.getHeaders(), timeout: 20000 }
     );
 
-    res.send({ success: true, url: response.data.data.url });
+    // FIX #17 — Validate ImgBB response shape before accessing
+    const url = response?.data?.data?.url;
+    if (!url || typeof url !== 'string') {
+      logger.error('ImgBB response invalid', { responseData: response?.data });
+      return res.status(502).send({ success: false, message: 'Image service returned invalid response' });
+    }
+
+    res.send({ success: true, url });
   } catch (err) {
-    logger.error("Image upload failed", err);
+    logger.error('Image upload failed', err);
     res.status(500).send({ success: false, message: 'Image upload failed' });
   }
 });
@@ -290,21 +2698,8 @@ app.post('/upload-image', verifyToken, multerUpload.single('image'), async (req,
 // ═══════════════════════════════════════════════════════════════════
 // /jwt — Issue Application JWT after Firebase ID Token Verification
 // ═══════════════════════════════════════════════════════════════════
-//
-// SECURITY MODEL:
-//   Client sends Firebase ID token (proof they logged in via Firebase)
-//   Server verifies token cryptographically using firebase-admin
-//   Only then does server issue its own JWT for API calls
-//
-// Why app JWT instead of just using Firebase ID token for all API calls?
-//   - Firebase ID tokens expire every 1 hour (frequent refresh needed)
-//   - Our app JWT lasts 7 days (better UX, less overhead)
-//   - App JWT carries role/status from our DB (Firebase doesn't know roles)
-//
 app.post('/jwt', authLimiter, async (req, res) => {
   try {
-    // ── 1. Extract Firebase ID token ──
-    // Support both body.idToken (preferred) and Authorization header
     let idToken = req.body?.idToken;
     if (!idToken) {
       const authHeader = req.headers.authorization;
@@ -321,7 +2716,6 @@ app.post('/jwt', authLimiter, async (req, res) => {
       });
     }
 
-    // ── 2. Cryptographically verify the token ──
     const verification = await verifyFirebaseIdToken(idToken);
 
     if (!verification.valid) {
@@ -331,7 +2725,6 @@ app.post('/jwt', authLimiter, async (req, res) => {
         ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress,
       });
 
-      // Return appropriate status code based on error type
       const isExpired = verification.error === 'auth/id-token-expired';
       return res.status(401).send({
         success: false,
@@ -342,9 +2735,6 @@ app.post('/jwt', authLimiter, async (req, res) => {
       });
     }
 
-    // ── 3. Get verified email (from Firebase, NOT client body) ──
-    // This is the critical security point: email comes from the verified
-    // token, not from whatever the client sent. Client CANNOT spoof email.
     const email = verification.email;
 
     if (!email) {
@@ -355,24 +2745,46 @@ app.post('/jwt', authLimiter, async (req, res) => {
       });
     }
 
-    // ── 4. Lookup user in our DB for role/status ──
+    // FIX #47 — Email verification enforcement
+    // Users must verify their email before they can get an app JWT.
+    // Exception: admins (once promoted) can bypass this check.
     const db = await connectDB();
     const userCollection = db.collection('users');
     const user = await userCollection.findOne({ email });
 
-    // ── 5. Build JWT payload ──
-    // Role/status come from DB (not client). UID from verified token.
+    // Allow login if email is verified OR user is already admin (safety net)
+    const isEmailVerified = verification.emailVerified === true;
+    const isAdminBypass = user?.role === 'admin' && user?.emailVerifyBypass === true;
+
+    if (!isEmailVerified && !isAdminBypass) {
+      logger.warn('Login blocked — email not verified', { email });
+      return res.status(403).send({
+        success: false,
+        code: 'EMAIL_NOT_VERIFIED',
+        message: 'Please verify your email address before logging in. Check your inbox for a verification link.',
+        email,
+      });
+    }
+
+    // Mark email as verified in our DB (for audit/UI use)
+    if (user && !user.emailVerified && isEmailVerified) {
+      await userCollection.updateOne(
+        { _id: user._id },
+        { $set: { emailVerified: true, emailVerifiedAt: new Date() } }
+      );
+    }
+
     const payload = {
       uid: verification.uid,
       email,
       role: user?.role || 'user',
       status: user?.status || 'pending',
+      emailVerified: isEmailVerified,
       ...(user?.vendorName ? { vendorName: user.vendorName } : {}),
     };
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 
-    // ── 6. Return token + user info ──
     res.send({
       success: true,
       token,
@@ -381,39 +2793,83 @@ app.post('/jwt', authLimiter, async (req, res) => {
         role: payload.role,
         status: payload.status,
         uid: payload.uid,
+        emailVerified: isEmailVerified,
         ...(payload.vendorName ? { vendorName: payload.vendorName } : {}),
       },
     });
   } catch (err) {
     logger.error('JWT issuance failed', err);
-    res.status(500).send({
-      success: false,
-      message: 'Token generation failed',
-    });
+    res.status(500).send({ success: false, message: 'Token generation failed' });
   }
 });
 
-// ── Users ──────────────────────────────────────────────────────────────────────
+// ── Quick token validity check (no DB hit) ────────────────────────
+// Useful for client to check token is still valid without making a real request.
+app.get('/verify-token', verifyToken, (req, res) => {
+  res.send({
+    success: true,
+    valid: true,
+    user: {
+      email: req.user?.email,
+      role: req.user?.role,
+      status: req.user?.status,
+      uid: req.user?.uid,
+      ...(req.user?.vendorName ? { vendorName: req.user.vendorName } : {}),
+    },
+  });
+});
 
-// ── Users ──────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Users
+// ═══════════════════════════════════════════════════════════════════
 
-app.post('/users', authLimiter, validate([
-  body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
-  body('displayName').trim().notEmpty().withMessage('Name required'),
-]), async (req, res) => {
+// FIX #16 — Require valid JWT (user must have completed /jwt flow).
+// Email taken from JWT (verified server-side), NOT from request body → spoof-proof.
+app.post('/users', verifyToken, async (req, res) => {
   try {
+    // Email comes from verified JWT — set during /jwt after Firebase verification
+    const verifiedEmail = req.user?.email;
+    if (!verifiedEmail) {
+      return res.status(401).send({ success: false, message: 'Unauthorized: no email in token' });
+    }
+
+    const { displayName, photoURL } = req.body;
+    if (!displayName || typeof displayName !== 'string' || !displayName.trim()) {
+      return res.status(400).send({ success: false, message: 'displayName required' });
+    }
+
     const db = await connectDB();
     const userCollection = db.collection('users');
-    const user = req.body;
-    const exists = await userCollection.findOne({ email: user.email });
-    if (exists) return res.send({ message: 'User already exists' });
-    user.role = 'user';
-    user.status = 'pending';
-    const result = await userCollection.insertOne(user);
-    res.send(result);
+    const exists = await userCollection.findOne({ email: verifiedEmail });
+    if (exists) {
+      // FIX #2 — Return structured success so client knows what happened
+      return res.send({
+        success: true,
+        alreadyExists: true,
+        message: 'User already exists',
+        user: { email: exists.email, role: exists.role, status: exists.status },
+      });
+    }
+
+    const newUser = {
+      email: verifiedEmail,
+      displayName: displayName.trim(),
+      photoURL: typeof photoURL === 'string' ? photoURL : '',
+      role: 'user',
+      status: 'pending',
+      firebaseUid: req.user?.uid || null,
+      createdAt: new Date(),
+    };
+    const result = await userCollection.insertOne(newUser);
+    res.send({
+      success: true,
+      alreadyExists: false,
+      insertedId: result.insertedId,
+      user: { email: newUser.email, role: newUser.role, status: newUser.status },
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: 'Failed to add user' });
+    logger.error('Failed to add user', err);
+    res.status(500).send({ success: false, message: 'Failed to add user' });
   }
 });
 
@@ -421,11 +2877,11 @@ app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
-    const result = await userCollection.find().toArray();
+    const result = await userCollection.find().sort({ createdAt: -1 }).toArray();
     res.send(result);
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: 'Failed to fetch users' });
+    logger.error('Failed to fetch users', err);
+    res.status(500).send({ success: false, message: 'Failed to fetch users' });
   }
 });
 
@@ -433,57 +2889,50 @@ app.get('/users/:email/role', verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
+    // Only allow user to fetch their own, OR admin to fetch any
+    if (req.user?.email !== req.params.email && req.user?.role !== 'admin') {
+      return res.status(403).send({ success: false, message: 'Forbidden' });
+    }
     const user = await userCollection.findOne({ email: req.params.email });
-    if (!user) return res.status(404).send({ message: 'User not found' });
+    if (!user) return res.status(404).send({ success: false, message: 'User not found' });
     res.send({
       role: user.role,
       status: user.status,
-      vendorName: user.vendorName || null,  // ← ADD
+      vendorName: user.vendorName || null,
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: 'Failed to fetch user role' });
+    logger.error('Failed to fetch user role', err);
+    res.status(500).send({ success: false, message: 'Failed to fetch user role' });
   }
 });
-
-// app.patch('/users/role/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
-//   param('id').isMongoId().withMessage('Invalid user ID'),
-//   body('role').isIn(['admin', 'manager', 'operator', 'user', 'ceo','vendor']).withMessage('Invalid role'),
-// ]), async (req, res) => {
-//   try {
-//     const db = await connectDB();
-//     const userCollection = db.collection('users');
-//     const { role } = req.body;
-//     const result = await userCollection.updateOne(
-//       { _id: new ObjectId(req.params.id) },
-//       { $set: { role } }
-//     );
-//     res.send(result);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).send({ message: 'Failed to update role' });
-//   }
-// });
 
 app.patch('/users/role/:id', verifyToken, verifyAdmin, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid user ID'),
   body('role').isIn(['admin', 'manager', 'operator', 'user', 'ceo', 'vendor']).withMessage('Invalid role'),
-  body('vendorName').optional().trim(),  // ← ADD
+  body('vendorName').optional().trim(),
 ]), async (req, res) => {
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
-    const { role, vendorName } = req.body;  // ← vendorName নাও
+    const { role, vendorName } = req.body;
     const setDoc = { role };
-    if (role === 'vendor' && vendorName) setDoc.vendorName = vendorName;  // ← vendor হলে save করো
+    if (role === 'vendor' && vendorName) {
+      setDoc.vendorName = vendorName.trim();
+    } else if (role !== 'vendor') {
+      // Non-vendor role হলে vendorName clear করো
+      await userCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $unset: { vendorName: "" } }
+      );
+    }
     const result = await userCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
       { $set: setDoc }
     );
     res.send(result);
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: 'Failed to update role' });
+    logger.error('Failed to update role', err);
+    res.status(500).send({ success: false, message: 'Failed to update role' });
   }
 });
 
@@ -501,8 +2950,8 @@ app.patch('/users/status/:id', verifyToken, verifyAdmin, validateObjectId('id'),
     );
     res.send(result);
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: 'Failed to update status' });
+    logger.error('Failed to update status', err);
+    res.status(500).send({ success: false, message: 'Failed to update status' });
   }
 });
 
@@ -512,6 +2961,19 @@ app.delete('/users/:id', verifyToken, verifyAdmin, validateObjectId('id'), valid
   try {
     const db = await connectDB();
     const userCollection = db.collection('users');
+    const doc = await userCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).send({ success: false, message: 'User not found' });
+
+    // FIX #48 — Audit log
+    await recordAudit({
+      db, req,
+      action: "DELETE_USER",
+      collectionName: "users",
+      documentId: doc._id,
+      oldDoc: doc,
+      reason: req.body?.reason?.trim() || "",
+    });
+
     const result = await userCollection.deleteOne({ _id: new ObjectId(req.params.id) });
     if (result.deletedCount === 1) {
       res.send({ success: true, message: 'User deleted successfully' });
@@ -519,14 +2981,16 @@ app.delete('/users/:id', verifyToken, verifyAdmin, validateObjectId('id'), valid
       res.status(404).send({ success: false, message: 'User not found' });
     }
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: 'Failed to delete user' });
+    logger.error('Failed to delete user', err);
+    res.status(500).send({ success: false, message: 'Failed to delete user' });
   }
 });
 
-// ── Gate Pass ──────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Gate Pass — FIX #5: verifyNonVendor applied (vendor can't touch gatepass)
+// ═══════════════════════════════════════════════════════════════════
 
-app.post('/gate-pass', verifyToken, validate([
+app.post('/gate-pass', verifyToken, verifyRole('admin', 'manager', 'operator'), validate([
   body('tripDo').trim().notEmpty().withMessage('Trip Do required'),
   body('tripDate').isISO8601().withMessage('Valid date required'),
   body('customerName').trim().notEmpty().withMessage('Customer name required'),
@@ -551,25 +3015,27 @@ app.post('/gate-pass', verifyToken, validate([
       }));
     }
     gatePass.createdAt = new Date();
+    gatePass.createdBy = req.user?.email || 'unknown';
     gatePass.tripMonth = new Date(gatePass.tripDate).getMonth() + 1;
     gatePass.tripYear = new Date(gatePass.tripDate).getFullYear();
     const result = await gatePassCollection.insertOne(gatePass);
-    res.send(result);
+    res.send({ success: true, insertedId: result.insertedId });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: 'Failed to add gate pass' });
+    logger.error('Failed to add gate pass', err);
+    res.status(500).send({ success: false, message: 'Failed to add gate pass' });
   }
 });
 
-app.get("/gate-pass", verifyToken, async (req, res) => {
+app.get("/gate-pass", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
-    const search = req.query.search || "";
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 50;
+    // FIX #3 — escape regex input
+    const search = escapeRegex(req.query.search || "");
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
     const skip = (page - 1) * limit;
     let query = {};
     if (search) {
@@ -585,9 +3051,9 @@ app.get("/gate-pass", verifyToken, async (req, res) => {
       ];
     } else {
       if (!month || !year) {
-        const now = new Date();
-        month = now.getMonth() + 1;
-        year = now.getFullYear();
+        const _dt = getDhakaCurrentMonthYear();
+        month = _dt.month;
+        year = _dt.year;
       }
       query.tripMonth = month;
       query.tripYear = year;
@@ -600,18 +3066,18 @@ app.get("/gate-pass", verifyToken, async (req, res) => {
       data,
       pagination: {
         total, page, limit,
-        totalPages: Math.ceil(total / limit),
+        totalPages: Math.max(1, Math.ceil(total / limit)),
         hasNextPage: page < Math.ceil(total / limit),
         hasPrevPage: page > 1,
       }
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to fetch gate passes" });
+    logger.error('Failed to fetch gate passes', err);
+    res.status(500).send({ success: false, message: "Failed to fetch gate passes" });
   }
 });
 
-app.patch('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
+app.patch('/gate-pass/:id', verifyToken, verifyRole('admin', 'manager', 'operator'), validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid gate pass ID'),
   body('customerName').trim().notEmpty().withMessage('Customer name required'),
   body('tripDate').isISO8601().withMessage('Valid date required'),
@@ -626,19 +3092,21 @@ app.patch('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
         $set: {
           tripDo, tripDate, customerName, csd, unit, vehicleNo, zone, currentUser,
           tripMonth: new Date(tripDate).getMonth() + 1,
-          tripYear: new Date(tripDate).getFullYear()
+          tripYear: new Date(tripDate).getFullYear(),
+          lastUpdatedBy: req.user?.email || 'unknown',
+          lastUpdatedAt: new Date(),
         }
       }
     );
     const updatedGatePass = await gatePassCollection.findOne({ _id: new ObjectId(req.params.id) });
     res.send({ success: true, data: updatedGatePass });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to update gate pass" });
+    logger.error('Failed to update gate pass', err);
+    res.status(500).send({ success: false, message: "Failed to update gate pass" });
   }
 });
 
-app.put('/gate-pass/:gatePassId/product/:productId', verifyToken, validateObjectId('gatePassId'), validate([
+app.put('/gate-pass/:gatePassId/product/:productId', verifyToken, verifyRole('admin', 'manager', 'operator'), validateObjectId('gatePassId'), validate([
   param('gatePassId').isMongoId().withMessage('Invalid gate pass ID'),
   body('productName').trim().notEmpty().withMessage('Product name required'),
   body('model').trim().notEmpty().withMessage('Model required'),
@@ -664,48 +3132,71 @@ app.put('/gate-pass/:gatePassId/product/:productId', verifyToken, validateObject
     const updatedGatePass = await gatePassCollection.findOne({ _id: new ObjectId(gatePassId) });
     res.send({ success: true, data: updatedGatePass });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to update product" });
+    logger.error('Failed to update product', err);
+    res.status(500).send({ success: false, message: "Failed to update product" });
   }
 });
 
-app.delete('/gate-pass/:id', verifyToken, validateObjectId('id'), validate([
+// FIX #5 — Only admin/manager can delete gate pass (was: any authenticated user)
+app.delete('/gate-pass/:id', verifyToken, verifyRole('admin', 'manager'), validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid ID'),
 ]), async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
-    const result = await gatePassCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-    if (result.deletedCount === 0)
-      return res.status(404).send({ success: false, message: "Gate Pass not found" });
+    const doc = await gatePassCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).send({ success: false, message: "Gate Pass not found" });
+
+    // FIX #48 — Audit log
+    await recordAudit({
+      db, req,
+      action: "DELETE_GATEPASS",
+      collectionName: "gate-pass",
+      documentId: doc._id,
+      oldDoc: doc,
+      reason: req.body?.reason?.trim() || "",
+    });
+
+    await gatePassCollection.deleteOne({ _id: new ObjectId(req.params.id) });
     res.send({ success: true, message: "Gate Pass deleted successfully" });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to delete gate pass" });
+    logger.error('Failed to delete gate pass', err);
+    res.status(500).send({ success: false, message: "Failed to delete gate pass" });
   }
 });
 
-// ── Autocomplete ───────────────────────────────────────────────────────────────
-
-app.get("/autocomplete", verifyToken, async (req, res) => {
+// ── Autocomplete ───────────────────────────────────────────────────
+app.get("/autocomplete", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
     const challanCollection = db.collection('challans');
-    const { field, search, collection } = req.query;
+    const { field, collection } = req.query;
+    // FIX #3 — escape regex input
+    const search = escapeRegex(req.query.search || "");
+
+    // Whitelist allowed fields to prevent injection
+    const ALLOWED_FIELDS = [
+      'tripDo', 'customerName', 'csd', 'unit', 'vehicleNo', 'zone',
+      'productName', 'model', 'address', 'receiverNumber', 'thana', 'district'
+    ];
+    if (!ALLOWED_FIELDS.includes(field)) {
+      return res.status(400).send({ success: false, message: 'Invalid field' });
+    }
+
     const targetCollection = collection === "challan" ? challanCollection : gatePassCollection;
     let pipeline = [];
     if (field === "productName" || field === "model") {
       pipeline = [
         { $unwind: "$products" },
-        { $match: { [`products.${field}`]: { $regex: search || "", $options: "i" } } },
+        { $match: { [`products.${field}`]: { $regex: search, $options: "i" } } },
         { $group: { _id: `$products.${field}` } },
         { $project: { _id: 0, value: "$_id" } },
         { $limit: 5 },
       ];
     } else {
       pipeline = [
-        { $match: { [field]: { $regex: search || "", $options: "i" } } },
+        { $match: { [field]: { $regex: search, $options: "i" } } },
         { $group: { _id: `$${field}` } },
         { $project: { _id: 0, value: "$_id" } },
         { $limit: 5 },
@@ -714,14 +3205,16 @@ app.get("/autocomplete", verifyToken, async (req, res) => {
     const result = await targetCollection.aggregate(pipeline).toArray();
     res.send(result);
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Autocomplete failed" });
+    logger.error('Autocomplete failed', err);
+    res.status(500).send({ success: false, message: "Autocomplete failed" });
   }
 });
 
-// ── Challan ────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Challan
+// ═══════════════════════════════════════════════════════════════════
 
-app.post("/challan", verifyToken, validate([
+app.post("/challan", verifyToken, verifyNonVendor, validate([
   body('customerName').trim().notEmpty().withMessage('Customer name required'),
   body('address').trim().notEmpty().withMessage('Address required'),
   body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
@@ -744,45 +3237,46 @@ app.post("/challan", verifyToken, validate([
       }));
     }
     challan.createdAt = new Date();
+    challan.createdBy = req.user?.email || 'unknown';
     const result = await challanCollection.insertOne(challan);
-    res.send(result);
+    res.send({ success: true, insertedId: result.insertedId });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to add challan" });
+    logger.error('Failed to add challan', err);
+    res.status(500).send({ success: false, message: "Failed to add challan" });
   }
 });
 
-app.get("/challan/recent", verifyToken, async (req, res) => {
+app.get("/challan/recent", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const result = await challanCollection.find().sort({ createdAt: -1 }).limit(1).toArray();
     res.send({ data: result });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to fetch recent challan" });
+    logger.error('Failed to fetch recent challan', err);
+    res.status(500).send({ success: false, message: "Failed to fetch recent challan" });
   }
 });
 
-app.get("/challans", verifyToken, async (req, res) => {
+app.get("/challans", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
-    const search = req.query.search || "";
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 50;
+    // FIX #3 — escape all user input used in regex
+    const search = escapeRegex(req.query.search || "");
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
     const skip = (page - 1) * limit;
 
-    // ── Server-side column filters ─────────────────────────────────
-    const customerFilter = req.query.customer || "";
-    const zoneFilter = req.query.zone || "";
-    const districtFilter = req.query.district || "";
-    const thanaFilter = req.query.thana || "";
-    const receiverFilter = req.query.receiver || "";
-    const modelFilter = req.query.model || "";
-    const productNameFilter = req.query.productName || "";
+    const customerFilter = escapeRegex(req.query.customer || "");
+    const zoneFilter = escapeRegex(req.query.zone || "");
+    const districtFilter = escapeRegex(req.query.district || "");
+    const thanaFilter = escapeRegex(req.query.thana || "");
+    const receiverFilter = escapeRegex(req.query.receiver || "");
+    const modelFilter = escapeRegex(req.query.model || "");
+    const productNameFilter = escapeRegex(req.query.productName || "");
     const dateFilter = req.query.date || "";
 
     let query = {};
@@ -799,13 +3293,12 @@ app.get("/challans", verifyToken, async (req, res) => {
       ];
     } else {
       if (!month || !year) {
-        const now = new Date();
-        month = now.getMonth() + 1;
-        year = now.getFullYear();
+        const _dt = getDhakaCurrentMonthYear();
+        month = _dt.month;
+        year = _dt.year;
       }
-      const startDate = new Date(year, month - 1, 1);
-      const endDate = new Date(year, month, 0, 23, 59, 59);
-      query.createdAt = { $gte: startDate, $lte: endDate };
+      const { startDate, endDate } = getDhakaMonthRange(year, month);
+      query.createdAt = { $gte: startDate, $lt: endDate };
     }
     if (customerFilter) query.customerName = { $regex: customerFilter, $options: "i" };
     if (zoneFilter) query.zone = { $regex: zoneFilter, $options: "i" };
@@ -816,9 +3309,11 @@ app.get("/challans", verifyToken, async (req, res) => {
     if (productNameFilter) query["products.productName"] = { $regex: productNameFilter, $options: "i" };
     if (dateFilter) {
       const filterDate = new Date(dateFilter);
-      const nextDay = new Date(dateFilter);
-      nextDay.setDate(nextDay.getDate() + 1);
-      query.createdAt = { $gte: filterDate, $lt: nextDay };
+      if (!isNaN(filterDate.getTime())) {
+        const nextDay = new Date(filterDate);
+        nextDay.setDate(nextDay.getDate() + 1);
+        query.createdAt = { $gte: filterDate, $lt: nextDay };
+      }
     }
 
     const [data, total] = await Promise.all([
@@ -829,31 +3324,30 @@ app.get("/challans", verifyToken, async (req, res) => {
       data,
       pagination: {
         total, page, limit,
-        totalPages: Math.ceil(total / limit),
+        totalPages: Math.max(1, Math.ceil(total / limit)),
         hasNextPage: page < Math.ceil(total / limit),
         hasPrevPage: page > 1,
       }
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to fetch challans" });
+    logger.error('Failed to fetch challans', err);
+    res.status(500).send({ success: false, message: "Failed to fetch challans" });
   }
 });
 
-app.get("/challans/filter-options", verifyToken, async (req, res) => {
+app.get("/challans/filter-options", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     if (!month || !year) {
-      const now = new Date();
-      month = now.getMonth() + 1;
-      year = now.getFullYear();
+        const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
     }
-    const startDate = new Date(year, month - 1, 1);
-    const endDate = new Date(year, month, 0, 23, 59, 59);
-    const baseQuery = { createdAt: { $gte: startDate, $lte: endDate } };
+    const { startDate, endDate } = getDhakaMonthRange(year, month);
+    const baseQuery = { createdAt: { $gte: startDate, $lt: endDate } };
     const [result] = await challanCollection.aggregate([
       { $match: baseQuery },
       { $unwind: "$products" },
@@ -887,26 +3381,40 @@ app.get("/challans/filter-options", verifyToken, async (req, res) => {
       data: result || { customerNames: [], zones: [], districts: [], thanas: [], receivers: [], models: [], productNames: [] }
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to fetch filter options" });
+    logger.error('Failed to fetch filter options', err);
+    res.status(500).send({ success: false, message: "Failed to fetch filter options" });
   }
 });
 
-app.delete("/challan/:id", verifyToken, validateObjectId('id'), validate([
+// FIX #5 — Only admin/manager can delete challan
+app.delete("/challan/:id", verifyToken, verifyRole('admin', 'manager'), validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid ID'),
 ]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
+    const doc = await challanCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).send({ success: false, message: "Challan not found" });
+
+    // FIX #48 — Audit log the delete
+    await recordAudit({
+      db, req,
+      action: "DELETE_CHALLAN",
+      collectionName: "challans",
+      documentId: doc._id,
+      oldDoc: doc,
+      reason: req.body?.reason?.trim() || "",
+    });
+
     const result = await challanCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-    res.send(result);
+    res.send({ success: true, deletedCount: result.deletedCount });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to delete challan" });
+    logger.error('Failed to delete challan', err);
+    res.status(500).send({ success: false, message: "Failed to delete challan" });
   }
 });
 
-app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
+app.patch('/challan/:id', verifyToken, verifyNonVendor, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid challan ID'),
   body('customerName').trim().notEmpty().withMessage('Customer name required'),
   body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
@@ -915,7 +3423,11 @@ app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt } = req.body;
-    const setDoc = { customerName, address, thana, district, receiverNumber, zone, currentUser };
+    const setDoc = {
+      customerName, address, thana, district, receiverNumber, zone, currentUser,
+      lastUpdatedBy: req.user?.email || 'unknown',
+      lastUpdatedAt: new Date(),
+    };
     if (createdAt) {
       setDoc.month = new Date(createdAt).getMonth() + 1;
       setDoc.year = new Date(createdAt).getFullYear();
@@ -924,13 +3436,12 @@ app.patch('/challan/:id', verifyToken, validateObjectId('id'), validate([
     const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(req.params.id) });
     res.send({ success: true, data: updatedChallan });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to update challan" });
+    logger.error('Failed to update challan', err);
+    res.status(500).send({ success: false, message: "Failed to update challan" });
   }
 });
 
-
-app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId('challanId'), validate([
+app.put('/challan/:challanId/product/:productId', verifyToken, verifyNonVendor, validateObjectId('challanId'), validate([
   param('challanId').isMongoId().withMessage('Invalid challan ID'),
   body('productName').trim().notEmpty().withMessage('Product name required'),
   body('model').trim().notEmpty().withMessage('Model required'),
@@ -956,13 +3467,12 @@ app.put('/challan/:challanId/product/:productId', verifyToken, validateObjectId(
     const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(challanId) });
     res.send({ success: true, data: updatedChallan });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to update product" });
+    logger.error('Failed to update product', err);
+    res.status(500).send({ success: false, message: "Failed to update product" });
   }
 });
 
-
-app.delete("/challans/:challanId/product/:productId", verifyToken, validateObjectId('challanId'), async (req, res) => {
+app.delete("/challans/:challanId/product/:productId", verifyToken, verifyNonVendor, validateObjectId('challanId'), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
@@ -977,19 +3487,25 @@ app.delete("/challans/:challanId/product/:productId", verifyToken, validateObjec
       res.status(404).send({ success: false, message: "Product not found" });
     }
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to delete product" });
+    logger.error('Failed to delete product', err);
+    res.status(500).send({ success: false, message: "Failed to delete product" });
   }
 });
 
-app.patch('/challans/:id', verifyToken, validateObjectId('id'), async (req, res) => {
+app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { customerName, receiverNumber, zone, address, thana, district, products } = req.body;
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
-      { $set: { customerName, receiverNumber, zone, address, thana, district, products } }
+      {
+        $set: {
+          customerName, receiverNumber, zone, address, thana, district, products,
+          lastUpdatedBy: req.user?.email || 'unknown',
+          lastUpdatedAt: new Date(),
+        }
+      }
     );
     if (result.matchedCount > 0) {
       res.send({ success: true, message: "Challan and Products updated successfully" });
@@ -997,14 +3513,16 @@ app.patch('/challans/:id', verifyToken, validateObjectId('id'), async (req, res)
       res.status(404).send({ success: false, message: "Challan not found" });
     }
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Update failed" });
+    logger.error('Update failed', err);
+    res.status(500).send({ success: false, message: "Update failed" });
   }
 });
 
-// ── Vendors ────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Vendors
+// ═══════════════════════════════════════════════════════════════════
 
-app.post("/vendors", verifyToken, validate([
+app.post("/vendors", verifyToken, verifyNonVendor, validate([
   body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
   body('vendorPhone').trim().notEmpty().withMessage('Phone required'),
   body('vendorAddress').trim().notEmpty().withMessage('Address required'),
@@ -1016,59 +3534,62 @@ app.post("/vendors", verifyToken, validate([
       ...req.body,
       vehicles: [],
       createdAt: new Date(),
+      createdBy: req.user?.email || 'unknown',
     });
-    res.send(result);
+    res.send({ success: true, insertedId: result.insertedId });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to add vendor" });
+    logger.error('Failed to add vendor', err);
+    res.status(500).send({ success: false, message: "Failed to add vendor" });
   }
 });
 
-// app.get("/vendors", verifyToken, async (req, res) => {
-//   try {
-//     const db = await connectDB();
-//     const vendorsCollection = db.collection('vendors');
-//     const result = await vendorsCollection.find().toArray();
-//     res.send(result);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).send({ message: "Failed to fetch vendors" });
-//   }
-// });
-
-app.get("/vendors", verifyToken, async (req, res) => {
+app.get("/vendors", verifyToken, verifyApproved, async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
 
-    // vendor role হলে শুধু নিজের vendor দেখাবে
     let query = {};
     if (req.user?.role === 'vendor') {
-      if (!req.user?.vendorName) return res.send([]);
-      query.vendorName = { $regex: `^${req.user.vendorName}$`, $options: 'i' };
+      // FIX #6 — Don't trust JWT vendorName; fetch fresh from DB
+      const userCollection = db.collection('users');
+      const me = await userCollection.findOne({ email: req.user.email });
+      if (!me?.vendorName) return res.send([]);
+      query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
     }
 
     const result = await vendorsCollection.find(query).toArray();
     res.send(result);
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to fetch vendors" });
+    logger.error('Failed to fetch vendors', err);
+    res.status(500).send({ success: false, message: "Failed to fetch vendors" });
   }
 });
 
-app.get("/vendors/:id", verifyToken, validateObjectId('id'), async (req, res) => {
+// FIX #15 — Vendor role can only fetch their own vendor record
+app.get("/vendors/:id", verifyToken, verifyApproved, validateObjectId('id'), async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
     const vendor = await vendorsCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!vendor) return res.status(404).send({ success: false, message: 'Vendor not found' });
+
+    // Vendor role — check they own this record
+    if (req.user?.role === 'vendor') {
+      const userCollection = db.collection('users');
+      const me = await userCollection.findOne({ email: req.user.email });
+      if (!me?.vendorName || me.vendorName.toLowerCase() !== (vendor.vendorName || '').toLowerCase()) {
+        return res.status(403).send({ success: false, message: 'Forbidden: Not your vendor' });
+      }
+    }
+
     res.send(vendor);
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to fetch vendor" });
+    logger.error('Failed to fetch vendor', err);
+    res.status(500).send({ success: false, message: "Failed to fetch vendor" });
   }
 });
 
-app.patch("/vendors/:id", verifyToken, validateObjectId('id'), validate([
+app.patch("/vendors/:id", verifyToken, verifyNonVendor, validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid vendor ID'),
   body('vendorName').trim().notEmpty().withMessage('Vendor name required'),
 ]), async (req, res) => {
@@ -1080,10 +3601,10 @@ app.patch("/vendors/:id", verifyToken, validateObjectId('id'), validate([
       { _id: new ObjectId(req.params.id) },
       { $set: { vendorName, vendorImg, vendorAddress, vendorPhone } }
     );
-    res.send(result);
+    res.send({ success: true, modifiedCount: result.modifiedCount });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to update vendor" });
+    logger.error('Failed to update vendor', err);
+    res.status(500).send({ success: false, message: "Failed to update vendor" });
   }
 });
 
@@ -1093,21 +3614,37 @@ app.delete("/vendors/:id", verifyToken, verifyAdmin, validateObjectId('id'), val
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
+    const doc = await vendorsCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!doc) return res.status(404).send({ success: false, message: "Vendor not found" });
+
+    // FIX #48 — Audit log
+    await recordAudit({
+      db, req,
+      action: "DELETE_VENDOR",
+      collectionName: "vendors",
+      documentId: doc._id,
+      oldDoc: doc,
+      reason: req.body?.reason?.trim() || "",
+    });
+
     const result = await vendorsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-    res.send(result);
+    res.send({ success: true, deletedCount: result.deletedCount });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Failed to delete vendor" });
+    logger.error('Failed to delete vendor', err);
+    res.status(500).send({ success: false, message: "Failed to delete vendor" });
   }
 });
 
-// ── Vehicles ───────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Vehicles
+// ═══════════════════════════════════════════════════════════════════
 
-app.get("/vehicles/search", verifyToken, async (req, res) => {
+app.get("/vehicles/search", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
-    const search = req.query.search?.trim();
+    // FIX #3 — escape regex input
+    const search = escapeRegex(req.query.search?.trim() || "");
     if (!search) return res.send([]);
     const result = await vendorsCollection.aggregate([
       { $unwind: "$vehicles" },
@@ -1126,12 +3663,12 @@ app.get("/vehicles/search", verifyToken, async (req, res) => {
     ]).toArray();
     res.send(result);
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Server Error" });
+    logger.error('Vehicle search failed', err);
+    res.status(500).send({ success: false, message: "Server Error" });
   }
 });
 
-app.post("/vehicles", verifyToken, validate([
+app.post("/vehicles", verifyToken, verifyNonVendor, validate([
   body('vendorId').isMongoId().withMessage('Invalid vendor ID'),
   body('vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
   body('driverName').trim().notEmpty().withMessage('Driver name required'),
@@ -1146,17 +3683,17 @@ app.post("/vehicles", verifyToken, validate([
       { $push: { vehicles: { _id: new ObjectId(), ...vehicleData, createdAt: new Date() } } }
     );
     if (result.modifiedCount > 0) {
-      res.send({ insertedId: true });
+      res.send({ success: true, insertedId: true });
     } else {
-      res.status(404).send({ error: "Vendor not found" });
+      res.status(404).send({ success: false, message: "Vendor not found" });
     }
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ error: "Failed to add vehicle" });
+    logger.error('Failed to add vehicle', err);
+    res.status(500).send({ success: false, message: "Failed to add vehicle" });
   }
 });
 
-app.delete("/vehicles/:vendorId/:vehicleId", verifyToken,
+app.delete("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
   validateObjectId('vendorId'),
   validateObjectId('vehicleId'),
   async (req, res) => {
@@ -1169,18 +3706,18 @@ app.delete("/vehicles/:vendorId/:vehicleId", verifyToken,
         { $pull: { vehicles: { _id: new ObjectId(vehicleId) } } }
       );
       if (result.modifiedCount > 0) {
-        res.send({ deletedCount: 1 });
+        res.send({ success: true, deletedCount: 1 });
       } else {
-        res.status(404).send({ error: "Vehicle or Vendor not found" });
+        res.status(404).send({ success: false, message: "Vehicle or Vendor not found" });
       }
     } catch (err) {
-      console.error(err);
-      res.status(500).send({ error: "Failed to delete vehicle" });
+      logger.error('Failed to delete vehicle', err);
+      res.status(500).send({ success: false, message: "Failed to delete vehicle" });
     }
   }
 );
 
-app.put("/vehicles/:vendorId/:vehicleId", verifyToken,
+app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
   validateObjectId('vendorId'),
   validateObjectId('vehicleId'),
   async (req, res) => {
@@ -1202,124 +3739,142 @@ app.put("/vehicles/:vendorId/:vehicleId", verifyToken,
         { arrayFilters: [{ "elem._id": new ObjectId(vehicleId) }] }
       );
       if (result.modifiedCount > 0) {
-        res.send({ modifiedCount: 1 });
+        res.send({ success: true, modifiedCount: 1 });
       } else {
-        res.status(404).send({ error: "Nothing updated" });
+        res.status(404).send({ success: false, message: "Nothing updated" });
       }
     } catch (err) {
-      console.error(err);
-      res.status(500).send({ error: "Failed to update vehicle" });
+      logger.error('Failed to update vehicle', err);
+      res.status(500).send({ success: false, message: "Failed to update vehicle" });
     }
   }
 );
 
-// ── Deliveries ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Deliveries
+// ═══════════════════════════════════════════════════════════════════
 
-app.post("/deliveries", verifyToken, validate([
+app.post("/deliveries", verifyToken, verifyNonVendor, validate([
   body().isArray({ min: 1 }).withMessage('At least one delivery required'),
   body('*.vehicleNumber').trim().notEmpty().withMessage('Vehicle number required'),
   body('*.driverName').trim().notEmpty().withMessage('Driver name required'),
   body('*.customerName').trim().notEmpty().withMessage('Customer name required'),
   body('*.products').isArray({ min: 1 }).withMessage('Products required'),
 ]), async (req, res) => {
+  const deliveries = req.body;
+  if (!Array.isArray(deliveries) || deliveries.length === 0) {
+    return res.status(400).send({ success: false, message: "No deliveries provided" });
+  }
+
+  const { client, db } = await getConnection();
+  const deliveriesCollection = db.collection('deliveries');
+  const challanCollection = db.collection('challans');
+  const counterCollection = db.collection('counters');
+
+  const session = client.startSession();
+  let tripNumber;
+  let result;
   try {
-    const db = await connectDB();
-    const deliveriesCollection = db.collection('deliveries');
-    const challanCollection = db.collection('challans');
-    const counterCollection = db.collection('counters');
-    const deliveries = req.body;
-    if (!Array.isArray(deliveries) || deliveries.length === 0) {
-      return res.status(400).send({ success: false, message: "No deliveries provided" });
-    }
+    await session.withTransaction(async () => {
+      const counter = await counterCollection.findOneAndUpdate(
+        { _id: "tripNumber" },
+        { $inc: { seq: 1 } },
+        { upsert: true, returnDocument: "after", session }
+      );
+      // FIX #26 — Strict counter check (don't silently fallback to 1)
+      const seq = counter?.seq ?? counter?.value?.seq;
+      if (!seq || typeof seq !== 'number') {
+        throw new Error('Counter generation failed');
+      }
+      tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
 
-    const { client } = await getConnection();
-    const session = client.startSession();
-    let tripNumber;
-    let result;
-    try {
-      await session.withTransaction(async () => {
-        const counter = await counterCollection.findOneAndUpdate(
-          { _id: "tripNumber" },
-          { $inc: { seq: 1 } },
-          { upsert: true, returnDocument: "after", session }
-        );
-        const seq = counter?.seq ?? counter?.value?.seq ?? 1;
-        tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
+      const challanIds = deliveries.map(d =>
+        typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+      );
 
-        const challanIds = deliveries.map(d =>
-          typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-        );
+      // FIX #7 — Correct session passing for mongodb v6 driver
+      const alreadyDelivered = await challanCollection
+        .find({ _id: { $in: challanIds }, status: "delivered" }, { session })
+        .toArray();
 
-        // ── Already delivered check ────────────────────────────────
-        const alreadyDelivered = await challanCollection.find(
-          { _id: { $in: challanIds }, status: "delivered" },
-          { session }
-        ).toArray();
+      if (alreadyDelivered.length > 0) {
+        const names = alreadyDelivered.map(c => c.customerName).join(", ");
+        const error = new Error(`Already delivered: ${names}`);
+        error.code = 'ALREADY_DELIVERED';
+        error.items = alreadyDelivered.map(c => ({ id: c._id, customerName: c.customerName }));
+        throw error;
+      }
 
-        if (alreadyDelivered.length > 0) {
-          const names = alreadyDelivered.map(c => c.customerName).join(", ");
-          throw new Error(`Already delivered: ${names}`);
-        }
-        // ──────────────────────────────────────────────────────────
+      const tripDocument = {
+        tripNumber,
+        vehicleNumber: deliveries[0].vehicleNumber,
+        vendorName: deliveries[0].vendorName,
+        vendorNumber: deliveries[0].vendorNumber,
+        driverName: deliveries[0].driverName,
+        driverNumber: deliveries[0].driverNumber,
+        createdBy: req.user?.email || deliveries[0].createdBy || "unknown",
+        totalChallan: deliveries.length,
+        challans: deliveries.map(d => ({
+          challanId: d.challanId,
+          customerName: d.customerName,
+          zone: d.zone,
+          address: d.address,
+          thana: d.thana,
+          district: d.district,
+          receiverNumber: d.receiverNumber,
+          products: (d.products || []).map(p => ({
+            _id: p._id || new ObjectId().toString(),
+            productName: p.productName,
+            model: p.model,
+            quantity: Number(p.quantity)
+          }))
+        })),
+        createdAt: new Date()
+      };
 
-        const tripDocument = {
-          tripNumber,
-          vehicleNumber: deliveries[0].vehicleNumber,
-          vendorName: deliveries[0].vendorName,
-          vendorNumber: deliveries[0].vendorNumber,
-          driverName: deliveries[0].driverName,
-          driverNumber: deliveries[0].driverNumber,
-          createdBy: deliveries[0].createdBy || "unknown",
-          totalChallan: deliveries.length,
-          challans: deliveries.map(d => ({
-            challanId: d.challanId,
-            customerName: d.customerName,
-            zone: d.zone,
-            address: d.address,
-            thana: d.thana,
-            district: d.district,
-            receiverNumber: d.receiverNumber,
-            products: (d.products || []).map(p => ({
-              _id: p._id || new ObjectId().toString(),
-              productName: p.productName,
-              model: p.model,
-              quantity: Number(p.quantity)
-            }))
-          })),
-          createdAt: new Date()
-        };
-
-        result = await deliveriesCollection.insertOne(tripDocument, { session });
-        await challanCollection.updateMany(
-          { _id: { $in: challanIds } },
-          { $set: { status: "delivered", tripNumber } },
-          { session }
-        );
-      });
-      res.send({ success: true, insertedId: result.insertedId, tripNumber, totalChallan: deliveries.length });
-    } finally {
-      await session.endSession();
-    }
+      result = await deliveriesCollection.insertOne(tripDocument, { session });
+      await challanCollection.updateMany(
+        { _id: { $in: challanIds } },
+        { $set: { status: "delivered", tripNumber } },
+        { session }
+      );
+    });
+    res.send({ success: true, insertedId: result.insertedId, tripNumber, totalChallan: deliveries.length });
   } catch (err) {
     logger.error("Delivery failed", err);
-    // already delivered error টা আলাদাভাবে handle করো
-    if (err.message?.startsWith("Already delivered:")) {
-      return res.status(400).send({ success: false, message: err.message });
+    // FIX #10 & #45 — Structured error response
+    if (err.code === 'ALREADY_DELIVERED' || err.message?.startsWith("Already delivered:")) {
+      return res.status(400).send({
+        success: false,
+        code: 'ALREADY_DELIVERED',
+        message: err.message,
+        items: err.items || [],
+      });
+    }
+    // Transaction-not-supported on M0 tier (rare but possible)
+    if (err.codeName === 'IllegalOperation' || err.message?.includes('Transaction')) {
+      return res.status(503).send({
+        success: false,
+        code: 'TRANSACTION_UNSUPPORTED',
+        message: 'Database transactions temporarily unavailable. Please try again.',
+      });
     }
     res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
+  } finally {
+    await session.endSession();
   }
 });
 
-
-app.get("/deliveries", verifyToken, async (req, res) => {
+app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
-    const search = req.query.search || "";
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 50;
+    // FIX #3 — escape regex
+    const search = escapeRegex(req.query.search || "");
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
     const skip = (page - 1) * limit;
     let query = {};
 
@@ -1340,13 +3895,25 @@ app.get("/deliveries", verifyToken, async (req, res) => {
       ];
     } else {
       if (!month || !year) {
-        const now = new Date();
-        month = now.getMonth() + 1;
-        year = now.getFullYear();
+        const _dt = getDhakaCurrentMonthYear();
+        month = _dt.month;
+        year = _dt.year;
       }
-      const startDate = new Date(year, month - 1, 1);
-      const endDate = new Date(year, month, 0, 23, 59, 59, 999);
-      query.createdAt = { $gte: startDate, $lte: endDate };
+      const { startDate, endDate } = getDhakaMonthRange(year, month);
+      query.createdAt = { $gte: startDate, $lt: endDate };
+    }
+
+    // FIX #15 — Vendor can only see their trips (double-check via DB)
+    if (req.user?.role === 'vendor') {
+      const userCollection = db.collection('users');
+      const me = await userCollection.findOne({ email: req.user.email });
+      if (!me?.vendorName) {
+        return res.send({
+          success: true, data: [],
+          pagination: { total: 0, page, limit, totalPages: 0, hasNextPage: false, hasPrevPage: false },
+        });
+      }
+      query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
     }
 
     const [data, total] = await Promise.all([
@@ -1358,18 +3925,18 @@ app.get("/deliveries", verifyToken, async (req, res) => {
       success: true, data,
       pagination: {
         total, page, limit,
-        totalPages: Math.ceil(total / limit),
+        totalPages: Math.max(1, Math.ceil(total / limit)),
         hasNextPage: page < Math.ceil(total / limit),
         hasPrevPage: page > 1,
       }
     });
   } catch (err) {
-    console.error(err);
+    logger.error('Failed to fetch deliveries', err);
     res.status(500).send({ success: false, message: "Failed to fetch deliveries" });
   }
 });
 
-app.patch("/deliveries/confirm", verifyToken, async (req, res) => {
+app.patch("/deliveries/confirm", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -1385,14 +3952,14 @@ app.patch("/deliveries/confirm", verifyToken, async (req, res) => {
         }
       }
     );
-    res.send(result);
+    res.send({ success: true, modifiedCount: result.modifiedCount });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Confirm failed" });
+    logger.error('Confirm failed', err);
+    res.status(500).send({ success: false, message: "Confirm failed" });
   }
 });
 
-app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
+app.patch("/deliveries/challan-return", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -1407,21 +3974,19 @@ app.patch("/deliveries/challan-return", verifyToken, async (req, res) => {
         }
       }
     );
-    res.send(result);
+    res.send({ success: true, modifiedCount: result.modifiedCount });
   } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Challan return update failed" });
+    logger.error('Challan return update failed', err);
+    res.status(500).send({ success: false, message: "Challan return update failed" });
   }
 });
 
-
-// ── Edit full challan info inside a trip ───────────────────────────
-app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-    const { customerName, address, thana, district, receiverNumber, zone, updatedBy } = req.body; // ← updatedBy নাও
+    const { customerName, address, thana, district, receiverNumber, zone } = req.body;
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
@@ -1433,8 +3998,8 @@ app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectI
           "challans.$.district": district,
           "challans.$.receiverNumber": receiverNumber,
           "challans.$.zone": zone,
-          lastUpdatedBy: updatedBy || null, // ← নতুন
-          lastUpdatedAt: new Date(),         // ← নতুন
+          lastUpdatedBy: req.user?.email || null,
+          lastUpdatedAt: new Date(),
         }
       }
     );
@@ -1442,22 +4007,20 @@ app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectI
       return res.status(404).send({ success: false, message: "Challan not found in trip" });
 
     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
-    res.send({ success: true, data: updated }); // ← data return করো
+    res.send({ success: true, data: updated });
   } catch (err) {
     logger.error("Edit trip challan failed", err);
-    res.status(500).send({ message: "Failed to update challan" });
+    res.status(500).send({ success: false, message: "Failed to update challan" });
   }
 });
 
-// ── Edit a product inside a trip's challan ─────────────────────────
-app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId, productId } = req.params;
     const { productName, model, quantity } = req.body;
 
-    // Fetch the trip, find challan index, update product in that challan
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
 
@@ -1481,12 +4044,11 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
     res.send({ success: true, modifiedCount: result.modifiedCount });
   } catch (err) {
     logger.error("Edit trip product failed", err);
-    res.status(500).send({ message: "Failed to update product" });
+    res.status(500).send({ success: false, message: "Failed to update product" });
   }
 });
 
-// ── Delete a product inside a trip's challan ───────────────────────
-app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -1508,12 +4070,11 @@ app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTo
     res.send({ success: true, modifiedCount: result.modifiedCount });
   } catch (err) {
     logger.error("Delete trip product failed", err);
-    res.status(500).send({ message: "Failed to delete product" });
+    res.status(500).send({ success: false, message: "Failed to delete product" });
   }
 });
 
-// ── Add a product to a trip's challan ─────────────────────────────
-app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, validateObjectId('tripId'), async (req, res) => {
+app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -1542,83 +4103,95 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, validate
     res.send({ success: true, product: newProduct });
   } catch (err) {
     logger.error("Add trip product failed", err);
-    res.status(500).send({ message: "Failed to add product" });
+    res.status(500).send({ success: false, message: "Failed to add product" });
   }
 });
 
-// ── Delete a full challan from a trip ─────────────────────────────
-app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, validateObjectId('tripId'), async (req, res) => {
-  try {
-    const db = await connectDB();
-    const deliveriesCollection = db.collection('deliveries');
-    const { tripId, challanId } = req.params;
+// FIX #25 — When removing challan from trip, restore original challan's status
+app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('admin', 'manager'), validateObjectId('tripId'), async (req, res) => {
+  const { client, db } = await getConnection();
+  const deliveriesCollection = db.collection('deliveries');
+  const challanCollection = db.collection('challans');
+  const { tripId, challanId } = req.params;
 
+  try {
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
     if (trip.challans.length <= 1)
       return res.status(400).send({ success: false, message: "Cannot remove last challan from trip" });
 
-    // challan টা আসলে DB তে কোন format এ আছে সেটা দেখো
     const targetChallan = trip.challans.find(c =>
       c.challanId === challanId || c.challanId?.toString() === challanId
     );
     if (!targetChallan)
       return res.status(404).send({ success: false, message: "Challan not found in trip" });
 
-    const result = await deliveriesCollection.updateOne(
-      { _id: new ObjectId(tripId) },
-      {
-        $pull: { challans: { challanId: targetChallan.challanId } },
-        $inc: { totalChallan: -1 }
-      }
-    );
-    res.send({ success: true, modifiedCount: result.modifiedCount });
+    // Use transaction to keep trip and original challan in sync
+    const session = client.startSession();
+    try {
+      await session.withTransaction(async () => {
+        await deliveriesCollection.updateOne(
+          { _id: new ObjectId(tripId) },
+          {
+            $pull: { challans: { challanId: targetChallan.challanId } },
+            $inc: { totalChallan: -1 }
+          },
+          { session }
+        );
+
+        // Restore original challan status to pending (skip return-type challans)
+        if (!targetChallan.isReturn && ObjectId.isValid(targetChallan.challanId)) {
+          await challanCollection.updateOne(
+            { _id: new ObjectId(targetChallan.challanId) },
+            { $set: { status: 'pending' }, $unset: { tripNumber: '' } },
+            { session }
+          );
+        }
+      });
+      res.send({ success: true, modifiedCount: 1 });
+    } finally {
+      await session.endSession();
+    }
   } catch (err) {
     logger.error("Delete trip challan failed", err);
-    res.status(500).send({ message: "Failed to delete challan" });
+    res.status(500).send({ success: false, message: "Failed to delete challan" });
   }
 });
 
-// ── Edit trip vehicle/driver/vendor info ───────────────────────────
-app.patch("/deliveries/:tripId/trip-info", verifyToken, validateObjectId('tripId'), async (req, res) => {
+app.patch("/deliveries/:tripId/trip-info", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId } = req.params;
-    const { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber, updatedBy } = req.body;
+    const { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber } = req.body;
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
       {
         $set: {
           vehicleNumber, vendorName, vendorNumber, driverName, driverNumber,
-          lastUpdatedBy: updatedBy || null,  // ← trip info updater
+          lastUpdatedBy: req.user?.email || null,
           lastUpdatedAt: new Date(),
-          // advanceSavedBy touch করছে না
         }
       }
     );
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Trip not found" });
 
-    // ← data return করো, frontend এটা serverData হিসেবে পাবে
     const updated = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     res.send({ success: true, data: updated });
   } catch (err) {
     logger.error("Edit trip info failed", err);
-    res.status(500).send({ message: "Failed to update trip info" });
+    res.status(500).send({ success: false, message: "Failed to update trip info" });
   }
 });
 
-
-// ── Add/Update return products for a challan ───────────────────────
-app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, validateObjectId('tripId'), async (req, res) => {
+app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-    const { returnedProducts, returnNote, updatedBy } = req.body;
-    // returnedProducts: [{ _id, productName, model, returnQty }]
+    const { returnedProducts, returnNote } = req.body;
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
@@ -1627,7 +4200,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, validate
           "challans.$.returnedProducts": returnedProducts,
           "challans.$.returnNote": returnNote || "",
           "challans.$.returnedAt": new Date(),
-          lastUpdatedBy: updatedBy || null, // ← নতুন
+          lastUpdatedBy: req.user?.email || null,
           lastUpdatedAt: new Date(),
         }
       }
@@ -1637,24 +4210,23 @@ app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, validate
     res.send({ success: true });
   } catch (err) {
     logger.error("Return update failed", err);
-    res.status(500).send({ message: "Failed to update return" });
+    res.status(500).send({ success: false, message: "Failed to update return" });
   }
 });
 
-// ── Add/Update note for a challan ──────────────────────────────────
-app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, validateObjectId('tripId'), async (req, res) => {
+app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-    const { note, updatedBy } = req.body;
+    const { note } = req.body;
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
       {
         $set: {
           "challans.$.note": note, "challans.$.noteUpdatedAt": new Date(),
-          lastUpdatedBy: updatedBy || null, // ← নতুন
+          lastUpdatedBy: req.user?.email || null,
           lastUpdatedAt: new Date(),
         }
       }
@@ -1664,12 +4236,11 @@ app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, validateOb
     res.send({ success: true });
   } catch (err) {
     logger.error("Note update failed", err);
-    res.status(500).send({ message: "Failed to update note" });
+    res.status(500).send({ success: false, message: "Failed to update note" });
   }
 });
 
-// ── Add return challan to trip ─────────────────────────────────────
-app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tripId'), async (req, res) => {
+app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -1678,12 +4249,10 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
       originalChallanId, customerName, zone, address,
       thana, district, receiverNumber,
       returnedProducts, returnNote,
-      updatedBy
     } = req.body;
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
 
-    // Return challan object
     const returnChallan = {
       challanId: `return_${originalChallanId}_${Date.now()}`,
       isReturn: true,
@@ -1694,7 +4263,7 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
       thana,
       district,
       receiverNumber,
-      products: returnedProducts.map(p => ({
+      products: (returnedProducts || []).map(p => ({
         _id: p._id || new ObjectId().toString(),
         productName: p.productName,
         model: p.model,
@@ -1714,7 +4283,6 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
       }
     );
 
-    // Also update original challan's returnedProducts
     await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": originalChallanId },
       {
@@ -1722,7 +4290,7 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
           "challans.$.returnedProducts": returnedProducts,
           "challans.$.returnNote": returnNote || "",
           "challans.$.returnedAt": new Date(),
-          lastUpdatedBy: updatedBy || null, // ← নতুন
+          lastUpdatedBy: req.user?.email || null,
           lastUpdatedAt: new Date(),
         }
       }
@@ -1731,70 +4299,23 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, validateObjectId('tr
     res.send({ success: true, returnChallan });
   } catch (err) {
     logger.error("Return challan add failed", err);
-    res.status(500).send({ message: "Failed to add return challan" });
+    res.status(500).send({ success: false, message: "Failed to add return challan" });
   }
 });
 
-// ── Car Rent ───────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Car Rent
+// ═══════════════════════════════════════════════════════════════════
 
-// app.get("/car-rents", verifyToken, async (req, res) => {
-//   try {
-//     const db = await connectDB();
-//     const deliveriesCollection = db.collection('deliveries');
-//     let month = parseInt(req.query.month);
-//     let year  = parseInt(req.query.year);
-//     const search = req.query.search || "";
-//     const page  = parseInt(req.query.page)  || 1;
-//     const limit = parseInt(req.query.limit) || 50;
-//     const skip  = (page - 1) * limit;
-
-//     let query = {};
-//     if (search) {
-//       query.$or = [
-//         { tripNumber:    { $regex: search, $options: "i" } },
-//         { vendorName:    { $regex: search, $options: "i" } },
-//         { driverName:    { $regex: search, $options: "i" } },
-//         { vehicleNumber: { $regex: search, $options: "i" } },
-//       ];
-//     } else {
-//       if (!month || !year) {
-//         const now = new Date();
-//         month = now.getMonth() + 1;
-//         year  = now.getFullYear();
-//       }
-//       const startDate = new Date(year, month - 1, 1);
-//       const endDate   = new Date(year, month, 0, 23, 59, 59, 999);
-//       query.createdAt = { $gte: startDate, $lte: endDate };
-//     }
-
-//     const [data, total] = await Promise.all([
-//       deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-//       deliveriesCollection.countDocuments(query),
-//     ]);
-
-//     res.send({
-//       success: true, data,
-//       pagination: { total, page, limit,
-//         totalPages: Math.ceil(total / limit),
-//         hasNextPage: page < Math.ceil(total / limit),
-//         hasPrevPage: page > 1,
-//       }
-//     });
-//   } catch (err) {
-//     logger.error("Car rent fetch failed", err);
-//     res.status(500).send({ success: false, message: "Failed to fetch car rents" });
-//   }
-// });
-
-app.get("/car-rents", verifyToken, async (req, res) => {
+app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
-    const search = req.query.search || "";
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 50;
+    const search = escapeRegex(req.query.search || "");
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
     const skip = (page - 1) * limit;
 
     let query = {};
@@ -1808,24 +4329,25 @@ app.get("/car-rents", verifyToken, async (req, res) => {
       ];
     } else {
       if (!month || !year) {
-        const now = new Date();
-        month = now.getMonth() + 1;
-        year = now.getFullYear();
+        const _dt = getDhakaCurrentMonthYear();
+        month = _dt.month;
+        year = _dt.year;
       }
-      const startDate = new Date(year, month - 1, 1);
-      const endDate = new Date(year, month, 0, 23, 59, 59, 999);
-      query.createdAt = { $gte: startDate, $lte: endDate };
+      const { startDate, endDate } = getDhakaMonthRange(year, month);
+      query.createdAt = { $gte: startDate, $lt: endDate };
     }
 
-    // vendor role হলে শুধু নিজের vendorName এর trips দেখাবে
+    // FIX #6 — Fetch fresh vendorName from DB (JWT could be stale)
     if (req.user?.role === "vendor") {
-      if (!req.user?.vendorName) {
+      const userCollection = db.collection('users');
+      const me = await userCollection.findOne({ email: req.user.email });
+      if (!me?.vendorName) {
         return res.send({
           success: true, data: [],
           pagination: { total: 0, page, limit, totalPages: 0, hasNextPage: false, hasPrevPage: false },
         });
       }
-      query.vendorName = { $regex: `^${req.user.vendorName}$`, $options: "i" };
+      query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: "i" };
     }
 
     const [data, total] = await Promise.all([
@@ -1837,7 +4359,7 @@ app.get("/car-rents", verifyToken, async (req, res) => {
       success: true, data,
       pagination: {
         total, page, limit,
-        totalPages: Math.ceil(total / limit),
+        totalPages: Math.max(1, Math.ceil(total / limit)),
         hasNextPage: page < Math.ceil(total / limit),
         hasPrevPage: page > 1,
       }
@@ -1848,18 +4370,28 @@ app.get("/car-rents", verifyToken, async (req, res) => {
   }
 });
 
-// ── Update rent & leborBill for a trip ─────────────────────────────
-app.patch("/car-rents/:tripId", verifyToken, validateObjectId('tripId'), async (req, res) => {
+// FIX #5 — Only finance roles can edit car rent money
+app.patch("/car-rents/:tripId", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
-    const { rent, leborBill, updatedBy } = req.body;
+    const { rent, leborBill } = req.body;
+
+    // Validate numeric
+    if (rent != null && (typeof rent !== 'number' || rent < 0)) {
+      return res.status(400).send({ success: false, message: 'rent must be non-negative number' });
+    }
+    if (leborBill != null && (typeof leborBill !== 'number' || leborBill < 0)) {
+      return res.status(400).send({ success: false, message: 'leborBill must be non-negative number' });
+    }
+
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(req.params.tripId) },
       {
         $set: {
           rent, leborBill,
-          rentSavedBy: updatedBy || null,
+          rentSavedBy: req.user?.email || null,
+          rentSavedAt: new Date(),
         }
       }
     );
@@ -1869,25 +4401,28 @@ app.patch("/car-rents/:tripId", verifyToken, validateObjectId('tripId'), async (
     res.send({ success: true, data: updated });
   } catch (err) {
     logger.error("Car rent update failed", err);
-    res.status(500).send({ message: "Failed to update" });
+    res.status(500).send({ success: false, message: "Failed to update" });
   }
 });
 
-
-// ── Update advance amount for a trip ──────────────────────────────
-app.patch("/deliveries/:tripId/advance", verifyToken, validateObjectId('tripId'), async (req, res) => {
+// FIX #5 — Only finance roles can edit advance
+app.patch("/deliveries/:tripId/advance", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
-    const { advance, updatedBy } = req.body;
+    const { advance } = req.body;
+
+    if (advance != null && (typeof advance !== 'number' || advance < 0)) {
+      return res.status(400).send({ success: false, message: 'advance must be non-negative number' });
+    }
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(req.params.tripId) },
       {
         $set: {
           advance: advance !== undefined ? Number(advance) : null,
-          advanceSavedBy: updatedBy || null,  // ← শুধু এটাই
-          // lastUpdatedBy touch করছে না!
+          advanceSavedBy: req.user?.email || null,
+          advanceSavedAt: new Date(),
         }
       }
     );
@@ -1898,41 +4433,50 @@ app.patch("/deliveries/:tripId/advance", verifyToken, validateObjectId('tripId')
     res.send({ success: true, data: updated });
   } catch (err) {
     logger.error("Advance update failed", err);
-    res.status(500).send({ message: "Failed to update advance" });
+    res.status(500).send({ success: false, message: "Failed to update advance" });
   }
 });
-// ── Accounts ───────────────────────────────────────────────────────
-//
-//  collection: accounts
-//  document shape:
-//  {
-//    type:        "income" | "expense" | "vendor_payment" | "auto_advance"
-//    description: string
-//    amount:      number
-//    date:        string  (YYYY-MM-DD)
-//    note:        string  (optional)
-//    vendorName:  string  (vendor_payment only)
-//    month:       number
-//    year:        number
-//    createdBy:   string
-//    createdAt:   Date
-//  }
 
-app.post("/accounts", verifyToken, validate([
-  body("type").isIn(["income", "expense", "vendor_payment", "auto_advance", "manual_advance", "advance_adjust", "carry_forward"]).withMessage("Invalid type"),
-  body("amount").isFloat().withMessage("Amount must be a number"), // advance_adjust negative হতে পারে
+// ═══════════════════════════════════════════════════════════════════
+// Accounts — FIX #4 (amount sign validation) + FIX #5 (finance roles only)
+// ═══════════════════════════════════════════════════════════════════
+
+app.post("/accounts", verifyToken, verifyRole('admin', 'manager', 'ceo'), validate([
+  body("type").isIn([
+    "income", "expense", "vendor_payment",
+    "auto_advance", "manual_advance", "advance_adjust", "carry_forward"
+  ]).withMessage("Invalid type"),
+  body("amount").isFloat().withMessage("Amount must be a number"),
   body("date").isISO8601().withMessage("Valid date required"),
   body("description").trim().notEmpty().withMessage("Description required"),
 ]), async (req, res) => {
   try {
+    const { type, description, amount, date, note, vendorName, recipientName } = req.body;
+    const amt = Number(amount);
+
+    // FIX #4 — Sign validation per type (prevent negative balance hacking)
+    if (type === 'advance_adjust' || type === 'carry_forward') {
+      // advance_adjust + carry_forward — can be negative
+      if (Number.isNaN(amt)) {
+        return res.status(400).send({ success: false, message: 'Invalid amount' });
+      }
+    } else {
+      // income, expense, vendor_payment, auto_advance, manual_advance — must be > 0
+      if (Number.isNaN(amt) || amt <= 0) {
+        return res.status(400).send({
+          success: false,
+          message: `${type} amount must be a positive number`,
+        });
+      }
+    }
+
     const db = await connectDB();
     const col = db.collection("accounts");
-    const { type, description, amount, date, note, vendorName, recipientName } = req.body;
     const d = new Date(date);
     const doc = {
       type,
       description: description.trim(),
-      amount: Number(amount),
+      amount: amt,
       date,
       note: note?.trim() || "",
       vendorName: vendorName?.trim() || "",
@@ -1946,55 +4490,48 @@ app.post("/accounts", verifyToken, validate([
     res.send({ success: true, insertedId: result.insertedId, data: { ...doc, _id: result.insertedId } });
   } catch (err) {
     logger.error("Account tx insert failed", err);
-    res.status(500).send({ message: "Failed to add transaction" });
+    res.status(500).send({ success: false, message: "Failed to add transaction" });
   }
 });
 
-app.get("/accounts", verifyToken, async (req, res) => {
+app.get("/accounts", verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
   try {
     const db = await connectDB();
     const col = db.collection("accounts");
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     if (!month || !year) {
-      const now = new Date();
-      month = now.getMonth() + 1;
-      year = now.getFullYear();
+        const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
     }
     const data = await col.find({ month, year }).sort({ date: -1, createdAt: -1 }).toArray();
     res.send({ success: true, data });
   } catch (err) {
     logger.error("Account tx fetch failed", err);
-    res.status(500).send({ message: "Failed to fetch transactions" });
+    res.status(500).send({ success: false, message: "Failed to fetch transactions" });
   }
 });
 
-app.delete("/accounts/:id", verifyToken, validateObjectId("id"), async (req, res) => {
+app.delete("/accounts/:id", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId("id"), async (req, res) => {
   try {
     const db = await connectDB();
     const col = db.collection("accounts");
-    const auditCol = db.collection("audit_logs");
 
     const doc = await col.findOne({ _id: new ObjectId(req.params.id) });
     if (!doc) return res.status(404).send({ success: false, message: "Transaction not found" });
-    if (doc.type === "auto_advance") return res.status(403).send({ success: false, message: "Auto transactions cannot be deleted" });
+    if (doc.type === "auto_advance") {
+      return res.status(403).send({ success: false, message: "Auto transactions cannot be deleted" });
+    }
 
-    // ── Delete reason (optional — frontend থেকে পাঠাতে পারবে)
     const reason = req.body?.reason?.trim() || "";
-
-    // ── Audit log save করো delete করার আগে
-    await auditCol.insertOne({
+    await recordAudit({
+      db, req,
       action: "DELETE_TRANSACTION",
       collectionName: "accounts",
       documentId: doc._id,
-      deletedDocument: doc,          // পুরো document টা save করো
+      oldDoc: doc,
       reason,
-      performedBy: {
-        email: req.user?.email || "unknown",
-        role: req.user?.role || "unknown",
-      },
-      performedAt: new Date(),
-      ipAddress: req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown",
     });
 
     await col.deleteOne({ _id: new ObjectId(req.params.id) });
@@ -2002,12 +4539,11 @@ app.delete("/accounts/:id", verifyToken, validateObjectId("id"), async (req, res
     res.send({ success: true });
   } catch (err) {
     logger.error("Account tx delete failed", err);
-    res.status(500).send({ message: "Failed to delete transaction" });
+    res.status(500).send({ success: false, message: "Failed to delete transaction" });
   }
 });
 
-// ── Get Audit Logs ─────────────────────────────────────────────────
-app.get("/audit-logs", verifyToken, async (req, res) => {
+app.get("/audit-logs", verifyToken, verifyRole('admin', 'ceo'), async (req, res) => {
   try {
     const db = await connectDB();
     const col = db.collection("audit_logs");
@@ -2015,10 +4551,11 @@ app.get("/audit-logs", verifyToken, async (req, res) => {
     const limit = Math.min(100, parseInt(req.query.limit) || 50);
     const skip = (page - 1) * limit;
 
-    // Filter options
     const filter = {};
     if (req.query.action) filter.action = req.query.action;
-    if (req.query.performedBy) filter["performedBy.email"] = { $regex: req.query.performedBy, $options: "i" };
+    if (req.query.performedBy) {
+      filter["performedBy.email"] = { $regex: escapeRegex(req.query.performedBy), $options: "i" };
+    }
 
     const [data, total] = await Promise.all([
       col.find(filter).sort({ performedAt: -1 }).skip(skip).limit(limit).toArray(),
@@ -2027,16 +4564,15 @@ app.get("/audit-logs", verifyToken, async (req, res) => {
     res.send({ success: true, data, total, page, limit });
   } catch (err) {
     logger.error("Audit log fetch failed", err);
-    res.status(500).send({ message: "Failed to fetch audit logs" });
+    res.status(500).send({ success: false, message: "Failed to fetch audit logs" });
   }
 });
 
-// ── Mark audit log entry as restored ──────────────────────────────
-app.patch("/audit-logs/:id/restored", verifyToken, validateObjectId("id"), async (req, res) => {
+app.patch("/audit-logs/:id/restored", verifyToken, verifyRole('admin', 'ceo'), validateObjectId("id"), async (req, res) => {
   try {
     const db = await connectDB();
     const col = db.collection("audit_logs");
-    const { restoredDocumentId } = req.body; // নতুন insert হওয়া document এর _id
+    const { restoredDocumentId } = req.body;
     const result = await col.updateOne(
       { _id: new ObjectId(req.params.id) },
       {
@@ -2053,21 +4589,229 @@ app.patch("/audit-logs/:id/restored", verifyToken, validateObjectId("id"), async
     res.send({ success: true });
   } catch (err) {
     logger.error("Audit log restore mark failed", err);
-    res.status(500).send({ message: "Failed to mark as restored" });
+    res.status(500).send({ success: false, message: "Failed to mark as restored" });
   }
 });
 
-// ── Mark manual advance as paid/unpaid ────────────────────────────
-app.patch("/accounts/:id/status", verifyToken, validateObjectId("id"), async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════
+// FIX #49 — Bulk Operations
+// ═══════════════════════════════════════════════════════════════════
+// Max 500 items per request to prevent abuse.
+// All bulk operations audit-log the batch operation.
+
+const BULK_LIMIT = 500;
+
+/**
+ * Bulk delete challans
+ * Body: { ids: ["...", "..."], reason: "..." }
+ */
+app.post('/challans/bulk-delete', verifyToken, verifyRole('admin', 'manager'), async (req, res) => {
+  try {
+    const { ids, reason } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).send({ success: false, message: 'ids array required' });
+    }
+    if (ids.length > BULK_LIMIT) {
+      return res.status(400).send({ success: false, message: `Max ${BULK_LIMIT} items per request` });
+    }
+    const validIds = ids.filter(id => isValidObjectId(id)).map(id => new ObjectId(id));
+    if (validIds.length === 0) {
+      return res.status(400).send({ success: false, message: 'No valid IDs provided' });
+    }
+
+    const db = await connectDB();
+    const col = db.collection('challans');
+
+    // Fetch docs before delete for audit
+    const docs = await col.find({ _id: { $in: validIds } }).toArray();
+
+    await recordAudit({
+      db, req,
+      action: "BULK_DELETE_CHALLAN",
+      collectionName: "challans",
+      documentId: null,
+      oldDoc: { count: docs.length, items: docs.map(d => ({ _id: d._id, customerName: d.customerName })) },
+      reason: reason?.trim() || "",
+    });
+
+    const result = await col.deleteMany({ _id: { $in: validIds } });
+    logger.info("Bulk challan delete", { count: result.deletedCount, by: req.user?.email });
+    res.send({ success: true, deletedCount: result.deletedCount });
+  } catch (err) {
+    logger.error('Bulk challan delete failed', err);
+    res.status(500).send({ success: false, message: "Bulk delete failed" });
+  }
+});
+
+/**
+ * Bulk delete gate passes
+ */
+app.post('/gate-pass/bulk-delete', verifyToken, verifyRole('admin', 'manager'), async (req, res) => {
+  try {
+    const { ids, reason } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).send({ success: false, message: 'ids array required' });
+    }
+    if (ids.length > BULK_LIMIT) {
+      return res.status(400).send({ success: false, message: `Max ${BULK_LIMIT} items per request` });
+    }
+    const validIds = ids.filter(id => isValidObjectId(id)).map(id => new ObjectId(id));
+    if (validIds.length === 0) {
+      return res.status(400).send({ success: false, message: 'No valid IDs provided' });
+    }
+
+    const db = await connectDB();
+    const col = db.collection('gate-pass');
+    const docs = await col.find({ _id: { $in: validIds } }).toArray();
+
+    await recordAudit({
+      db, req,
+      action: "BULK_DELETE_GATEPASS",
+      collectionName: "gate-pass",
+      documentId: null,
+      oldDoc: { count: docs.length, items: docs.map(d => ({ _id: d._id, tripDo: d.tripDo, customerName: d.customerName })) },
+      reason: reason?.trim() || "",
+    });
+
+    const result = await col.deleteMany({ _id: { $in: validIds } });
+    logger.info("Bulk gate-pass delete", { count: result.deletedCount, by: req.user?.email });
+    res.send({ success: true, deletedCount: result.deletedCount });
+  } catch (err) {
+    logger.error('Bulk gate-pass delete failed', err);
+    res.status(500).send({ success: false, message: "Bulk delete failed" });
+  }
+});
+
+/**
+ * Bulk export — fetch all matching records for Excel/PDF generation (client-side).
+ * Supports same filters as list endpoints.
+ * No pagination (up to 10000 records max).
+ */
+app.get('/challans/bulk-export', verifyToken, verifyNonVendor, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('challans');
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    const search = escapeRegex(req.query.search || "");
+
+    let query = {};
+    if (search) {
+      query.$or = [
+        { customerName: { $regex: search, $options: "i" } },
+        { receiverNumber: { $regex: search, $options: "i" } },
+        { zone: { $regex: search, $options: "i" } },
+      ];
+    } else {
+      if (!month || !year) {
+        const _dt = getDhakaCurrentMonthYear();
+        month = _dt.month;
+        year = _dt.year;
+      }
+      const { startDate, endDate } = getDhakaMonthRange(year, month);
+      query.createdAt = { $gte: startDate, $lt: endDate };
+    }
+
+    const data = await col.find(query).sort({ createdAt: -1 }).limit(10000).toArray();
+    res.send({ success: true, data, count: data.length });
+  } catch (err) {
+    logger.error('Bulk export failed', err);
+    res.status(500).send({ success: false, message: "Export failed" });
+  }
+});
+
+app.get('/gate-pass/bulk-export', verifyToken, verifyNonVendor, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('gate-pass');
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    const search = escapeRegex(req.query.search || "");
+
+    let query = {};
+    if (search) {
+      query.$or = [
+        { tripDo: { $regex: search, $options: "i" } },
+        { customerName: { $regex: search, $options: "i" } },
+        { vehicleNo: { $regex: search, $options: "i" } },
+      ];
+    } else {
+      if (!month || !year) {
+        const _dt = getDhakaCurrentMonthYear();
+        month = _dt.month;
+        year = _dt.year;
+      }
+      query.tripMonth = month;
+      query.tripYear = year;
+    }
+
+    const data = await col.find(query).sort({ createdAt: -1 }).limit(10000).toArray();
+    res.send({ success: true, data, count: data.length });
+  } catch (err) {
+    logger.error('Bulk export failed', err);
+    res.status(500).send({ success: false, message: "Export failed" });
+  }
+});
+
+app.get('/deliveries/bulk-export', verifyToken, verifyApproved, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('deliveries');
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    if (!month || !year) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
+    }
+    const { startDate, endDate } = getDhakaMonthRange(year, month);
+    let query = { createdAt: { $gte: startDate, $lt: endDate } };
+
+    // Vendor isolation
+    if (req.user?.role === 'vendor') {
+      const userCollection = db.collection('users');
+      const me = await userCollection.findOne({ email: req.user.email });
+      if (!me?.vendorName) return res.send({ success: true, data: [], count: 0 });
+      query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
+    }
+
+    const data = await col.find(query).sort({ createdAt: -1 }).limit(10000).toArray();
+    res.send({ success: true, data, count: data.length });
+  } catch (err) {
+    logger.error('Bulk export failed', err);
+    res.status(500).send({ success: false, message: "Export failed" });
+  }
+});
+
+app.get('/accounts/bulk-export', verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('accounts');
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    if (!month || !year) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
+    }
+    const data = await col.find({ month, year }).sort({ date: -1 }).limit(10000).toArray();
+    res.send({ success: true, data, count: data.length });
+  } catch (err) {
+    logger.error('Accounts export failed', err);
+    res.status(500).send({ success: false, message: "Export failed" });
+  }
+});
+
+app.patch("/accounts/:id/status", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId("id"), async (req, res) => {
   try {
     const db = await connectDB();
     const col = db.collection("accounts");
-    const { status } = req.body; // "paid" | "unpaid"
+    const { status } = req.body;
     if (!["paid", "unpaid"].includes(status))
       return res.status(400).send({ success: false, message: "Invalid status" });
     const result = await col.updateOne(
       { _id: new ObjectId(req.params.id), type: "manual_advance" },
-      { $set: { status, statusUpdatedAt: new Date() } }
+      { $set: { status, statusUpdatedAt: new Date(), statusUpdatedBy: req.user?.email || null } }
     );
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Advance not found" });
@@ -2075,19 +4819,57 @@ app.patch("/accounts/:id/status", verifyToken, validateObjectId("id"), async (re
     res.send({ success: true, data: updated });
   } catch (err) {
     logger.error("Advance status update failed", err);
-    res.status(500).send({ message: "Failed to update status" });
+    res.status(500).send({ success: false, message: "Failed to update status" });
   }
 });
 
-// ── Dashboard Stats ────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Dashboard Stats
+// ═══════════════════════════════════════════════════════════════════
+// FIX #27 — Simple in-memory cache for dashboard stats (5 min TTL).
+// Stats aggregate 15+ queries; caching saves M0 tier load.
+// Cache key includes month/year but NOT user role (data is same for all roles).
+const dashboardCache = new Map();
+const DASHBOARD_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+
+function getCachedDashboard(key) {
+  const entry = dashboardCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > DASHBOARD_CACHE_TTL_MS) {
+    dashboardCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+function setCachedDashboard(key, data) {
+  // Prevent unbounded growth — drop oldest if > 50 entries
+  if (dashboardCache.size >= 50) {
+    const firstKey = dashboardCache.keys().next().value;
+    dashboardCache.delete(firstKey);
+  }
+  dashboardCache.set(key, { ts: Date.now(), data });
+}
+
 app.get("/dashboard-stats", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
-    const now = new Date();
-    const month = now.getMonth() + 1;
-    const year = now.getFullYear();
-    const monthStart = new Date(year, month - 1, 1);
-    const monthEnd = new Date(year, month, 1);
+    // FIX #28 — Accept optional month/year query params; default to current Dhaka month
+    let month = parseInt(req.query.month);
+    let year = parseInt(req.query.year);
+    if (!month || !year || month < 1 || month > 12) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
+    }
+
+    // Try cache first
+    const cacheKey = `${month}-${year}`;
+    const cached = getCachedDashboard(cacheKey);
+    if (cached) {
+      return res.send({ success: true, data: cached, cached: true });
+    }
+
+    const { startDate: monthStart, endDate: monthEnd } = getDhakaMonthRange(year, month);
 
     const [
       gpUnitAgg, gpMonthCount, gpTotalCount,
@@ -2097,8 +4879,6 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
       accountsTxs, carRentThisMonth,
       topDeliveryPoints,
     ] = await Promise.all([
-
-      // Gate Pass: unit-wise total qty এই মাসে (unit = top-level field, e.g. "WFR")
       db.collection('gate-pass').aggregate([
         { $match: { tripMonth: month, tripYear: year } },
         { $unwind: '$products' },
@@ -2116,7 +4896,6 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
       db.collection('gate-pass').countDocuments({ tripMonth: month, tripYear: year }),
       db.collection('gate-pass').countDocuments(),
 
-      // Challan: productName-wise qty এই মাসে
       db.collection('challans').aggregate([
         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
         { $unwind: '$products' },
@@ -2124,14 +4903,12 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
         { $sort: { qty: -1 } },
         { $limit: 8 },
       ]).toArray(),
-      // Challan status breakdown
       db.collection('challans').aggregate([
         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
         { $group: { _id: '$status', count: { $sum: 1 } } },
       ]).toArray(),
       db.collection('challans').countDocuments(),
 
-      // Delivery: productName-wise qty এই মাসে
       db.collection('deliveries').aggregate([
         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
         { $unwind: '$challans' },
@@ -2149,15 +4926,12 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
       db.collection('vendors').countDocuments(),
       db.collection('users').countDocuments(),
 
-      // Accounts এই মাসের
       db.collection('accounts').find({ month, year }).toArray(),
-      // Car rent এই মাসের (advance জন্য)
       db.collection('deliveries').find(
         { createdAt: { $gte: monthStart, $lt: monthEnd } },
         { projection: { advance: 1 } }
       ).toArray(),
 
-      // Top delivery zones/points এই মাসে (challan zone-wise count)
       db.collection('challans').aggregate([
         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
         { $group: { _id: '$zone', count: { $sum: 1 } } },
@@ -2166,11 +4940,9 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
       ]).toArray(),
     ]);
 
-    // Challan status map
     const csMap = {};
     challanStatusAgg.forEach(s => { csMap[s._id || 'pending'] = s.count; });
 
-    // Accounts summary
     const n = (v) => (v != null ? Number(v) : 0);
     const income = accountsTxs.filter(t => t.type === 'income').reduce((s, t) => s + n(t.amount), 0);
     const expense = accountsTxs.filter(t => t.type === 'expense').reduce((s, t) => s + n(t.amount), 0);
@@ -2180,51 +4952,60 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
     const totalExpense = expense + vendorPayment + manualAdv + autoAdv;
     const netBalance = income - totalExpense;
 
-    res.send({
-      success: true,
-      data: {
-        currentMonth: month,
-        currentYear: year,
-        gatePass: {
-          totalCount: gpTotalCount,
-          monthCount: gpMonthCount,
-          unitBreakdown: gpUnitAgg,   // [{ _id: 'WFR', qty: 230, passCount: 5 }, ...]
-        },
-        challan: {
-          totalCount: challanTotalCount,
-          monthTotal: challanStatusAgg.reduce((s, x) => s + x.count, 0),
-          delivered: csMap['delivered'] || 0,
-          pending: csMap['pending'] || 0,
-          returned: csMap['returned'] || 0,
-          productBreakdown: challanProductAgg,
-        },
-        trip: {
-          totalCount: tripTotalCount,
-          monthCount: tripMonthCount,
-          activeCount: activeTripCount,
-          productBreakdown: deliveryProductAgg,
-        },
-        vendor: { totalCount: vendorCount },
-        user: { totalCount: userCount },
-        accounts: { income, totalExpense, netBalance, vendorPayment, autoAdv, manualAdv },
-        topDeliveryPoints,
-      }
-    });
+    const statsData = {
+      currentMonth: month,
+      currentYear: year,
+      gatePass: {
+        totalCount: gpTotalCount,
+        monthCount: gpMonthCount,
+        unitBreakdown: gpUnitAgg,
+      },
+      challan: {
+        totalCount: challanTotalCount,
+        monthTotal: challanStatusAgg.reduce((s, x) => s + x.count, 0),
+        delivered: csMap['delivered'] || 0,
+        pending: csMap['pending'] || 0,
+        returned: csMap['returned'] || 0,
+        productBreakdown: challanProductAgg,
+      },
+      trip: {
+        totalCount: tripTotalCount,
+        monthCount: tripMonthCount,
+        activeCount: activeTripCount,
+        productBreakdown: deliveryProductAgg,
+      },
+      vendor: { totalCount: vendorCount },
+      user: { totalCount: userCount },
+      accounts: { income, totalExpense, netBalance, vendorPayment, autoAdv, manualAdv },
+      topDeliveryPoints,
+    };
+
+    // FIX #27 — Cache result for 5 min
+    setCachedDashboard(cacheKey, statsData);
+
+    res.send({ success: true, data: statsData, cached: false });
   } catch (err) {
     logger.error("Dashboard stats failed", err);
-    res.status(500).send({ message: "Failed to fetch stats" });
+    res.status(500).send({ success: false, message: "Failed to fetch stats" });
   }
 });
-
 
 // ── Global Error Handler ───────────────────────────────────────────
 app.use((err, req, res, next) => {
   logger.error("Unhandled error", err);
-  res.status(500).send({ message: "Internal Server Error" });
+  // CORS error
+  if (err.message?.startsWith('CORS blocked')) {
+    return res.status(403).send({ success: false, message: err.message });
+  }
+  // Multer file size error
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).send({ success: false, message: 'File too large (max 5MB)' });
+  }
+  res.status(500).send({ success: false, message: "Internal Server Error" });
 });
 
 // ── Start Server ───────────────────────────────────────────────────
-if (process.env.NODE_ENV !== "production") {
+if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
   app.listen(port, () => {
     logger.info(`Server running`, { port });
   });
