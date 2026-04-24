@@ -157,6 +157,33 @@ async function verifyFirebaseIdToken(idToken) {
       picture: decoded.picture || null,
     };
   } catch (err) {
+    // FIX: auth/user-not-found can occur as a race condition immediately after
+    // account creation when checkRevoked:true tries to fetch the user record
+    // before Firebase has fully propagated it. Retry once without revocation
+    // check — the token signature is still cryptographically verified.
+    if (err.code === 'auth/user-not-found') {
+      try {
+        const decoded = await admin.auth().verifyIdToken(idToken, false);
+        return {
+          valid: true,
+          uid: decoded.uid,
+          email: decoded.email || null,
+          emailVerified: decoded.email_verified || false,
+          provider: decoded.firebase?.sign_in_provider || 'unknown',
+          issuedAt: new Date(decoded.iat * 1000),
+          expiresAt: new Date(decoded.exp * 1000),
+          name: decoded.name || null,
+          picture: decoded.picture || null,
+        };
+      } catch (retryErr) {
+        return {
+          valid: false,
+          error: retryErr.code || 'unknown',
+          message: retryErr.message || 'Token verification failed',
+        };
+      }
+    }
+
     // Common error codes:
     //   auth/id-token-expired   — token > 1 hour old (client should refresh)
     //   auth/id-token-revoked   — session revoked

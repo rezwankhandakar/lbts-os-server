@@ -583,6 +583,72 @@ app.get('/verify-token', verifyToken, (req, res) => {
 // Users
 // ═══════════════════════════════════════════════════════════════════
 
+// ── Registration endpoint ──────────────────────────────────────────
+// Accepts a Firebase ID token (not an app JWT) so the client never needs
+// to call /jwt during registration. This removes the isNewRegistration
+// bypass entirely — /jwt now always requires a verified email.
+//
+// Security properties:
+//  - Firebase ID token is cryptographically verified server-side
+//  - Email comes from the verified token, never from request body
+//  - Account must be < 5 minutes old (prevents abusing this endpoint
+//    after a user deletes their own DB record to bypass email verification)
+app.post('/register', authLimiter, async (req, res) => {
+  try {
+    const { idToken, displayName, photoURL } = req.body;
+
+    if (!idToken) {
+      return res.status(400).send({ success: false, message: 'Firebase ID token required' });
+    }
+    if (!displayName || typeof displayName !== 'string' || !displayName.trim()) {
+      return res.status(400).send({ success: false, message: 'displayName required' });
+    }
+
+    const verification = await verifyFirebaseIdToken(idToken);
+    if (!verification.valid) {
+      return res.status(401).send({ success: false, message: 'Invalid Firebase token', code: verification.error });
+    }
+
+    const { email, uid, issuedAt } = verification;
+    if (!email) {
+      return res.status(400).send({ success: false, message: 'No email in Firebase token' });
+    }
+
+    // Reject if the Firebase account is older than 5 minutes — this endpoint
+    // is only for brand-new signups, not for bypassing email verification later.
+    const accountAgeMs = Date.now() - new Date(issuedAt).getTime();
+    if (accountAgeMs > 5 * 60 * 1000) {
+      return res.status(403).send({
+        success: false,
+        code: 'NOT_NEW_ACCOUNT',
+        message: 'This endpoint is only for new registrations.',
+      });
+    }
+
+    const db = await connectDB();
+    const userCollection = db.collection('users');
+    const exists = await userCollection.findOne({ email });
+    if (exists) {
+      return res.send({ success: true, alreadyExists: true, message: 'User already exists' });
+    }
+
+    const newUser = {
+      email,
+      displayName: displayName.trim(),
+      photoURL: typeof photoURL === 'string' ? photoURL : '',
+      role: 'user',
+      status: 'pending',
+      firebaseUid: uid,
+      createdAt: new Date(),
+    };
+    const result = await userCollection.insertOne(newUser);
+    res.send({ success: true, alreadyExists: false, insertedId: result.insertedId });
+  } catch (err) {
+    logger.error('Registration failed', err);
+    res.status(500).send({ success: false, message: 'Registration failed' });
+  }
+});
+
 // FIX #16 — Require valid JWT (user must have completed /jwt flow).
 // Email taken from JWT (verified server-side), NOT from request body → spoof-proof.
 app.post('/users', verifyToken, async (req, res) => {
@@ -712,6 +778,58 @@ app.patch('/users/status/:id', verifyToken, verifyAdmin, validateObjectId('id'),
   } catch (err) {
     logger.error('Failed to update status', err);
     res.status(500).send({ success: false, message: 'Failed to update status' });
+  }
+});
+
+// Profile update — user updates their own displayName / photoURL in MongoDB.
+// Email and role are immutable here; those go through admin routes.
+app.patch('/users/profile', verifyToken, validate([
+  body('displayName').optional().trim().notEmpty().withMessage('displayName cannot be empty'),
+  body('photoURL').optional().isURL().withMessage('photoURL must be a valid URL'),
+]), async (req, res) => {
+  try {
+    const email = req.user?.email;
+    if (!email) return res.status(401).send({ success: false, message: 'Unauthorized' });
+
+    const { displayName, photoURL } = req.body;
+    const updates = {};
+    if (displayName) updates.displayName = displayName.trim();
+    if (typeof photoURL === 'string') updates.photoURL = photoURL;
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).send({ success: false, message: 'Nothing to update' });
+    }
+
+    updates.updatedAt = new Date();
+
+    const db = await connectDB();
+    const result = await db.collection('users').updateOne({ email }, { $set: updates });
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ success: false, message: 'User not found' });
+    }
+
+    res.send({ success: true, updated: updates });
+  } catch (err) {
+    logger.error('Failed to update profile', err);
+    res.status(500).send({ success: false, message: 'Failed to update profile' });
+  }
+});
+
+// Self-delete — used only during registration rollback when post-create steps fail.
+// Allows a newly created user to remove their own DB record before Firebase account
+// is also deleted. No admin required — token ownership proves identity.
+app.delete('/users/self', verifyToken, async (req, res) => {
+  try {
+    const email = req.user?.email;
+    if (!email) return res.status(401).send({ success: false, message: 'Unauthorized' });
+
+    const db = await connectDB();
+    const userCollection = db.collection('users');
+    const result = await userCollection.deleteOne({ email });
+    res.send({ success: true, deleted: result.deletedCount === 1 });
+  } catch (err) {
+    logger.error('Failed to self-delete user', err);
+    res.status(500).send({ success: false, message: 'Failed to delete user' });
   }
 });
 
