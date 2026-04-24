@@ -64,7 +64,7 @@ const INDEX_PLAN = {
     },
   ],
 
-  // ─────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────.......
   //  GATE-PASS collection
   //  Query patterns from index.js:
   //    - find({ tripMonth, tripYear }).sort({ createdAt: -1 })   [Line 2480-2484]
