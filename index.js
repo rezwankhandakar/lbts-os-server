@@ -53,10 +53,10 @@ function isRealImage(buffer) {
   if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'jpeg';
   // PNG: 89 50 4E 47 0D 0A 1A 0A
   if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47 &&
-      buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A) return 'png';
+    buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A) return 'png';
   // WEBP: RIFF....WEBP (bytes 0-3 'RIFF', bytes 8-11 'WEBP')
   if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
-      buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) return 'webp';
+    buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) return 'webp';
   return false;
 }
 
@@ -1220,7 +1220,7 @@ app.get("/challans/filter-options", verifyToken, verifyNonVendor, async (req, re
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     if (!month || !year) {
-        const _dt = getDhakaCurrentMonthYear();
+      const _dt = getDhakaCurrentMonthYear();
       month = _dt.month;
       year = _dt.year;
     }
@@ -1300,10 +1300,10 @@ app.patch('/challan/:id', verifyToken, verifyNonVendor, validateObjectId('id'), 
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
-    const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt } = req.body;
+    const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt, updatedBy } = req.body;
     const setDoc = {
       customerName, address, thana, district, receiverNumber, zone, currentUser,
-      lastUpdatedBy: req.user?.email || 'unknown',
+      lastUpdatedBy: updatedBy || req.user?.email || 'unknown',
       lastUpdatedAt: new Date(),
     };
     if (createdAt) {
@@ -1374,13 +1374,13 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
-    const { customerName, receiverNumber, zone, address, thana, district, products } = req.body;
+    const { customerName, receiverNumber, zone, address, thana, district, products, updatedBy } = req.body;
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
       {
         $set: {
           customerName, receiverNumber, zone, address, thana, district, products,
-          lastUpdatedBy: req.user?.email || 'unknown',
+          lastUpdatedBy: updatedBy || req.user?.email || 'unknown',
           lastUpdatedAt: new Date(),
         }
       }
@@ -1690,7 +1690,7 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
         vendorNumber: deliveries[0].vendorNumber,
         driverName: deliveries[0].driverName,
         driverNumber: deliveries[0].driverNumber,
-        createdBy: req.user?.email || deliveries[0].createdBy || "unknown",
+        createdBy: deliveries[0].createdBy || req.user?.email || "unknown",
         totalChallan: deliveries.length,
         challans: deliveries.map(d => ({
           challanId: d.challanId,
@@ -1864,7 +1864,7 @@ app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, verifyNonVendor
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-    const { customerName, address, thana, district, receiverNumber, zone } = req.body;
+    const { customerName, address, thana, district, receiverNumber, zone, updatedBy } = req.body;
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
@@ -1876,7 +1876,7 @@ app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, verifyNonVendor
           "challans.$.district": district,
           "challans.$.receiverNumber": receiverNumber,
           "challans.$.zone": zone,
-          lastUpdatedBy: req.user?.email || null,
+          lastUpdatedBy: updatedBy || req.user?.email || null,
           lastUpdatedAt: new Date(),
         }
       }
@@ -1897,7 +1897,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId, productId } = req.params;
-    const { productName, model, quantity } = req.body;
+    const { productName, model, quantity, updatedBy } = req.body;
 
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
@@ -1916,6 +1916,8 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
           [`${updateField}.productName`]: productName,
           [`${updateField}.model`]: model,
           [`${updateField}.quantity`]: Number(quantity),
+          lastUpdatedBy: updatedBy || req.user?.email || null,
+          lastUpdatedAt: new Date(),
         }
       }
     );
@@ -2041,14 +2043,14 @@ app.patch("/deliveries/:tripId/trip-info", verifyToken, verifyNonVendor, validat
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId } = req.params;
-    const { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber } = req.body;
+    const { vehicleNumber, vendorName, vendorNumber, driverName, driverNumber,updatedBy  } = req.body;
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
       {
         $set: {
           vehicleNumber, vendorName, vendorNumber, driverName, driverNumber,
-          lastUpdatedBy: req.user?.email || null,
+          lastUpdatedBy: updatedBy || req.user?.email || null,
           lastUpdatedAt: new Date(),
         }
       }
@@ -2069,7 +2071,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, verifyNo
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-    const { returnedProducts, returnNote } = req.body;
+    const { returnedProducts, returnNote,updatedBy } = req.body;
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
@@ -2078,7 +2080,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, verifyNo
           "challans.$.returnedProducts": returnedProducts,
           "challans.$.returnNote": returnNote || "",
           "challans.$.returnedAt": new Date(),
-          lastUpdatedBy: req.user?.email || null,
+          lastUpdatedBy:updatedBy || req.user?.email || null,
           lastUpdatedAt: new Date(),
         }
       }
@@ -2097,14 +2099,14 @@ app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, verifyNonV
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-    const { note } = req.body;
+    const { note,updatedBy} = req.body;
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
       {
         $set: {
           "challans.$.note": note, "challans.$.noteUpdatedAt": new Date(),
-          lastUpdatedBy: req.user?.email || null,
+          lastUpdatedBy:updatedBy || req.user?.email || null,
           lastUpdatedAt: new Date(),
         }
       }
@@ -2253,7 +2255,7 @@ app.patch("/car-rents/:tripId", verifyToken, verifyRole('admin', 'manager', 'ceo
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
-    const { rent, leborBill } = req.body;
+    const { rent, leborBill, updatedBy } = req.body;
 
     // Validate numeric
     if (rent != null && (typeof rent !== 'number' || rent < 0)) {
@@ -2268,7 +2270,7 @@ app.patch("/car-rents/:tripId", verifyToken, verifyRole('admin', 'manager', 'ceo
       {
         $set: {
           rent, leborBill,
-          rentSavedBy: req.user?.email || null,
+          rentSavedBy: updatedBy || req.user?.email || null,
           rentSavedAt: new Date(),
         }
       }
@@ -2288,7 +2290,7 @@ app.patch("/deliveries/:tripId/advance", verifyToken, verifyRole('admin', 'manag
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
-    const { advance } = req.body;
+    const { advance, updatedBy } = req.body;
 
     if (advance != null && (typeof advance !== 'number' || advance < 0)) {
       return res.status(400).send({ success: false, message: 'advance must be non-negative number' });
@@ -2299,7 +2301,7 @@ app.patch("/deliveries/:tripId/advance", verifyToken, verifyRole('admin', 'manag
       {
         $set: {
           advance: advance !== undefined ? Number(advance) : null,
-          advanceSavedBy: req.user?.email || null,
+          advanceSavedBy: updatedBy || req.user?.email || null,
           advanceSavedAt: new Date(),
         }
       }
@@ -2379,7 +2381,7 @@ app.get("/accounts", verifyToken, verifyRole('admin', 'manager', 'ceo'), async (
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     if (!month || !year) {
-        const _dt = getDhakaCurrentMonthYear();
+      const _dt = getDhakaCurrentMonthYear();
       month = _dt.month;
       year = _dt.year;
     }
