@@ -407,13 +407,33 @@ app.get('/', (req, res) => {
 });
 
 // ── Image Upload ───────────────────────────────────────────────────
-app.post('/upload-image', verifyToken, uploadLimiter, multerUpload.single('image'), async (req, res) => {
+app.post('/upload-image', uploadLimiter, multerUpload.single('image'), async (req, res) => {
   try {
+    // Firebase ID token অথবা App JWT — দুটোই accept করো
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      return res.status(401).send({ success: false, message: 'Unauthorized' });
+    }
+    const token = authHeader.split(' ')[1];
+
+    // আগে App JWT try করো, fail হলে Firebase ID token try করো
+    let userEmail = null;
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      userEmail = decoded.email;
+    } catch {
+      const verification = await verifyFirebaseIdToken(token);
+      if (!verification.valid) {
+        return res.status(401).send({ success: false, message: 'Invalid token' });
+      }
+      userEmail = verification.email;
+    }
+    req.user = { email: userEmail };
+
     if (!req.file) {
       return res.status(400).send({ success: false, message: 'No image provided' });
     }
 
-    // FIX #30 — Verify file is actually an image (not just renamed extension)
     const realFormat = isRealImage(req.file.buffer);
     if (!realFormat) {
       logger.warn('Fake image upload blocked', {
@@ -441,7 +461,6 @@ app.post('/upload-image', verifyToken, uploadLimiter, multerUpload.single('image
       { headers: formData.getHeaders(), timeout: 20000 }
     );
 
-    // FIX #17 — Validate ImgBB response shape before accessing
     const url = response?.data?.data?.url;
     if (!url || typeof url !== 'string') {
       logger.error('ImgBB response invalid', { responseData: response?.data });
@@ -1301,15 +1320,29 @@ app.patch('/challan/:id', verifyToken, verifyNonVendor, validateObjectId('id'), 
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt, updatedBy } = req.body;
+
+    // createdAt না পাঠালে DB থেকে নাও
+    let dateToUse = createdAt ? new Date(createdAt) : null;
+    if (!dateToUse) {
+      const existing = await challanCollection.findOne(
+        { _id: new ObjectId(req.params.id) },
+        { projection: { createdAt: 1 } }
+      );
+      dateToUse = existing?.createdAt ? new Date(existing.createdAt) : null;
+    }
+
     const setDoc = {
       customerName, address, thana, district, receiverNumber, zone, currentUser,
       lastUpdatedBy: updatedBy || req.user?.email || 'unknown',
       lastUpdatedAt: new Date(),
     };
-    if (createdAt) {
-      setDoc.month = new Date(createdAt).getMonth() + 1;
-      setDoc.year = new Date(createdAt).getFullYear();
+
+    // এখন সবসময় month/year set হবে
+    if (dateToUse && !isNaN(dateToUse.getTime())) {
+      setDoc.month = dateToUse.getMonth() + 1;
+      setDoc.year = dateToUse.getFullYear();
     }
+
     await challanCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: setDoc });
     const updatedChallan = await challanCollection.findOne({ _id: new ObjectId(req.params.id) });
     res.send({ success: true, data: updatedChallan });
@@ -1571,7 +1604,10 @@ app.post("/vehicles", verifyToken, verifyNonVendor, validate([
   }
 });
 
-app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor, async (req, res) => {
+app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
+  validateObjectId('vendorId'),   // ← এটা যোগ করো
+  validateObjectId('vehicleId'),  // ← এটা যোগ করো
+  async (req, res) => {
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
@@ -1579,7 +1615,6 @@ app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor, async (r
     const { vendorId, vehicleId } = req.params;
     const { vehicleModel, vehicleNumber, driverName, driverPhone, driverImg } = req.body;
 
-    // শুধু যেসব field পাঠানো হয়েছে সেগুলোই update হবে
     const updateFields = {};
     if (vehicleModel  !== undefined) updateFields["vehicles.$.vehicleModel"]  = vehicleModel;
     if (vehicleNumber !== undefined) updateFields["vehicles.$.vehicleNumber"] = vehicleNumber;
@@ -2156,65 +2191,82 @@ app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, verifyNonV
 });
 
 app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
+  const { client, db } = await getConnection();
+  const deliveriesCollection = db.collection('deliveries');
+  const { tripId } = req.params;
+  const {
+    originalChallanId, customerName, zone, address,
+    thana, district, receiverNumber,
+    returnedProducts, returnNote,
+  } = req.body;
+
+  const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+  if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+  const returnChallan = {
+    challanId: `return_${originalChallanId}_${Date.now()}`,
+    isReturn: true,
+    originalChallanId,
+    customerName,
+    zone,
+    address,
+    thana,
+    district,
+    receiverNumber,
+    products: (returnedProducts || []).map(p => ({
+      _id: p._id || new ObjectId().toString(),
+      productName: p.productName,
+      model: p.model,
+      quantity: Number(p.returnQty || p.quantity),
+    })),
+    returnNote: returnNote || "",
+    returnedAt: new Date(),
+    deliveryStatus: "return",
+    challanReturnStatus: null,
+  };
+
+  const session = client.startSession();
   try {
-    const db = await connectDB();
-    const deliveriesCollection = db.collection('deliveries');
-    const { tripId } = req.params;
-    const {
-      originalChallanId, customerName, zone, address,
-      thana, district, receiverNumber,
-      returnedProducts, returnNote,
-    } = req.body;
-    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
-    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+    await session.withTransaction(async () => {
+      // ১ম call — return challan যোগ করো
+      await deliveriesCollection.updateOne(
+        { _id: new ObjectId(tripId) },
+        {
+          $push: { challans: returnChallan },
+          $inc: { totalChallan: 1 }
+        },
+        { session }
+      );
 
-    const returnChallan = {
-      challanId: `return_${originalChallanId}_${Date.now()}`,
-      isReturn: true,
-      originalChallanId,
-      customerName,
-      zone,
-      address,
-      thana,
-      district,
-      receiverNumber,
-      products: (returnedProducts || []).map(p => ({
-        _id: p._id || new ObjectId().toString(),
-        productName: p.productName,
-        model: p.model,
-        quantity: Number(p.returnQty || p.quantity),
-      })),
-      returnNote: returnNote || "",
-      returnedAt: new Date(),
-      deliveryStatus: "return",
-      challanReturnStatus: null,
-    };
-
-    await deliveriesCollection.updateOne(
-      { _id: new ObjectId(tripId) },
-      {
-        $push: { challans: returnChallan },
-        $inc: { totalChallan: 1 }
-      }
-    );
-
-    await deliveriesCollection.updateOne(
-      { _id: new ObjectId(tripId), "challans.challanId": originalChallanId },
-      {
-        $set: {
-          "challans.$.returnedProducts": returnedProducts,
-          "challans.$.returnNote": returnNote || "",
-          "challans.$.returnedAt": new Date(),
-          lastUpdatedBy: req.user?.email || null,
-          lastUpdatedAt: new Date(),
-        }
-      }
-    );
+      // ২য় call — original challan এ returnedProducts mark করো
+      await deliveriesCollection.updateOne(
+        { _id: new ObjectId(tripId), "challans.challanId": originalChallanId },
+        {
+          $set: {
+            "challans.$.returnedProducts": returnedProducts,
+            "challans.$.returnNote": returnNote || "",
+            "challans.$.returnedAt": new Date(),
+            lastUpdatedBy: req.user?.email || null,
+            lastUpdatedAt: new Date(),
+          }
+        },
+        { session }
+      );
+    });
 
     res.send({ success: true, returnChallan });
   } catch (err) {
     logger.error("Return challan add failed", err);
+    if (err.codeName === 'IllegalOperation' || err.message?.includes('Transaction')) {
+      return res.status(503).send({
+        success: false,
+        code: 'TRANSACTION_UNSUPPORTED',
+        message: 'Database transactions temporarily unavailable. Please try again.',
+      });
+    }
     res.status(500).send({ success: false, message: "Failed to add return challan" });
+  } finally {
+    await session.endSession();
   }
 });
 
