@@ -1571,6 +1571,41 @@ app.post("/vehicles", verifyToken, verifyNonVendor, validate([
   }
 });
 
+app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const vendorsCollection = db.collection('vendors');
+
+    const { vendorId, vehicleId } = req.params;
+    const { vehicleModel, vehicleNumber, driverName, driverPhone, driverImg } = req.body;
+
+    // শুধু যেসব field পাঠানো হয়েছে সেগুলোই update হবে
+    const updateFields = {};
+    if (vehicleModel  !== undefined) updateFields["vehicles.$.vehicleModel"]  = vehicleModel;
+    if (vehicleNumber !== undefined) updateFields["vehicles.$.vehicleNumber"] = vehicleNumber;
+    if (driverName    !== undefined) updateFields["vehicles.$.driverName"]    = driverName;
+    if (driverPhone   !== undefined) updateFields["vehicles.$.driverPhone"]   = driverPhone;
+    if (driverImg     !== undefined) updateFields["vehicles.$.driverImg"]     = driverImg;
+
+    const result = await vendorsCollection.updateOne(
+      {
+        _id: new ObjectId(vendorId),
+        "vehicles._id": new ObjectId(vehicleId),
+      },
+      { $set: updateFields }
+    );
+
+    if (result.modifiedCount > 0) {
+      res.send({ success: true });
+    } else {
+      res.status(404).send({ success: false, message: "Vehicle not found" });
+    }
+  } catch (err) {
+    logger.error('Failed to update vehicle', err);
+    res.status(500).send({ success: false, message: "Failed to update vehicle" });
+  }
+});
+
 app.delete("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
   validateObjectId('vendorId'),
   validateObjectId('vehicleId'),
