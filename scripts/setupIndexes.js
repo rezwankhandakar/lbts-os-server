@@ -177,6 +177,17 @@ const INDEX_PLAN = {
       options: { name: 'tripNumber', sparse: true },
       why: 'Lookup challans by trip number (sparse: only delivered ones)',
     },
+    // ── Products nested field indexes — autocomplete fast path ──
+    {
+      keys: { 'products.productName': 1 },
+      options: { name: 'products_productName' },
+      why: 'Autocomplete: $match on products.productName before $unwind (faster than full scan)',
+    },
+    {
+      keys: { 'products.model': 1 },
+      options: { name: 'products_model' },
+      why: 'Autocomplete: $match on products.model before $unwind (faster than full scan)',
+    },
     // ── Text index for challan search ──
     {
       keys: {

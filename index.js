@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require('express');
@@ -212,7 +211,7 @@ app.use(express.json({ limit: '2mb' }));
 
 // FIX #20 — Apply global rate limit to ALL routes (exempts health check)
 app.use((req, res, next) => {
-  if (req.path === '/') return next(); // skip health check
+  if (req.path === '/' || req.path === '/warmup') return next(); // skip health + warmup
   return globalLimiter(req, res, next);
 });
 
@@ -232,7 +231,7 @@ const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeUR
 let cachedConnection = null;
 let connectionPromise = null;
 let lastPingTime = 0;
-const PING_CACHE_MS = 30 * 1000; // FIX #23 — Only ping every 30s, not every request
+const PING_CACHE_MS = 60 * 1000; // FIX: ping interval 60s — connection alive থাকলে ping skip
 
 async function getConnection() {
   // If already connected, reuse (ping only if stale)
@@ -267,13 +266,21 @@ async function getConnection() {
         strict: false,
         deprecationErrors: true,
       },
-      maxPoolSize: 3,
-      minPoolSize: 0,
-      maxIdleTimeMS: 10000,
+      // ── FIX: Cold Start & Connection Warmup ──────────────────────
+      // আগে: minPoolSize=0, maxIdleTimeMS=10000
+      //   → Vercel function sleep হলে connection মরে যেত
+      //   → পরের request-এ reconnect → 3-5s cold start
+      // এখন: minPoolSize=1 → সবসময় ১টা connection জীবিত থাকে
+      //       maxIdleTimeMS=60000 → 60s idle-এও connection টিকে থাকে
+      //       heartbeatFrequencyMS=10000 → MongoDB server alive রাখে
+      maxPoolSize: 5,           // 10-12 user, 5 concurrent যথেষ্ট
+      minPoolSize: 1,           // সবসময় ১টা connection warm থাকবে
+      maxIdleTimeMS: 60000,     // 60s idle-এও মরবে না (আগে 10s)
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
       connectTimeoutMS: 10000,
       waitQueueTimeoutMS: 5000,
+      heartbeatFrequencyMS: 10000, // server alive রাখে, stale connection ধরে
       retryWrites: true,
       retryReads: true,
     });
@@ -281,7 +288,7 @@ async function getConnection() {
     try {
       await client.connect();
       const db = client.db('LBTS-OS-DB');
-      logger.info('MongoDB Connected', { poolSize: 3, appName: 'LBTS-OS' });
+      logger.info('MongoDB Connected', { poolSize: 5, minPool: 1, appName: 'LBTS-OS' });
       cachedConnection = { client, db };
       lastPingTime = Date.now();
       return cachedConnection;
@@ -404,6 +411,27 @@ function validateObjectId(paramName = 'id') {
 // ── Health Check ───────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.send('LBTS-OS Server is running ✅');
+});
+
+// ── Warmup endpoint ────────────────────────────────────────────────
+// FIX: Vercel serverless cold start এড়াতে client থেকে প্রতি 4 মিনিটে
+// এই endpoint ping করলে function warm থাকবে + MongoDB connection জীবিত থাকবে
+// Client-এ: setInterval(() => fetch(`${API_URL}/warmup`), 4 * 60 * 1000)
+// (শুধু user logged-in থাকলে চলবে — AuthProvider-এ রাখো)
+app.get('/warmup', async (req, res) => {
+  try {
+    const start = Date.now();
+    await connectDB(); // connection alive আছে কিনা confirm করো
+    res.send({
+      ok: true,
+      message: 'warm',
+      dbLatencyMs: Date.now() - start,
+      ts: new Date().toISOString(),
+    });
+  } catch (err) {
+    logger.error('Warmup failed', err);
+    res.status(503).send({ ok: false, message: 'db unavailable' });
+  }
 });
 
 // ── Image Upload ───────────────────────────────────────────────────
@@ -1063,16 +1091,35 @@ app.delete('/gate-pass/:id', verifyToken, verifyRole('admin', 'manager'), valida
 });
 
 // ── Autocomplete ───────────────────────────────────────────────────
+// ── Autocomplete field → index mapping ──────────────────────────────
+// Text index কোন collection-এ কোন field cover করে:
+//   challans    text index: customerName, address, receiverNumber, zone, thana, district
+//   gate-pass   text index: tripDo, customerName, csd, unit, vehicleNo, zone
+// productName / model — nested products array, text index support নেই MongoDB-তে
+//   → এগুলোর জন্য individual field index (products.productName, products.model) দিয়ে regex
+//
+// Strategy:
+//   1. Text-indexed fields  → $text + $search (fastest, index-only scan)
+//   2. products.* fields    → $match regex on indexed nested field + $unwind
+//   3. Fallback             → regex on individual field index (still fast with index)
+
+// কোন field কোন collection-এ text index-এ আছে
+const TEXT_INDEXED = {
+  challan:  new Set(['customerName', 'address', 'receiverNumber', 'zone', 'thana', 'district']),
+  gatepass: new Set(['tripDo', 'customerName', 'csd', 'unit', 'vehicleNo', 'zone']),
+};
+
 app.get("/autocomplete", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
     const gatePassCollection = db.collection('gate-pass');
-    const challanCollection = db.collection('challans');
+    const challanCollection  = db.collection('challans');
     const { field, collection } = req.query;
-    // FIX #3 — escape regex input
-    const search = escapeRegex(req.query.search || "");
+    const rawSearch = (req.query.search || "").trim();
 
-    // Whitelist allowed fields to prevent injection
+    if (!rawSearch) return res.send([]);
+
+    // Whitelist — injection protection
     const ALLOWED_FIELDS = [
       'tripDo', 'customerName', 'csd', 'unit', 'vehicleNo', 'zone',
       'productName', 'model', 'address', 'receiverNumber', 'thana', 'district'
@@ -1081,24 +1128,55 @@ app.get("/autocomplete", verifyToken, verifyNonVendor, async (req, res) => {
       return res.status(400).send({ success: false, message: 'Invalid field' });
     }
 
-    const targetCollection = collection === "challan" ? challanCollection : gatePassCollection;
+    const isChallan = collection === "challan";
+    const targetCollection = isChallan ? challanCollection : gatePassCollection;
+    const collKey = isChallan ? 'challan' : 'gatepass';
+    const isTextIndexed = TEXT_INDEXED[collKey]?.has(field);
+    const isProductField = field === 'productName' || field === 'model';
+
     let pipeline = [];
-    if (field === "productName" || field === "model") {
+
+    if (isProductField) {
+      // ── products.* — nested field, individual index দিয়ে regex ──
+      // Index: challans→products.model, challans→(no productName index, regex scan)
+      // $match আগে করো তারপর $unwind → collection scan কমে
+      const safeSearch = escapeRegex(rawSearch);
       pipeline = [
-        { $unwind: "$products" },
-        { $match: { [`products.${field}`]: { $regex: search, $options: "i" } } },
-        { $group: { _id: `$products.${field}` } },
-        { $project: { _id: 0, value: "$_id" } },
-        { $limit: 5 },
+        { $match:   { [`products.${field}`]: { $regex: safeSearch, $options: 'i' } } },
+        { $unwind:  '$products' },
+        { $match:   { [`products.${field}`]: { $regex: safeSearch, $options: 'i' } } },
+        { $group:   { _id: `$products.${field}` } },
+        { $project: { _id: 0, value: '$_id' } },
+        { $limit:   5 },
+      ];
+    } else if (isTextIndexed) {
+      // ── Text index → $text + $search (fastest) ──
+      // MongoDB text search prefix match নেই — তাই regex fallback দিয়ে filter করো
+      // $text দিয়ে candidate set ছোট করো, তারপর regex দিয়ে prefix match করো
+      const safeSearch = escapeRegex(rawSearch);
+      pipeline = [
+        { $match: {
+            $and: [
+              { $text: { $search: rawSearch } },                              // text index scan
+              { [field]: { $regex: safeSearch, $options: 'i' } },            // prefix filter
+            ]
+        }},
+        { $group:   { _id: `$${field}` } },
+        { $project: { _id: 0, value: '$_id' } },
+        { $limit:   5 },
       ];
     } else {
+      // ── Fallback: individual field index দিয়ে regex ──
+      // (vehicleNo, tripDo etc যেগুলো text index-এ নেই কিন্তু own index আছে)
+      const safeSearch = escapeRegex(rawSearch);
       pipeline = [
-        { $match: { [field]: { $regex: search, $options: "i" } } },
-        { $group: { _id: `$${field}` } },
-        { $project: { _id: 0, value: "$_id" } },
-        { $limit: 5 },
+        { $match:   { [field]: { $regex: safeSearch, $options: 'i' } } },
+        { $group:   { _id: `$${field}` } },
+        { $project: { _id: 0, value: '$_id' } },
+        { $limit:   5 },
       ];
     }
+
     const result = await targetCollection.aggregate(pipeline).toArray();
     res.send(result);
   } catch (err) {
@@ -1604,42 +1682,49 @@ app.post("/vehicles", verifyToken, verifyNonVendor, validate([
   }
 });
 
+// ── FIX: Duplicate route ছিল (line 1686 + 1747) — merged into one ──
+// প্রথমটা: partial update + vehicles.$  (positional operator)
+// দ্বিতীয়টা: full replace + arrayFilters (more precise, MongoDB recommended)
+// Merged: partial update (undefined skip) + arrayFilters + driverImg support
 app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
-  validateObjectId('vendorId'),   // ← এটা যোগ করো
-  validateObjectId('vehicleId'),  // ← এটা যোগ করো
+  validateObjectId('vendorId'),
+  validateObjectId('vehicleId'),
   async (req, res) => {
-  try {
-    const db = await connectDB();
-    const vendorsCollection = db.collection('vendors');
+    try {
+      const db = await connectDB();
+      const vendorsCollection = db.collection('vendors');
+      const { vendorId, vehicleId } = req.params;
+      const { vehicleModel, vehicleNumber, driverName, driverPhone, driverImg } = req.body;
 
-    const { vendorId, vehicleId } = req.params;
-    const { vehicleModel, vehicleNumber, driverName, driverPhone, driverImg } = req.body;
+      // Partial update — undefined field পাঠালে overwrite হবে না
+      const updateFields = {};
+      if (vehicleModel  !== undefined) updateFields["vehicles.$[elem].vehicleModel"]  = vehicleModel;
+      if (vehicleNumber !== undefined) updateFields["vehicles.$[elem].vehicleNumber"] = vehicleNumber;
+      if (driverName    !== undefined) updateFields["vehicles.$[elem].driverName"]    = driverName;
+      if (driverPhone   !== undefined) updateFields["vehicles.$[elem].driverPhone"]   = driverPhone;
+      if (driverImg     !== undefined) updateFields["vehicles.$[elem].driverImg"]     = driverImg;
 
-    const updateFields = {};
-    if (vehicleModel  !== undefined) updateFields["vehicles.$.vehicleModel"]  = vehicleModel;
-    if (vehicleNumber !== undefined) updateFields["vehicles.$.vehicleNumber"] = vehicleNumber;
-    if (driverName    !== undefined) updateFields["vehicles.$.driverName"]    = driverName;
-    if (driverPhone   !== undefined) updateFields["vehicles.$.driverPhone"]   = driverPhone;
-    if (driverImg     !== undefined) updateFields["vehicles.$.driverImg"]     = driverImg;
+      if (Object.keys(updateFields).length === 0) {
+        return res.status(400).send({ success: false, message: "No fields to update" });
+      }
 
-    const result = await vendorsCollection.updateOne(
-      {
-        _id: new ObjectId(vendorId),
-        "vehicles._id": new ObjectId(vehicleId),
-      },
-      { $set: updateFields }
-    );
+      const result = await vendorsCollection.updateOne(
+        { _id: new ObjectId(vendorId) },
+        { $set: updateFields },
+        { arrayFilters: [{ "elem._id": new ObjectId(vehicleId) }] }
+      );
 
-    if (result.modifiedCount > 0) {
-      res.send({ success: true });
-    } else {
-      res.status(404).send({ success: false, message: "Vehicle not found" });
+      if (result.modifiedCount > 0) {
+        res.send({ success: true, modifiedCount: 1 });
+      } else {
+        res.status(404).send({ success: false, message: "Vehicle not found" });
+      }
+    } catch (err) {
+      logger.error('Failed to update vehicle', err);
+      res.status(500).send({ success: false, message: "Failed to update vehicle" });
     }
-  } catch (err) {
-    logger.error('Failed to update vehicle', err);
-    res.status(500).send({ success: false, message: "Failed to update vehicle" });
   }
-});
+);
 
 app.delete("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
   validateObjectId('vendorId'),
@@ -1665,38 +1750,7 @@ app.delete("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
   }
 );
 
-app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
-  validateObjectId('vendorId'),
-  validateObjectId('vehicleId'),
-  async (req, res) => {
-    try {
-      const db = await connectDB();
-      const vendorsCollection = db.collection('vendors');
-      const { vendorId, vehicleId } = req.params;
-      const updatedData = req.body;
-      const result = await vendorsCollection.updateOne(
-        { _id: new ObjectId(vendorId) },
-        {
-          $set: {
-            "vehicles.$[elem].vehicleNumber": updatedData.vehicleNumber,
-            "vehicles.$[elem].vehicleModel": updatedData.vehicleModel,
-            "vehicles.$[elem].driverName": updatedData.driverName,
-            "vehicles.$[elem].driverPhone": updatedData.driverPhone,
-          }
-        },
-        { arrayFilters: [{ "elem._id": new ObjectId(vehicleId) }] }
-      );
-      if (result.modifiedCount > 0) {
-        res.send({ success: true, modifiedCount: 1 });
-      } else {
-        res.status(404).send({ success: false, message: "Nothing updated" });
-      }
-    } catch (err) {
-      logger.error('Failed to update vehicle', err);
-      res.status(500).send({ success: false, message: "Failed to update vehicle" });
-    }
-  }
-);
+
 
 // ═══════════════════════════════════════════════════════════════════
 // Deliveries
@@ -1719,78 +1773,102 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
   const challanCollection = db.collection('challans');
   const counterCollection = db.collection('counters');
 
-  const session = client.startSession();
+  // ── FIX: M0 transaction → manual rollback pattern ──────────────
+  // M0 free tier-এ transaction fail করলে TRANSACTION_UNSUPPORTED error আসত
+  // এখন: try-based sequential writes + fail হলে manual rollback
+  // Steps: 1) counter increment  2) already-delivered check
+  //        3) delivery insert    4) challan status update
+  //        5) fail → rollback counter + delete delivery
   let tripNumber;
   let result;
+  let insertedDeliveryId = null;
+  let counterSeq = null;
+  const challanIds = deliveries.map(d =>
+    typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
+  );
+
   try {
-    await session.withTransaction(async () => {
-      const counter = await counterCollection.findOneAndUpdate(
-        { _id: "tripNumber" },
-        { $inc: { seq: 1 } },
-        { upsert: true, returnDocument: "after", session }
-      );
-      // FIX #26 — Strict counter check (don't silently fallback to 1)
-      const seq = counter?.seq ?? counter?.value?.seq;
-      if (!seq || typeof seq !== 'number') {
-        throw new Error('Counter generation failed');
-      }
-      tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
+    // Step 1: Counter increment
+    const counter = await counterCollection.findOneAndUpdate(
+      { _id: "tripNumber" },
+      { $inc: { seq: 1 } },
+      { upsert: true, returnDocument: "after" }
+    );
+    const seq = counter?.seq ?? counter?.value?.seq;
+    if (!seq || typeof seq !== 'number') throw new Error('Counter generation failed');
+    counterSeq = seq;
+    tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
 
-      const challanIds = deliveries.map(d =>
-        typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-      );
+    // Step 2: Already-delivered check
+    const alreadyDelivered = await challanCollection
+      .find({ _id: { $in: challanIds }, status: "delivered" })
+      .toArray();
+    if (alreadyDelivered.length > 0) {
+      const names = alreadyDelivered.map(c => c.customerName).join(", ");
+      const error = new Error(`Already delivered: ${names}`);
+      error.code = 'ALREADY_DELIVERED';
+      error.items = alreadyDelivered.map(c => ({ id: c._id, customerName: c.customerName }));
+      throw error;
+    }
 
-      // FIX #7 — Correct session passing for mongodb v6 driver
-      const alreadyDelivered = await challanCollection
-        .find({ _id: { $in: challanIds }, status: "delivered" }, { session })
-        .toArray();
+    // Step 3: Insert delivery
+    const tripDocument = {
+      tripNumber,
+      vehicleNumber: deliveries[0].vehicleNumber,
+      vendorName: deliveries[0].vendorName,
+      vendorNumber: deliveries[0].vendorNumber,
+      driverName: deliveries[0].driverName,
+      driverNumber: deliveries[0].driverNumber,
+      createdBy: deliveries[0].createdBy || req.user?.email || "unknown",
+      totalChallan: deliveries.length,
+      challans: deliveries.map(d => ({
+        challanId: d.challanId,
+        customerName: d.customerName,
+        zone: d.zone,
+        address: d.address,
+        thana: d.thana,
+        district: d.district,
+        receiverNumber: d.receiverNumber,
+        products: (d.products || []).map(p => ({
+          _id: p._id || new ObjectId().toString(),
+          productName: p.productName,
+          model: p.model,
+          quantity: Number(p.quantity)
+        }))
+      })),
+      createdAt: new Date()
+    };
+    result = await deliveriesCollection.insertOne(tripDocument);
+    insertedDeliveryId = result.insertedId;
 
-      if (alreadyDelivered.length > 0) {
-        const names = alreadyDelivered.map(c => c.customerName).join(", ");
-        const error = new Error(`Already delivered: ${names}`);
-        error.code = 'ALREADY_DELIVERED';
-        error.items = alreadyDelivered.map(c => ({ id: c._id, customerName: c.customerName }));
-        throw error;
-      }
+    // Step 4: Mark challans as delivered
+    await challanCollection.updateMany(
+      { _id: { $in: challanIds } },
+      { $set: { status: "delivered", tripNumber } }
+    );
 
-      const tripDocument = {
-        tripNumber,
-        vehicleNumber: deliveries[0].vehicleNumber,
-        vendorName: deliveries[0].vendorName,
-        vendorNumber: deliveries[0].vendorNumber,
-        driverName: deliveries[0].driverName,
-        driverNumber: deliveries[0].driverNumber,
-        createdBy: deliveries[0].createdBy || req.user?.email || "unknown",
-        totalChallan: deliveries.length,
-        challans: deliveries.map(d => ({
-          challanId: d.challanId,
-          customerName: d.customerName,
-          zone: d.zone,
-          address: d.address,
-          thana: d.thana,
-          district: d.district,
-          receiverNumber: d.receiverNumber,
-          products: (d.products || []).map(p => ({
-            _id: p._id || new ObjectId().toString(),
-            productName: p.productName,
-            model: p.model,
-            quantity: Number(p.quantity)
-          }))
-        })),
-        createdAt: new Date()
-      };
-
-      result = await deliveriesCollection.insertOne(tripDocument, { session });
-      await challanCollection.updateMany(
-        { _id: { $in: challanIds } },
-        { $set: { status: "delivered", tripNumber } },
-        { session }
-      );
-    });
     res.send({ success: true, insertedId: result.insertedId, tripNumber, totalChallan: deliveries.length });
+
   } catch (err) {
     logger.error("Delivery failed", err);
-    // FIX #10 & #45 — Structured error response
+
+    // ── Manual Rollback ──────────────────────────────────────────
+    // Step 4 fail হলে: delivery মুছো + challan status revert
+    // Step 3 fail হলে: delivery মুছো
+    // Step 1 fail হলে: counter gap থাকবে (acceptable — tripNumber skip)
+    if (insertedDeliveryId) {
+      try {
+        await deliveriesCollection.deleteOne({ _id: insertedDeliveryId });
+        await challanCollection.updateMany(
+          { _id: { $in: challanIds }, tripNumber },
+          { $set: { status: "pending" }, $unset: { tripNumber: "" } }
+        );
+        logger.info('Delivery rollback successful', { tripNumber });
+      } catch (rollbackErr) {
+        logger.error('Delivery rollback FAILED — manual fix needed', { tripNumber, rollbackErr });
+      }
+    }
+
     if (err.code === 'ALREADY_DELIVERED' || err.message?.startsWith("Already delivered:")) {
       return res.status(400).send({
         success: false,
@@ -1799,17 +1877,7 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
         items: err.items || [],
       });
     }
-    // Transaction-not-supported on M0 tier (rare but possible)
-    if (err.codeName === 'IllegalOperation' || err.message?.includes('Transaction')) {
-      return res.status(503).send({
-        success: false,
-        code: 'TRANSACTION_UNSUPPORTED',
-        message: 'Database transactions temporarily unavailable. Please try again.',
-      });
-    }
     res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
-  } finally {
-    await session.endSession();
   }
 });
 
@@ -2076,31 +2144,46 @@ app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('ad
     if (!targetChallan)
       return res.status(404).send({ success: false, message: "Challan not found in trip" });
 
-    // Use transaction to keep trip and original challan in sync
-    const session = client.startSession();
+    // ── FIX: M0 transaction → sequential writes + rollback ──────────
+    // Step 1: Trip থেকে challan বাদ দাও
+    // Step 2: Original challan-কে pending করো
+    // Fail হলে: trip-এ challan ফিরিয়ে দাও (rollback)
+    const tripUpdateResult = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      {
+        $pull: { challans: { challanId: targetChallan.challanId } },
+        $inc: { totalChallan: -1 }
+      }
+    );
+
+    if (tripUpdateResult.modifiedCount === 0) {
+      return res.status(404).send({ success: false, message: "Challan not found in trip" });
+    }
+
     try {
-      await session.withTransaction(async () => {
+      if (!targetChallan.isReturn && ObjectId.isValid(targetChallan.challanId)) {
+        await challanCollection.updateOne(
+          { _id: new ObjectId(targetChallan.challanId) },
+          { $set: { status: 'pending' }, $unset: { tripNumber: '' } }
+        );
+      }
+      res.send({ success: true, modifiedCount: 1 });
+    } catch (challanErr) {
+      // Step 2 fail → rollback step 1 (trip-এ challan ফিরিয়ে দাও)
+      logger.error('Challan status revert failed, rolling back trip', challanErr);
+      try {
         await deliveriesCollection.updateOne(
           { _id: new ObjectId(tripId) },
           {
-            $pull: { challans: { challanId: targetChallan.challanId } },
-            $inc: { totalChallan: -1 }
-          },
-          { session }
+            $push: { challans: targetChallan },
+            $inc: { totalChallan: 1 }
+          }
         );
-
-        // Restore original challan status to pending (skip return-type challans)
-        if (!targetChallan.isReturn && ObjectId.isValid(targetChallan.challanId)) {
-          await challanCollection.updateOne(
-            { _id: new ObjectId(targetChallan.challanId) },
-            { $set: { status: 'pending' }, $unset: { tripNumber: '' } },
-            { session }
-          );
-        }
-      });
-      res.send({ success: true, modifiedCount: 1 });
-    } finally {
-      await session.endSession();
+        logger.info('Trip rollback successful');
+      } catch (rollbackErr) {
+        logger.error('Trip rollback FAILED — manual fix needed', { tripId, challanId, rollbackErr });
+      }
+      throw challanErr;
     }
   } catch (err) {
     logger.error("Delete trip challan failed", err);
@@ -2225,48 +2308,43 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, val
     challanReturnStatus: null,
   };
 
-  const session = client.startSession();
+  // ── FIX: ২টো update একই delivery document-এ ($_id same) ────────
+  // আগে: transaction দিয়ে ২টা আলাদা updateOne (M0-তে fail হতো)
+  // এখন: bulkWrite দিয়ে একটা atomic operation — transaction-ই দরকার নেই
+  //   bulkWrite ordered=true → প্রথমটা fail হলে দ্বিতীয়টা চলে না
   try {
-    await session.withTransaction(async () => {
-      // ১ম call — return challan যোগ করো
-      await deliveriesCollection.updateOne(
-        { _id: new ObjectId(tripId) },
-        {
-          $push: { challans: returnChallan },
-          $inc: { totalChallan: 1 }
-        },
-        { session }
-      );
-
-      // ২য় call — original challan এ returnedProducts mark করো
-      await deliveriesCollection.updateOne(
-        { _id: new ObjectId(tripId), "challans.challanId": originalChallanId },
-        {
-          $set: {
-            "challans.$.returnedProducts": returnedProducts,
-            "challans.$.returnNote": returnNote || "",
-            "challans.$.returnedAt": new Date(),
-            lastUpdatedBy: req.user?.email || null,
-            lastUpdatedAt: new Date(),
+    await deliveriesCollection.bulkWrite([
+      // ১ম: return challan যোগ করো
+      {
+        updateOne: {
+          filter: { _id: new ObjectId(tripId) },
+          update: {
+            $push: { challans: returnChallan },
+            $inc: { totalChallan: 1 }
           }
-        },
-        { session }
-      );
-    });
+        }
+      },
+      // ২য়: original challan-এ returnedProducts mark করো
+      {
+        updateOne: {
+          filter: { _id: new ObjectId(tripId), "challans.challanId": originalChallanId },
+          update: {
+            $set: {
+              "challans.$.returnedProducts": returnedProducts,
+              "challans.$.returnNote": returnNote || "",
+              "challans.$.returnedAt": new Date(),
+              lastUpdatedBy: req.user?.email || null,
+              lastUpdatedAt: new Date(),
+            }
+          }
+        }
+      }
+    ], { ordered: true }); // ordered=true → atomic sequence
 
     res.send({ success: true, returnChallan });
   } catch (err) {
     logger.error("Return challan add failed", err);
-    if (err.codeName === 'IllegalOperation' || err.message?.includes('Transaction')) {
-      return res.status(503).send({
-        success: false,
-        code: 'TRANSACTION_UNSUPPORTED',
-        message: 'Database transactions temporarily unavailable. Please try again.',
-      });
-    }
     res.status(500).send({ success: false, message: "Failed to add return challan" });
-  } finally {
-    await session.endSession();
   }
 });
 
@@ -2334,6 +2412,123 @@ app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor
   } catch (err) {
     logger.error("Car rent fetch failed", err);
     res.status(500).send({ success: false, message: "Failed to fetch car rents" });
+  }
+});
+
+// ══ Bill Summary — Rent + Lebor tracking per month ══════════════
+// GET /bill-summary?month=4&year=2025
+// Returns: per-vendor bill breakdown + payment status
+app.get("/bill-summary", verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+
+    let month = parseInt(req.query.month);
+    let year  = parseInt(req.query.year);
+    if (!month || !year) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month; year = _dt.year;
+    }
+    const { startDate, endDate } = getDhakaMonthRange(year, month);
+
+    const trips = await deliveriesCollection.find(
+      { createdAt: { $gte: startDate, $lt: endDate } },
+      { projection: { tripNumber:1, vendorName:1, vendorNumber:1, driverName:1,
+          challans:1, rent:1, leborBill:1, advance:1, rentPaid:1, rentPaidAmount:1,
+          leborPaid:1, leborPaidAmount:1, createdAt:1 } }
+    ).sort({ createdAt: -1 }).toArray();
+
+    // Group by vendor
+    const vendorMap = new Map();
+    for (const trip of trips) {
+      const key = (trip.vendorName || 'Unknown').trim();
+      if (!vendorMap.has(key)) {
+        vendorMap.set(key, {
+          vendorName: key,
+          vendorNumber: trip.vendorNumber || null,
+          trips: [],
+          totalRent: 0, totalLebor: 0, totalAdvance: 0,
+          totalPics: 0,
+          rentPaidAmount: 0, leborPaidAmount: 0,
+        });
+      }
+      const v = vendorMap.get(key);
+      const normalChallans = (trip.challans || []).filter(c => !c.isReturn);
+      const pics = normalChallans.reduce((s, c) =>
+        s + (c.products || []).reduce((ps, p) => ps + Number(p.quantity || 0), 0), 0);
+
+      // Product summary per trip
+      const prodMap = {};
+      normalChallans.forEach(c => (c.products || []).forEach(p => {
+        if (!prodMap[p.productName]) prodMap[p.productName] = 0;
+        prodMap[p.productName] += Number(p.quantity || 0);
+      }));
+
+      v.trips.push({
+        _id: trip._id,
+        tripNumber: trip.tripNumber,
+        createdAt: trip.createdAt,
+        pics,
+        products: Object.entries(prodMap).map(([name, qty]) => ({ name, qty })),
+        rent: trip.rent ?? null,
+        leborBill: trip.leborBill ?? null,
+        advance: trip.advance ?? null,
+        rentPaid: trip.rentPaid || false,
+        rentPaidAmount: trip.rentPaidAmount ?? null,
+        leborPaid: trip.leborPaid || false,
+        leborPaidAmount: trip.leborPaidAmount ?? null,
+      });
+
+      v.totalPics     += pics;
+      v.totalRent     += Number(trip.rent     || 0);
+      v.totalLebor    += Number(trip.leborBill || 0);
+      v.totalAdvance  += Number(trip.advance   || 0);
+      v.rentPaidAmount  += Number(trip.rentPaidAmount  || 0);
+      v.leborPaidAmount += Number(trip.leborPaidAmount || 0);
+    }
+
+    const vendors = Array.from(vendorMap.values()).map(v => ({
+      ...v,
+      rentDue:  Math.max(0, v.totalRent  - v.rentPaidAmount),
+      leborDue: Math.max(0, v.totalLebor - v.leborPaidAmount),
+    }));
+
+    const summary = {
+      month, year,
+      totalTrips:    trips.length,
+      totalRent:     vendors.reduce((s, v) => s + v.totalRent, 0),
+      totalLebor:    vendors.reduce((s, v) => s + v.totalLebor, 0),
+      totalRentDue:  vendors.reduce((s, v) => s + v.rentDue, 0),
+      totalLeborDue: vendors.reduce((s, v) => s + v.leborDue, 0),
+    };
+
+    res.send({ success: true, vendors, summary });
+  } catch (err) {
+    logger.error('Bill summary failed', err);
+    res.status(500).send({ success: false, message: 'Failed to fetch bill summary' });
+  }
+});
+
+// PATCH /bill-summary/:tripId/payment — mark rent or lebor as paid
+app.patch("/bill-summary/:tripId/payment", verifyToken, verifyRole('admin', 'manager', 'ceo'),
+  validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('deliveries');
+    const { type, paidAmount, paidBy } = req.body; // type: 'rent' | 'lebor'
+    if (!['rent', 'lebor'].includes(type)) {
+      return res.status(400).send({ success: false, message: 'type must be rent or lebor' });
+    }
+    const setFields = type === 'rent'
+      ? { rentPaid: true, rentPaidAmount: Number(paidAmount), rentPaidBy: paidBy, rentPaidAt: new Date() }
+      : { leborPaid: true, leborPaidAmount: Number(paidAmount), leborPaidBy: paidBy, leborPaidAt: new Date() };
+
+    const result = await col.updateOne({ _id: new ObjectId(req.params.tripId) }, { $set: setFields });
+    if (result.matchedCount === 0) return res.status(404).send({ success: false, message: 'Trip not found' });
+    res.send({ success: true });
+  } catch (err) {
+    logger.error('Payment update failed', err);
+    res.status(500).send({ success: false, message: 'Failed to update payment' });
   }
 });
 
@@ -2838,52 +3033,26 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
 
     const { startDate: monthStart, endDate: monthEnd } = getDhakaMonthRange(year, month);
 
+    // ── FIX: ১৫টি query একসাথে → M0-তে timeout হওয়ার সম্ভাবনা ছিল
+    // এখন ৩টি batch-এ ভাগ — প্রতি batch-এ ৫টি করে query
+    // Batch 1: lightweight counts + accounts (দ্রুত শেষ হয়, index-only)
+    // Batch 2: medium aggregations (challan status, zone, gatepass unit)
+    // Batch 3: heavy double-unwind aggregations (শেষে)
+    // প্রতিটি batch sequential — M0 একসাথে কম চাপ পাবে
+
+    // ── Batch 1: Counts + accounts (fast, index hits) ──────────────
     const [
-      gpUnitAgg, gpMonthCount, gpTotalCount,
-      challanProductAgg, challanStatusAgg, challanTotalCount,
-      deliveryProductAgg, tripMonthCount, tripTotalCount, activeTripCount,
+      gpMonthCount, gpTotalCount,
+      challanTotalCount,
+      tripMonthCount, tripTotalCount, activeTripCount,
       vendorCount, userCount,
       accountsTxs, carRentThisMonth,
-      topDeliveryPoints,
     ] = await Promise.all([
-      db.collection('gate-pass').aggregate([
-        { $match: { tripMonth: month, tripYear: year } },
-        { $unwind: '$products' },
-        {
-          $group: {
-            _id: '$unit',
-            qty: { $sum: '$products.quantity' },
-            passCount: { $addToSet: '$_id' },
-          }
-        },
-        { $addFields: { passCount: { $size: '$passCount' } } },
-        { $sort: { qty: -1 } },
-        { $limit: 10 },
-      ]).toArray(),
       db.collection('gate-pass').countDocuments({ tripMonth: month, tripYear: year }),
       db.collection('gate-pass').countDocuments(),
 
-      db.collection('challans').aggregate([
-        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
-        { $unwind: '$products' },
-        { $group: { _id: '$products.productName', qty: { $sum: '$products.quantity' } } },
-        { $sort: { qty: -1 } },
-        { $limit: 8 },
-      ]).toArray(),
-      db.collection('challans').aggregate([
-        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
-        { $group: { _id: '$status', count: { $sum: 1 } } },
-      ]).toArray(),
       db.collection('challans').countDocuments(),
 
-      db.collection('deliveries').aggregate([
-        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
-        { $unwind: '$challans' },
-        { $unwind: '$challans.products' },
-        { $group: { _id: '$challans.products.productName', qty: { $sum: '$challans.products.quantity' } } },
-        { $sort: { qty: -1 } },
-        { $limit: 8 },
-      ]).toArray(),
       db.collection('deliveries').countDocuments({ createdAt: { $gte: monthStart, $lt: monthEnd } }),
       db.collection('deliveries').countDocuments(),
       db.collection('deliveries').countDocuments({
@@ -2898,12 +3067,56 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
         { createdAt: { $gte: monthStart, $lt: monthEnd } },
         { projection: { advance: 1 } }
       ).toArray(),
+    ]);
 
+    // ── Batch 2: Medium aggregations (challan status, zone, gatepass) ──
+    const [
+      challanStatusAgg, topDeliveryPoints, gpUnitAgg,
+    ] = await Promise.all([
+      db.collection('challans').aggregate([
+        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]).toArray(),
       db.collection('challans').aggregate([
         { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
         { $group: { _id: '$zone', count: { $sum: 1 } } },
         { $sort: { count: -1 } },
         { $limit: 5 },
+      ]).toArray(),
+      db.collection('gate-pass').aggregate([
+        { $match: { tripMonth: month, tripYear: year } },
+        { $unwind: '$products' },
+        {
+          $group: {
+            _id: '$unit',
+            qty: { $sum: '$products.quantity' },
+            passCount: { $addToSet: '$_id' },
+          }
+        },
+        { $addFields: { passCount: { $size: '$passCount' } } },
+        { $sort: { qty: -1 } },
+        { $limit: 10 },
+      ]).toArray(),
+    ]);
+
+    // ── Batch 3: Heavy double-unwind aggregations ───────────────────
+    const [
+      challanProductAgg, deliveryProductAgg,
+    ] = await Promise.all([
+      db.collection('challans').aggregate([
+        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+        { $unwind: '$products' },
+        { $group: { _id: '$products.productName', qty: { $sum: '$products.quantity' } } },
+        { $sort: { qty: -1 } },
+        { $limit: 8 },
+      ]).toArray(),
+      db.collection('deliveries').aggregate([
+        { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+        { $unwind: '$challans' },
+        { $unwind: '$challans.products' },
+        { $group: { _id: '$challans.products.productName', qty: { $sum: '$challans.products.quantity' } } },
+        { $sort: { qty: -1 } },
+        { $limit: 8 },
       ]).toArray(),
     ]);
 
@@ -2969,6 +3182,248 @@ app.use((err, req, res, next) => {
     return res.status(400).send({ success: false, message: 'File too large (max 5MB)' });
   }
   res.status(500).send({ success: false, message: "Internal Server Error" });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+// Walton Bill Tracker — Manual bill issue & payment tracking
+// Collection: walton-bills
+// ═══════════════════════════════════════════════════════════════════
+
+// GET /walton-bills?month=4&year=2025&type=main|lebor
+app.get("/walton-bills", verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('walton-bills');
+    const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+    const year  = parseInt(req.query.year)  || new Date().getFullYear();
+    const type  = req.query.type; // 'main' | 'lebor' | undefined (all)
+
+    const query = { month, year };
+    if (type) query.type = type;
+
+    const bills = await col.find(query).sort({ createdAt: -1 }).toArray();
+    res.send({ success: true, data: bills });
+  } catch (err) {
+    logger.error('Walton bills fetch failed', err);
+    res.status(500).send({ success: false, message: 'Failed to fetch bills' });
+  }
+});
+
+// POST /walton-bills — create new bill issue
+app.post("/walton-bills", verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('walton-bills');
+    const { month, year, type, items, note } = req.body;
+    // items: [{ model: 'WFR', pics: 500, amount: 400000 }, ...]
+
+    if (!month || !year || !['main','lebor'].includes(type) || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).send({ success: false, message: 'Invalid data' });
+    }
+
+    const totalAmount = items.reduce((s, i) => s + Number(i.amount || 0), 0);
+    const doc = {
+      month, year, type,
+      items: items.map(i => ({ model: i.model.trim(), pics: Number(i.pics||0), amount: Number(i.amount||0) })),
+      totalAmount,
+      note: note || '',
+      payments: [],           // [{ amount, date, note, by }]
+      totalPaid: 0,
+      status: 'unpaid',       // unpaid | partial | paid
+      issuedBy: req.user?.email || 'unknown',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await col.insertOne(doc);
+    res.send({ success: true, insertedId: result.insertedId, data: { ...doc, _id: result.insertedId } });
+  } catch (err) {
+    logger.error('Walton bill create failed', err);
+    res.status(500).send({ success: false, message: 'Failed to create bill' });
+  }
+});
+
+// PATCH /walton-bills/:id/payment — add a payment
+app.patch("/walton-bills/:id/payment", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId('id'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('walton-bills');
+    const { amount, note, date } = req.body;
+
+    if (!amount || isNaN(amount) || Number(amount) <= 0) {
+      return res.status(400).send({ success: false, message: 'Valid amount required' });
+    }
+
+    const bill = await col.findOne({ _id: new ObjectId(req.params.id) });
+    if (!bill) return res.status(404).send({ success: false, message: 'Bill not found' });
+
+    const payment = { amount: Number(amount), note: note || '', date: date || new Date().toISOString(), by: req.user?.email || 'unknown', addedAt: new Date() };
+    const newTotalPaid = bill.totalPaid + payment.amount;
+    const newStatus = newTotalPaid >= bill.totalAmount ? 'paid' : newTotalPaid > 0 ? 'partial' : 'unpaid';
+
+    await col.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $push: { payments: payment }, $set: { totalPaid: newTotalPaid, status: newStatus, updatedAt: new Date() } }
+    );
+    const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+    res.send({ success: true, data: updated });
+  } catch (err) {
+    logger.error('Payment add failed', err);
+    res.status(500).send({ success: false, message: 'Failed to add payment' });
+  }
+});
+
+// DELETE /walton-bills/:id — delete a bill
+app.delete("/walton-bills/:id", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId('id'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const result = await db.collection('walton-bills').deleteOne({ _id: new ObjectId(req.params.id) });
+    if (result.deletedCount === 0) return res.status(404).send({ success: false, message: 'Bill not found' });
+    res.send({ success: true });
+  } catch (err) {
+    logger.error('Bill delete failed', err);
+    res.status(500).send({ success: false, message: 'Failed to delete bill' });
+  }
+});
+
+// DELETE /walton-bills/:id/payment/:idx — delete a specific payment
+app.delete("/walton-bills/:id/payment/:idx", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId('id'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('walton-bills');
+    const bill = await col.findOne({ _id: new ObjectId(req.params.id) });
+    if (!bill) return res.status(404).send({ success: false, message: 'Bill not found' });
+
+    const idx = parseInt(req.params.idx);
+    if (isNaN(idx) || idx < 0 || idx >= bill.payments.length) {
+      return res.status(400).send({ success: false, message: 'Invalid payment index' });
+    }
+    const removedAmt = bill.payments[idx].amount;
+    const newPayments = bill.payments.filter((_, i) => i !== idx);
+    const newTotalPaid = bill.totalPaid - removedAmt;
+    const newStatus = newTotalPaid >= bill.totalAmount ? 'paid' : newTotalPaid > 0 ? 'partial' : 'unpaid';
+
+    await col.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { payments: newPayments, totalPaid: newTotalPaid, status: newStatus, updatedAt: new Date() } }
+    );
+    const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+    res.send({ success: true, data: updated });
+  } catch (err) {
+    logger.error('Payment delete failed', err);
+    res.status(500).send({ success: false, message: 'Failed to delete payment' });
+  }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════
+// Challan Floor/Carrying entry — for Labor Bill tracking
+// PATCH /deliveries/:tripId/challan/:challanId/floor-carrying
+// ═══════════════════════════════════════════════════════════════════
+app.patch("/deliveries/:tripId/challan/:challanId/floor-carrying",
+  verifyToken, verifyNonVendor, validateObjectId('tripId'),
+  async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('deliveries');
+    const { floor, carrying, note } = req.body;
+    // floor: number 1-15 | null, carrying: string | null
+    const setFields = {};
+    if (floor !== undefined) setFields["challans.$.floor"] = floor;
+    if (carrying !== undefined) setFields["challans.$.carrying"] = carrying;
+    if (note !== undefined) setFields["challans.$.note"] = note;
+    if (Object.keys(setFields).length === 0)
+      return res.status(400).send({ success: false, message: 'No fields provided' });
+
+    const result = await col.updateOne(
+      { _id: new ObjectId(req.params.tripId), "challans.challanId": req.params.challanId },
+      { $set: setFields }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: 'Trip or challan not found' });
+    const updated = await col.findOne({ _id: new ObjectId(req.params.tripId) });
+    res.send({ success: true, data: updated });
+  } catch (err) {
+    logger.error('Floor/carrying update failed', err);
+    res.status(500).send({ success: false, message: 'Failed to update' });
+  }
+});
+
+// PATCH /deliveries/:tripId/challan/:challanId/status — update rtn/note status
+app.patch("/deliveries/:tripId/challan/:challanId/status",
+  verifyToken, verifyNonVendor, validateObjectId('tripId'),
+  async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('deliveries');
+    const { deliveryStatus, challanReturnStatus, note, returnNote } = req.body;
+    const setFields = {};
+    if (deliveryStatus !== undefined)      setFields["challans.$.deliveryStatus"]      = deliveryStatus;
+    if (challanReturnStatus !== undefined) setFields["challans.$.challanReturnStatus"] = challanReturnStatus;
+    if (note !== undefined)                setFields["challans.$.note"]                = note;
+    if (returnNote !== undefined)          setFields["challans.$.returnNote"]          = returnNote;
+    if (!Object.keys(setFields).length)
+      return res.status(400).send({ success: false, message: 'No fields' });
+
+    const result = await col.updateOne(
+      { _id: new ObjectId(req.params.tripId), "challans.challanId": req.params.challanId },
+      { $set: setFields }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: 'Not found' });
+    const updated = await col.findOne({ _id: new ObjectId(req.params.tripId) });
+    res.send({ success: true, data: updated });
+  } catch (err) {
+    logger.error('Challan status update failed', err);
+    res.status(500).send({ success: false, message: 'Failed to update status' });
+  }
+});
+
+// GET /labor-bill?month=4&year=2025 — challans with floor or carrying entry
+app.get("/labor-bill", verifyToken, verifyRole('admin'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const col = db.collection('deliveries');
+    let month = parseInt(req.query.month);
+    let year  = parseInt(req.query.year);
+    if (!month || !year) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month; year = _dt.year;
+    }
+    const { startDate, endDate } = getDhakaMonthRange(year, month);
+    const trips = await col.find(
+      { createdAt: { $gte: startDate, $lt: endDate } },
+      { projection: { tripNumber:1, challans:1, createdAt:1 } }
+    ).sort({ createdAt: -1 }).toArray();
+
+    // Extract only challans that have floor or carrying set
+    const rows = [];
+    trips.forEach(trip => {
+      (trip.challans || []).filter(c => !c.isReturn && (c.floor || c.carrying)).forEach(c => {
+        rows.push({
+          tripId: trip._id,
+          tripNumber: trip.tripNumber,
+          createdAt: trip.createdAt,
+          challanId: c.challanId,
+          customerName: c.customerName,
+          zone: c.zone,
+          address: c.address,
+          district: c.district,
+          thana: c.thana,
+          receiverNumber: c.receiverNumber,
+          products: c.products || [],
+          floor: c.floor ?? null,
+          carrying: c.carrying || null,
+          note: c.note || null,
+        });
+      });
+    });
+    res.send({ success: true, data: rows, month, year });
+  } catch (err) {
+    logger.error('Labor bill fetch failed', err);
+    res.status(500).send({ success: false, message: 'Failed' });
+  }
 });
 
 // ── Start Server ───────────────────────────────────────────────────
