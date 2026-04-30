@@ -1106,7 +1106,7 @@ app.delete('/gate-pass/:id', verifyToken, verifyRole('admin', 'manager'), valida
 // কোন field কোন collection-এ text index-এ আছে
 const TEXT_INDEXED = {
   challan:  new Set(['customerName', 'address', 'receiverNumber', 'zone', 'thana', 'district']),
-  gatepass: new Set(['tripDo', 'customerName', 'csd', 'unit', 'vehicleNo', 'zone']),
+  gatepass: new Set(['tripDo', 'customerName', 'csd', 'vehicleNo', 'zone']),
 };
 
 app.get("/autocomplete", verifyToken, verifyNonVendor, async (req, res) => {
@@ -3088,7 +3088,7 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
         { $unwind: '$products' },
         {
           $group: {
-            _id: '$unit',
+            _id: { $toUpper: '$unit' },
             qty: { $sum: '$products.quantity' },
             passCount: { $addToSet: '$_id' },
           }
