@@ -959,11 +959,10 @@ app.get("/gate-pass", verifyToken, verifyNonVendor, async (req, res) => {
     let year = parseInt(req.query.year);
     // FIX #3 — escape regex input
     const search = escapeRegex(req.query.search || "");
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, parseInt(req.query.limit) || 50);
-    const skip = (page - 1) * limit;
     let query = {};
+
     if (search) {
+      // Global search — পুরো collection, limit 500
       query.$or = [
         { tripDo: { $regex: search, $options: "i" } },
         { customerName: { $regex: search, $options: "i" } },
@@ -974,28 +973,20 @@ app.get("/gate-pass", verifyToken, verifyNonVendor, async (req, res) => {
         { "products.productName": { $regex: search, $options: "i" } },
         { "products.model": { $regex: search, $options: "i" } },
       ];
-    } else {
-      if (!month || !year) {
-        const _dt = getDhakaCurrentMonthYear();
-        month = _dt.month;
-        year = _dt.year;
-      }
-      query.tripMonth = month;
-      query.tripYear = year;
+      const data = await gatePassCollection.find(query).sort({ createdAt: -1 }).limit(500).toArray();
+      return res.send({ data, pagination: { total: data.length } });
     }
-    const [data, total] = await Promise.all([
-      gatePassCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      gatePassCollection.countDocuments(query),
-    ]);
-    res.send({
-      data,
-      pagination: {
-        total, page, limit,
-        totalPages: Math.max(1, Math.ceil(total / limit)),
-        hasNextPage: page < Math.ceil(total / limit),
-        hasPrevPage: page > 1,
-      }
-    });
+
+    // Month query — no limit, index আছে তাই fast
+    if (!month || !year) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
+    }
+    query.tripMonth = month;
+    query.tripYear = year;
+    const data = await gatePassCollection.find(query).sort({ createdAt: -1 }).toArray();
+    res.send({ data, pagination: { total: data.length } });
   } catch (err) {
     logger.error('Failed to fetch gate passes', err);
     res.status(500).send({ success: false, message: "Failed to fetch gate passes" });
@@ -1241,9 +1232,6 @@ app.get("/challans", verifyToken, verifyNonVendor, async (req, res) => {
     let year = parseInt(req.query.year);
     // FIX #3 — escape all user input used in regex
     const search = escapeRegex(req.query.search || "");
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, parseInt(req.query.limit) || 50);
-    const skip = (page - 1) * limit;
 
     const customerFilter = escapeRegex(req.query.customer || "");
     const zoneFilter = escapeRegex(req.query.zone || "");
@@ -1255,7 +1243,9 @@ app.get("/challans", verifyToken, verifyNonVendor, async (req, res) => {
     const dateFilter = req.query.date || "";
 
     let query = {};
+
     if (search) {
+      // Global search — পুরো collection, কিন্তু limit 200 (browser fast রাখতে)
       query.$or = [
         { customerName: { $regex: search, $options: "i" } },
         { address: { $regex: search, $options: "i" } },
@@ -1266,15 +1256,19 @@ app.get("/challans", verifyToken, verifyNonVendor, async (req, res) => {
         { "products.productName": { $regex: search, $options: "i" } },
         { "products.model": { $regex: search, $options: "i" } },
       ];
-    } else {
-      if (!month || !year) {
-        const _dt = getDhakaCurrentMonthYear();
-        month = _dt.month;
-        year = _dt.year;
-      }
-      const { startDate, endDate } = getDhakaMonthRange(year, month);
-      query.createdAt = { $gte: startDate, $lt: endDate };
+      const data = await challanCollection.find(query).sort({ createdAt: -1 }).limit(200).toArray();
+      return res.send({ data, pagination: { total: data.length } });
     }
+
+    // Month query — no limit, index আছে তাই fast
+    if (!month || !year) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
+    }
+    const { startDate, endDate } = getDhakaMonthRange(year, month);
+    query.createdAt = { $gte: startDate, $lt: endDate };
+
     if (customerFilter) query.customerName = { $regex: customerFilter, $options: "i" };
     if (zoneFilter) query.zone = { $regex: zoneFilter, $options: "i" };
     if (districtFilter) query.district = { $regex: districtFilter, $options: "i" };
@@ -1291,19 +1285,8 @@ app.get("/challans", verifyToken, verifyNonVendor, async (req, res) => {
       }
     }
 
-    const [data, total] = await Promise.all([
-      challanCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      challanCollection.countDocuments(query),
-    ]);
-    res.send({
-      data,
-      pagination: {
-        total, page, limit,
-        totalPages: Math.max(1, Math.ceil(total / limit)),
-        hasNextPage: page < Math.ceil(total / limit),
-        hasPrevPage: page > 1,
-      }
-    });
+    const data = await challanCollection.find(query).sort({ createdAt: -1 }).toArray();
+    res.send({ data, pagination: { total: data.length } });
   } catch (err) {
     logger.error('Failed to fetch challans', err);
     res.status(500).send({ success: false, message: "Failed to fetch challans" });
@@ -1889,12 +1872,10 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
     let year = parseInt(req.query.year);
     // FIX #3 — escape regex
     const search = escapeRegex(req.query.search || "");
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, parseInt(req.query.limit) || 50);
-    const skip = (page - 1) * limit;
     let query = {};
 
     if (search) {
+      // Global search — পুরো collection, limit 500
       query.$or = [
         { tripNumber: { $regex: search, $options: "i" } },
         { vendorName: { $regex: search, $options: "i" } },
@@ -1909,43 +1890,38 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
         { "challans.products.productName": { $regex: search, $options: "i" } },
         { "challans.products.model": { $regex: search, $options: "i" } },
       ];
-    } else {
-      if (!month || !year) {
-        const _dt = getDhakaCurrentMonthYear();
-        month = _dt.month;
-        year = _dt.year;
+
+      // Vendor filter — search এও apply হবে
+      if (req.user?.role === 'vendor') {
+        const userCollection = db.collection('users');
+        const me = await userCollection.findOne({ email: req.user.email });
+        if (!me?.vendorName) return res.send({ success: true, data: [], pagination: { total: 0 } });
+        query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
       }
-      const { startDate, endDate } = getDhakaMonthRange(year, month);
-      query.createdAt = { $gte: startDate, $lt: endDate };
+
+      const data = await deliveriesCollection.find(query).sort({ createdAt: -1 }).limit(500).toArray();
+      return res.send({ success: true, data, pagination: { total: data.length } });
     }
+
+    // Month query — no limit, index আছে তাই fast
+    if (!month || !year) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
+    }
+    const { startDate, endDate } = getDhakaMonthRange(year, month);
+    query.createdAt = { $gte: startDate, $lt: endDate };
 
     // FIX #15 — Vendor can only see their trips (double-check via DB)
     if (req.user?.role === 'vendor') {
       const userCollection = db.collection('users');
       const me = await userCollection.findOne({ email: req.user.email });
-      if (!me?.vendorName) {
-        return res.send({
-          success: true, data: [],
-          pagination: { total: 0, page, limit, totalPages: 0, hasNextPage: false, hasPrevPage: false },
-        });
-      }
+      if (!me?.vendorName) return res.send({ success: true, data: [], pagination: { total: 0 } });
       query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
     }
 
-    const [data, total] = await Promise.all([
-      deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      deliveriesCollection.countDocuments(query),
-    ]);
-
-    res.send({
-      success: true, data,
-      pagination: {
-        total, page, limit,
-        totalPages: Math.max(1, Math.ceil(total / limit)),
-        hasNextPage: page < Math.ceil(total / limit),
-        hasPrevPage: page > 1,
-      }
-    });
+    const data = await deliveriesCollection.find(query).sort({ createdAt: -1 }).toArray();
+    res.send({ success: true, data, pagination: { total: data.length } });
   } catch (err) {
     logger.error('Failed to fetch deliveries', err);
     res.status(500).send({ success: false, message: "Failed to fetch deliveries" });
@@ -2359,56 +2335,48 @@ app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor
     let month = parseInt(req.query.month);
     let year = parseInt(req.query.year);
     const search = escapeRegex(req.query.search || "");
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, parseInt(req.query.limit) || 50);
-    const skip = (page - 1) * limit;
 
     let query = {};
 
     if (search) {
+      // Global search — পুরো collection, limit 500
       query.$or = [
         { tripNumber: { $regex: search, $options: "i" } },
         { vendorName: { $regex: search, $options: "i" } },
         { driverName: { $regex: search, $options: "i" } },
         { vehicleNumber: { $regex: search, $options: "i" } },
       ];
-    } else {
-      if (!month || !year) {
-        const _dt = getDhakaCurrentMonthYear();
-        month = _dt.month;
-        year = _dt.year;
+
+      if (req.user?.role === "vendor") {
+        const userCollection = db.collection('users');
+        const me = await userCollection.findOne({ email: req.user.email });
+        if (!me?.vendorName) return res.send({ success: true, data: [], pagination: { total: 0 } });
+        query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: "i" };
       }
-      const { startDate, endDate } = getDhakaMonthRange(year, month);
-      query.createdAt = { $gte: startDate, $lt: endDate };
+
+      const data = await deliveriesCollection.find(query).sort({ createdAt: -1 }).limit(500).toArray();
+      return res.send({ success: true, data, pagination: { total: data.length } });
     }
+
+    // Month query — no limit, index আছে তাই fast
+    if (!month || !year) {
+      const _dt = getDhakaCurrentMonthYear();
+      month = _dt.month;
+      year = _dt.year;
+    }
+    const { startDate, endDate } = getDhakaMonthRange(year, month);
+    query.createdAt = { $gte: startDate, $lt: endDate };
 
     // FIX #6 — Fetch fresh vendorName from DB (JWT could be stale)
     if (req.user?.role === "vendor") {
       const userCollection = db.collection('users');
       const me = await userCollection.findOne({ email: req.user.email });
-      if (!me?.vendorName) {
-        return res.send({
-          success: true, data: [],
-          pagination: { total: 0, page, limit, totalPages: 0, hasNextPage: false, hasPrevPage: false },
-        });
-      }
+      if (!me?.vendorName) return res.send({ success: true, data: [], pagination: { total: 0 } });
       query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: "i" };
     }
 
-    const [data, total] = await Promise.all([
-      deliveriesCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      deliveriesCollection.countDocuments(query),
-    ]);
-
-    res.send({
-      success: true, data,
-      pagination: {
-        total, page, limit,
-        totalPages: Math.max(1, Math.ceil(total / limit)),
-        hasNextPage: page < Math.ceil(total / limit),
-        hasPrevPage: page > 1,
-      }
-    });
+    const data = await deliveriesCollection.find(query).sort({ createdAt: -1 }).toArray();
+    res.send({ success: true, data, pagination: { total: data.length } });
   } catch (err) {
     logger.error("Car rent fetch failed", err);
     res.status(500).send({ success: false, message: "Failed to fetch car rents" });
@@ -2568,7 +2536,7 @@ app.patch("/car-rents/:tripId", verifyToken, verifyRole('admin', 'manager', 'ceo
 });
 
 // FIX #5 — Only finance roles can edit advance
-app.patch("/deliveries/:tripId/advance", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId('tripId'), async (req, res) => {
+app.patch("/deliveries/:tripId/advance", verifyToken, verifyRole('admin', 'manager', 'ceo','operator'), validateObjectId('tripId'), async (req, res) => {
   try {
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
@@ -3381,7 +3349,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/status",
 });
 
 // GET /labor-bill?month=4&year=2025 — challans with floor or carrying entry
-app.get("/labor-bill", verifyToken, verifyRole('admin'), async (req, res) => {
+app.get("/labor-bill", verifyToken, async (req, res) => {
   try {
     const db = await connectDB();
     const col = db.collection('deliveries');
