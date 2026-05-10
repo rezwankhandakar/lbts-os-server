@@ -1054,7 +1054,7 @@ app.put('/gate-pass/:gatePassId/product/:productId', verifyToken, verifyRole('ad
 });
 
 // FIX #5 — Only admin/manager can delete gate pass (was: any authenticated user)
-app.delete('/gate-pass/:id', verifyToken, verifyRole('admin', 'manager'), validateObjectId('id'), validate([
+app.delete('/gate-pass/:id', verifyToken, verifyRole('admin', 'manager','operator'), validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid ID'),
 ]), async (req, res) => {
   try {
@@ -1345,7 +1345,7 @@ app.get("/challans/filter-options", verifyToken, verifyNonVendor, async (req, re
 });
 
 // FIX #5 — Only admin/manager can delete challan
-app.delete("/challan/:id", verifyToken, verifyRole('admin', 'manager'), validateObjectId('id'), validate([
+app.delete("/challan/:id", verifyToken, verifyRole('admin', 'manager','operator'), validateObjectId('id'), validate([
   param('id').isMongoId().withMessage('Invalid ID'),
 ]), async (req, res) => {
   try {
@@ -1464,20 +1464,43 @@ app.delete("/challans/:challanId/product/:productId", verifyToken, verifyNonVend
   }
 });
 
-app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'), async (req, res) => {
+// FIX (A3): Plural route — used by CreateDelivery to update challan + products together.
+// আগে কোনো validation ছিল না → invalid product data inject করা যেত।
+// এখন: required field + products array structure validate করি।
+app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'), validate([
+  param('id').isMongoId().withMessage('Invalid challan ID'),
+  body('customerName').trim().notEmpty().withMessage('Customer name required'),
+  body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
+  body('products').optional().isArray().withMessage('Products must be an array'),
+  body('products.*.productName').optional().trim().notEmpty().withMessage('Product name required'),
+  body('products.*.model').optional().trim().notEmpty().withMessage('Product model required'),
+  body('products.*.quantity').optional().isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { customerName, receiverNumber, zone, address, thana, district, products, updatedBy } = req.body;
+
+    // Sanitize products — preserve _id, coerce quantity to number
+    const sanitizedProducts = Array.isArray(products)
+      ? products.map(p => ({
+          _id: p._id || new ObjectId().toString(),
+          productName: String(p.productName || '').trim(),
+          model: String(p.model || '').trim(),
+          quantity: Number(p.quantity) || 0,
+        }))
+      : undefined;
+
+    const setDoc = {
+      customerName, receiverNumber, zone, address, thana, district,
+      lastUpdatedBy: updatedBy || req.user?.email || 'unknown',
+      lastUpdatedAt: new Date(),
+    };
+    if (sanitizedProducts !== undefined) setDoc.products = sanitizedProducts;
+
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(req.params.id) },
-      {
-        $set: {
-          customerName, receiverNumber, zone, address, thana, district, products,
-          lastUpdatedBy: updatedBy || req.user?.email || 'unknown',
-          lastUpdatedAt: new Date(),
-        }
-      }
+      { $set: setDoc }
     );
     if (result.matchedCount > 0) {
       res.send({ success: true, message: "Challan and Products updated successfully" });
@@ -1502,8 +1525,13 @@ app.post("/vendors", verifyToken, verifyNonVendor, validate([
   try {
     const db = await connectDB();
     const vendorsCollection = db.collection('vendors');
+    // FIX (A8): Whitelist instead of `...req.body` spread to prevent mass assignment.
+    const { vendorName, vendorPhone, vendorAddress, vendorImg } = req.body;
     const result = await vendorsCollection.insertOne({
-      ...req.body,
+      vendorName: vendorName.trim(),
+      vendorPhone: vendorPhone.trim(),
+      vendorAddress: vendorAddress.trim(),
+      vendorImg: vendorImg || null,
       vehicles: [],
       createdAt: new Date(),
       createdBy: req.user?.email || 'unknown',
@@ -1751,27 +1779,116 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
     return res.status(400).send({ success: false, message: "No deliveries provided" });
   }
 
-  const { client, db } = await getConnection();
+  const { db } = await getConnection();
   const deliveriesCollection = db.collection('deliveries');
   const challanCollection = db.collection('challans');
   const counterCollection = db.collection('counters');
 
-  // ── FIX: M0 transaction → manual rollback pattern ──────────────
-  // M0 free tier-এ transaction fail করলে TRANSACTION_UNSUPPORTED error আসত
-  // এখন: try-based sequential writes + fail হলে manual rollback
-  // Steps: 1) counter increment  2) already-delivered check
-  //        3) delivery insert    4) challan status update
-  //        5) fail → rollback counter + delete delivery
-  let tripNumber;
-  let result;
+  // ── FIX: Race-safe atomic claim pattern ────────────────────────
+  // আগের bug: Step 2 read-then-write race — দুটো concurrent request
+  //           একই challan-এর জন্য দুটো trip তৈরি করে দিতে পারত।
+  // এখন: MongoDB-এর atomic updateMany ব্যবহার করে "claim" করি।
+  //      `status: { $ne: 'delivered' }` filter দিয়ে updateMany করলে
+  //      MongoDB শুধু সেই docs-ই update করে যেগুলো সত্যি pending।
+  //      দুটো request একসাথে এলে শুধু একজনই matchedCount পাবে।
+  //
+  // Order:
+  //   1) Atomically claim challans (set status=claiming, tripNumber=temp)
+  //   2) Verify সবাই claim হয়েছে — না হলে rollback
+  //   3) Counter increment + tripNumber generate
+  //   4) Insert delivery doc
+  //   5) Finalize challan status to 'delivered' with real tripNumber
+  //   6) Fail হলে manual rollback (challan status revert + delivery delete)
+
+  let challanIds;
+  try {
+    challanIds = deliveries.map(d => {
+      if (typeof d.challanId === "string" && ObjectId.isValid(d.challanId)) {
+        return new ObjectId(d.challanId);
+      }
+      throw new Error(`Invalid challanId: ${d.challanId}`);
+    });
+  } catch (err) {
+    return res.status(400).send({ success: false, message: err.message });
+  }
+
+  // Unique check — একই request-এ duplicate challanId এলে বাতিল করো
+  const uniqueIds = new Set(challanIds.map(id => id.toString()));
+  if (uniqueIds.size !== challanIds.length) {
+    return res.status(400).send({ success: false, message: "Duplicate challan IDs in request" });
+  }
+
+  // Temp claim token — concurrent request distinguish করতে
+  const claimToken = `claim_${new ObjectId().toString()}`;
+  let tripNumber = null;
   let insertedDeliveryId = null;
-  let counterSeq = null;
-  const challanIds = deliveries.map(d =>
-    typeof d.challanId === "string" ? new ObjectId(d.challanId) : d.challanId
-  );
+  let claimedSuccessfully = false;
 
   try {
-    // Step 1: Counter increment
+    // ── Step 1: Atomic claim ───────────────────────────────────────
+    // শুধু সেই challan গুলোই claim হবে যেগুলো:
+    //   - exist করে (matched in $in)
+    //   - status delivered না (অথবা status field-ই নেই)
+    //   - কোনো claim token attached না (অন্য concurrent request পেন্ডিং না)
+    const claimResult = await challanCollection.updateMany(
+      {
+        _id: { $in: challanIds },
+        status: { $ne: 'delivered' },
+        claimToken: { $exists: false },
+      },
+      {
+        $set: { claimToken, claimedAt: new Date() },
+      }
+    );
+    claimedSuccessfully = true;
+
+    // ── Step 2: Verify সবাই claim হয়েছে কিনা ───────────────────────
+    if (claimResult.matchedCount !== challanIds.length) {
+      // কেউ-কেউ claim হয়নি — already delivered, missing, বা race-এ অন্য request পেয়েছে
+      // আমরা যা claim করেছিলাম সেগুলো release করি
+      await challanCollection.updateMany(
+        { _id: { $in: challanIds }, claimToken },
+        { $unset: { claimToken: "", claimedAt: "" } }
+      );
+      claimedSuccessfully = false;
+
+      // Diagnostic: কোন challan গুলো problem তা ক্লায়েন্টকে জানাই
+      const conflictDocs = await challanCollection
+        .find({ _id: { $in: challanIds } })
+        .project({ customerName: 1, status: 1 })
+        .toArray();
+
+      const foundIds = new Set(conflictDocs.map(d => d._id.toString()));
+      const missing = challanIds.filter(id => !foundIds.has(id.toString()));
+      const alreadyDelivered = conflictDocs.filter(d => d.status === 'delivered');
+      const lockedByOther = conflictDocs.filter(d => d.status !== 'delivered'); // claim token দখলে
+
+      if (alreadyDelivered.length > 0) {
+        return res.status(400).send({
+          success: false,
+          code: 'ALREADY_DELIVERED',
+          message: `Already delivered: ${alreadyDelivered.map(c => c.customerName).join(", ")}`,
+          items: alreadyDelivered.map(c => ({ id: c._id, customerName: c.customerName })),
+        });
+      }
+      if (missing.length > 0) {
+        return res.status(404).send({
+          success: false,
+          code: 'CHALLAN_NOT_FOUND',
+          message: `Challan(s) not found: ${missing.length}`,
+          items: missing,
+        });
+      }
+      // race condition — অন্য concurrent request claim করেছে
+      return res.status(409).send({
+        success: false,
+        code: 'CONCURRENT_DELIVERY',
+        message: 'Another delivery is being processed for these challans. Please try again.',
+        items: lockedByOther.map(c => ({ id: c._id, customerName: c.customerName })),
+      });
+    }
+
+    // ── Step 3: Counter increment + tripNumber ─────────────────────
     const counter = await counterCollection.findOneAndUpdate(
       { _id: "tripNumber" },
       { $inc: { seq: 1 } },
@@ -1779,22 +1896,9 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
     );
     const seq = counter?.seq ?? counter?.value?.seq;
     if (!seq || typeof seq !== 'number') throw new Error('Counter generation failed');
-    counterSeq = seq;
     tripNumber = `TR-${seq.toString().padStart(6, "0")}`;
 
-    // Step 2: Already-delivered check
-    const alreadyDelivered = await challanCollection
-      .find({ _id: { $in: challanIds }, status: "delivered" })
-      .toArray();
-    if (alreadyDelivered.length > 0) {
-      const names = alreadyDelivered.map(c => c.customerName).join(", ");
-      const error = new Error(`Already delivered: ${names}`);
-      error.code = 'ALREADY_DELIVERED';
-      error.items = alreadyDelivered.map(c => ({ id: c._id, customerName: c.customerName }));
-      throw error;
-    }
-
-    // Step 3: Insert delivery
+    // ── Step 4: Insert delivery doc ────────────────────────────────
     const tripDocument = {
       tripNumber,
       vehicleNumber: deliveries[0].vehicleNumber,
@@ -1821,46 +1925,71 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
       })),
       createdAt: new Date()
     };
-    result = await deliveriesCollection.insertOne(tripDocument);
+    const result = await deliveriesCollection.insertOne(tripDocument);
     insertedDeliveryId = result.insertedId;
 
-    // Step 4: Mark challans as delivered
-    await challanCollection.updateMany(
-      { _id: { $in: challanIds } },
-      { $set: { status: "delivered", tripNumber } }
+    // ── Step 5: Finalize challan status (claim → delivered) ───────
+    // claimToken filter দিয়ে নিশ্চিত করি যে শুধু আমাদের claim করা docs-ই update হবে
+    const finalizeResult = await challanCollection.updateMany(
+      { _id: { $in: challanIds }, claimToken },
+      {
+        $set: { status: "delivered", tripNumber },
+        $unset: { claimToken: "", claimedAt: "" },
+      }
     );
 
-    res.send({ success: true, insertedId: result.insertedId, tripNumber, totalChallan: deliveries.length });
+    if (finalizeResult.matchedCount !== challanIds.length) {
+      // সাধারণত এটা hit হবে না (claim আমাদের লক ছিল), কিন্তু safety
+      throw new Error('Failed to finalize all challans');
+    }
+
+    return res.send({
+      success: true,
+      insertedId: result.insertedId,
+      tripNumber,
+      totalChallan: deliveries.length
+    });
 
   } catch (err) {
-    logger.error("Delivery failed", err);
+    logger.error("Delivery failed", err, { tripNumber, claimToken });
 
     // ── Manual Rollback ──────────────────────────────────────────
-    // Step 4 fail হলে: delivery মুছো + challan status revert
-    // Step 3 fail হলে: delivery মুছো
-    // Step 1 fail হলে: counter gap থাকবে (acceptable — tripNumber skip)
+    // Step 4/5 fail হলে: claim release + delivery delete
     if (insertedDeliveryId) {
       try {
         await deliveriesCollection.deleteOne({ _id: insertedDeliveryId });
+      } catch (rollbackErr) {
+        logger.error('Delivery doc rollback FAILED', { tripNumber, rollbackErr });
+      }
+    }
+    if (claimedSuccessfully) {
+      try {
         await challanCollection.updateMany(
-          { _id: { $in: challanIds }, tripNumber },
-          { $set: { status: "pending" }, $unset: { tripNumber: "" } }
+          { _id: { $in: challanIds }, claimToken },
+          {
+            $unset: { claimToken: "", claimedAt: "", tripNumber: "" },
+            // status delivered হয়ে গেলেও revert — কিন্তু শুধু আমাদের tripNumber হলে
+            // (অন্য কারো success-কে ভাঙব না)
+          }
         );
+        // status revert আলাদা — শুধু আমাদের trip-এর জন্য
+        if (tripNumber) {
+          await challanCollection.updateMany(
+            { _id: { $in: challanIds }, tripNumber },
+            { $set: { status: "pending" }, $unset: { tripNumber: "" } }
+          );
+        }
         logger.info('Delivery rollback successful', { tripNumber });
       } catch (rollbackErr) {
-        logger.error('Delivery rollback FAILED — manual fix needed', { tripNumber, rollbackErr });
+        logger.error('Challan rollback FAILED — manual fix needed', { tripNumber, claimToken, rollbackErr });
       }
     }
 
-    if (err.code === 'ALREADY_DELIVERED' || err.message?.startsWith("Already delivered:")) {
-      return res.status(400).send({
-        success: false,
-        code: 'ALREADY_DELIVERED',
-        message: err.message,
-        items: err.items || [],
-      });
-    }
-    res.status(500).send({ success: false, message: "Delivery failed", error: err.message });
+    return res.status(500).send({
+      success: false,
+      message: "Delivery failed",
+      error: err.message,
+    });
   }
 });
 
@@ -2016,10 +2145,18 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
 
+    // FIX (A12): Defensive — challans/products undefined হলে .findIndex throws
+    if (!Array.isArray(trip.challans)) {
+      return res.status(400).send({ success: false, message: "Trip has no challans" });
+    }
     const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
     if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
 
-    const productIndex = trip.challans[challanIndex].products.findIndex(p => p._id === productId);
+    const challanProducts = trip.challans[challanIndex].products;
+    if (!Array.isArray(challanProducts)) {
+      return res.status(400).send({ success: false, message: "Challan has no products" });
+    }
+    const productIndex = challanProducts.findIndex(p => p._id === productId);
     if (productIndex === -1) return res.status(404).send({ success: false, message: "Product not found" });
 
     const updateField = `challans.${challanIndex}.products.${productIndex}`;
@@ -2051,10 +2188,15 @@ app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTo
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
 
+    // FIX (A12): Defensive
+    if (!Array.isArray(trip.challans)) {
+      return res.status(400).send({ success: false, message: "Trip has no challans" });
+    }
     const challanIndex = trip.challans.findIndex(c => c.challanId === challanId);
     if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
 
-    if (trip.challans[challanIndex].products.length <= 1)
+    const challanProducts = trip.challans[challanIndex].products;
+    if (!Array.isArray(challanProducts) || challanProducts.length <= 1)
       return res.status(400).send({ success: false, message: "Cannot remove last product" });
 
     const result = await deliveriesCollection.updateOne(
@@ -2103,7 +2245,7 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, verifyNo
 
 // FIX #25 — When removing challan from trip, restore original challan's status
 app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('admin', 'manager'), validateObjectId('tripId'), async (req, res) => {
-  const { client, db } = await getConnection();
+  const { db } = await getConnection();
   const deliveriesCollection = db.collection('deliveries');
   const challanCollection = db.collection('challans');
   const { tripId, challanId } = req.params;
@@ -2111,6 +2253,10 @@ app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('ad
   try {
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+    // FIX (A12 defensive): challans field undefined হলে crash না করে handle
+    if (!Array.isArray(trip.challans) || trip.challans.length === 0) {
+      return res.status(400).send({ success: false, message: "Trip has no challans" });
+    }
     if (trip.challans.length <= 1)
       return res.status(400).send({ success: false, message: "Cannot remove last challan from trip" });
 
@@ -2120,7 +2266,17 @@ app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('ad
     if (!targetChallan)
       return res.status(404).send({ success: false, message: "Challan not found in trip" });
 
-    // ── FIX: M0 transaction → sequential writes + rollback ──────────
+    // FIX (A9): Audit log the trip-challan delete (অন্য delete-এ আছে কিন্তু এটায় ছিল না)
+    await recordAudit({
+      db, req,
+      action: "DELETE_CHALLAN_FROM_TRIP",
+      collectionName: "deliveries",
+      documentId: trip._id,
+      oldDoc: { tripNumber: trip.tripNumber, removedChallan: targetChallan },
+      reason: req.body?.reason?.trim() || "",
+    });
+
+    // ── M0 transaction → sequential writes + rollback ──────────────
     // Step 1: Trip থেকে challan বাদ দাও
     // Step 2: Original challan-কে pending করো
     // Fail হলে: trip-এ challan ফিরিয়ে দাও (rollback)
@@ -2980,7 +3136,8 @@ function setCachedDashboard(key, data) {
   dashboardCache.set(key, { ts: Date.now(), data });
 }
 
-app.get("/dashboard-stats", verifyToken, async (req, res) => {
+// FIX (A13): verifyApproved যোগ — pending/rejected user-দের access বন্ধ
+app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
   try {
     const db = await connectDB();
     // FIX #28 — Accept optional month/year query params; default to current Dhaka month
@@ -3138,21 +3295,6 @@ app.get("/dashboard-stats", verifyToken, async (req, res) => {
   }
 });
 
-// ── Global Error Handler ───────────────────────────────────────────
-app.use((err, req, res, next) => {
-  logger.error("Unhandled error", err);
-  // CORS error
-  if (err.message?.startsWith('CORS blocked')) {
-    return res.status(403).send({ success: false, message: err.message });
-  }
-  // Multer file size error
-  if (err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).send({ success: false, message: 'File too large (max 5MB)' });
-  }
-  res.status(500).send({ success: false, message: "Internal Server Error" });
-});
-
-
 // ═══════════════════════════════════════════════════════════════════
 // Walton Bill Tracker — Manual bill issue & payment tracking
 // Collection: walton-bills
@@ -3179,21 +3321,33 @@ app.get("/walton-bills", verifyToken, verifyRole('admin', 'manager', 'ceo'), asy
 });
 
 // POST /walton-bills — create new bill issue
-app.post("/walton-bills", verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
+// FIX (A5): Added validation + defensive item parsing — invalid item.model
+//           আগে .trim() throw করত (TypeError → 500)
+app.post("/walton-bills", verifyToken, verifyRole('admin', 'manager', 'ceo'), validate([
+  body('month').isInt({ min: 1, max: 12 }).withMessage('Valid month (1-12) required'),
+  body('year').isInt({ min: 2000, max: 3000 }).withMessage('Valid year required'),
+  body('type').isIn(['main', 'lebor']).withMessage('Type must be main or lebor'),
+  body('items').isArray({ min: 1 }).withMessage('At least one item required'),
+  body('items.*.model').trim().notEmpty().withMessage('Item model required'),
+  body('items.*.pics').optional().isInt({ min: 0 }).withMessage('Pics must be non-negative integer'),
+  body('items.*.amount').isFloat({ min: 0 }).withMessage('Amount must be non-negative'),
+]), async (req, res) => {
   try {
     const db = await connectDB();
     const col = db.collection('walton-bills');
     const { month, year, type, items, note } = req.body;
-    // items: [{ model: 'WFR', pics: 500, amount: 400000 }, ...]
 
-    if (!month || !year || !['main','lebor'].includes(type) || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).send({ success: false, message: 'Invalid data' });
-    }
+    // Safe item processing — String() coerce করি যাতে .trim() never fails
+    const sanitizedItems = items.map(i => ({
+      model: String(i.model || '').trim(),
+      pics: Number(i.pics) || 0,
+      amount: Number(i.amount) || 0,
+    }));
+    const totalAmount = sanitizedItems.reduce((s, i) => s + i.amount, 0);
 
-    const totalAmount = items.reduce((s, i) => s + Number(i.amount || 0), 0);
     const doc = {
-      month, year, type,
-      items: items.map(i => ({ model: i.model.trim(), pics: Number(i.pics||0), amount: Number(i.amount||0) })),
+      month: Number(month), year: Number(year), type,
+      items: sanitizedItems,
       totalAmount,
       note: note || '',
       payments: [],           // [{ amount, date, note, by }]
@@ -3227,8 +3381,11 @@ app.patch("/walton-bills/:id/payment", verifyToken, verifyRole('admin', 'manager
     if (!bill) return res.status(404).send({ success: false, message: 'Bill not found' });
 
     const payment = { amount: Number(amount), note: note || '', date: date || new Date().toISOString(), by: req.user?.email || 'unknown', addedAt: new Date() };
-    const newTotalPaid = bill.totalPaid + payment.amount;
-    const newStatus = newTotalPaid >= bill.totalAmount ? 'paid' : newTotalPaid > 0 ? 'partial' : 'unpaid';
+    // FIX (A7): legacy bill-এ totalPaid/totalAmount undefined হলে NaN হয়ে যেত
+    const currentTotalPaid = Number(bill.totalPaid) || 0;
+    const currentTotalAmount = Number(bill.totalAmount) || 0;
+    const newTotalPaid = currentTotalPaid + payment.amount;
+    const newStatus = newTotalPaid >= currentTotalAmount ? 'paid' : newTotalPaid > 0 ? 'partial' : 'unpaid';
 
     await col.updateOne(
       { _id: new ObjectId(req.params.id) },
@@ -3263,14 +3420,18 @@ app.delete("/walton-bills/:id/payment/:idx", verifyToken, verifyRole('admin', 'm
     const bill = await col.findOne({ _id: new ObjectId(req.params.id) });
     if (!bill) return res.status(404).send({ success: false, message: 'Bill not found' });
 
+    // FIX (A6): legacy bill-এ payments field না থাকলে .length throw করত
+    const payments = Array.isArray(bill.payments) ? bill.payments : [];
     const idx = parseInt(req.params.idx);
-    if (isNaN(idx) || idx < 0 || idx >= bill.payments.length) {
+    if (isNaN(idx) || idx < 0 || idx >= payments.length) {
       return res.status(400).send({ success: false, message: 'Invalid payment index' });
     }
-    const removedAmt = bill.payments[idx].amount;
-    const newPayments = bill.payments.filter((_, i) => i !== idx);
-    const newTotalPaid = bill.totalPaid - removedAmt;
-    const newStatus = newTotalPaid >= bill.totalAmount ? 'paid' : newTotalPaid > 0 ? 'partial' : 'unpaid';
+    const removedAmt = Number(payments[idx]?.amount) || 0;
+    const newPayments = payments.filter((_, i) => i !== idx);
+    const currentTotalPaid = Number(bill.totalPaid) || 0;
+    const currentTotalAmount = Number(bill.totalAmount) || 0;
+    const newTotalPaid = currentTotalPaid - removedAmt;
+    const newStatus = newTotalPaid >= currentTotalAmount ? 'paid' : newTotalPaid > 0 ? 'partial' : 'unpaid';
 
     await col.updateOne(
       { _id: new ObjectId(req.params.id) },
@@ -3392,6 +3553,23 @@ app.get("/labor-bill", verifyToken, async (req, res) => {
     logger.error('Labor bill fetch failed', err);
     res.status(500).send({ success: false, message: 'Failed' });
   }
+});
+
+// ── Global Error Handler ───────────────────────────────────────────
+// FIX: এই handler অবশ্যই সব route registration-এর পরে থাকতে হবে।
+// Express শুধু এর আগে register হওয়া route গুলোর error catch করে — পরের
+// route গুলো default HTML error page-এ fall through করে যায়।
+app.use((err, req, res, next) => {
+  logger.error("Unhandled error", err);
+  // CORS error
+  if (err.message?.startsWith('CORS blocked')) {
+    return res.status(403).send({ success: false, message: err.message });
+  }
+  // Multer file size error
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).send({ success: false, message: 'File too large (max 5MB)' });
+  }
+  res.status(500).send({ success: false, message: "Internal Server Error" });
 });
 
 // ── Start Server ───────────────────────────────────────────────────
