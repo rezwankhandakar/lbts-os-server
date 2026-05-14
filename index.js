@@ -12,6 +12,10 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const { initFirebaseAdmin, verifyFirebaseIdToken } = require('./config/firebaseAdmin');
 initFirebaseAdmin();
 
+// ── Gemini AI Address Parser ──
+const { parseAddressHybrid } = require('./services/hybridAddressParser');
+const { BANGLADESH_DISTRICTS } = require('./constants/bangladeshDistricts');
+
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -179,6 +183,16 @@ const uploadLimiter = rateLimit({
   legacyHeaders: false,
   validate: { xForwardedForHeader: false },
   message: { success: false, message: 'Too many upload requests, please slow down' }
+});
+
+// ── AI Rate Limiter ──
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  message: { success: false, message: 'Too many AI requests, please wait a moment' }
 });
 
 // ── CORS ───────────────────────────────────────────────────────────
@@ -1221,6 +1235,100 @@ app.get("/challan/recent", verifyToken, verifyNonVendor, async (req, res) => {
   } catch (err) {
     logger.error('Failed to fetch recent challan', err);
     res.status(500).send({ success: false, message: "Failed to fetch recent challan" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+//  POST /parse-address — Gemini AI Address Parser
+// ═══════════════════════════════════════════════════════════════════
+app.post('/parse-address', verifyToken, verifyNonVendor, aiLimiter, async (req, res) => {
+  try {
+    const { address } = req.body;
+
+    if (!address || typeof address !== 'string' || address.trim().length < 3) {
+      return res.status(400).send({
+        success: false,
+        message: 'Address must be at least 3 characters',
+      });
+    }
+
+    const db = await connectDB();
+    const challanCollection = db.collection('challans');
+
+    // Get existing thanas from DB for context
+    const existingThanas = await challanCollection
+      .distinct('thana', { thana: { $exists: true, $ne: null, $ne: '' } });
+
+    const approvedThanas = existingThanas
+      .filter(t => typeof t === 'string' && t.trim().length > 0)
+      .map(t => t.trim())
+      .slice(0, 200);
+
+    // Check cache first
+    const crypto = require('crypto');
+    const cacheKey = crypto
+      .createHash('sha256')
+      .update(address.trim().toLowerCase())
+      .digest('hex');
+
+    const cacheCollection = db.collection('address_cache');
+    const cached = await cacheCollection.findOne({ _id: cacheKey });
+
+    if (cached && cached.expiresAt > new Date()) {
+      return res.send({
+        success: true,
+        ...cached.result,
+        cached: true,
+      });
+    }
+
+    // Call Gemini
+const result = await parseAddressHybrid(
+  address,
+  approvedThanas,
+  BANGLADESH_DISTRICTS
+);
+    if (!result.success) {
+      return res.status(502).send(result);
+    }
+
+    // Save to cache (30 days TTL)
+    const cacheDoc = {
+      _id: cacheKey,
+      input: address.trim(),
+      result: {
+        cleanAddress: result.cleanAddress,
+        thana: result.thana,
+        district: result.district,
+        confidence: result.confidence,
+        notes: result.notes,
+      },
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    };
+
+    cacheCollection.updateOne(
+      { _id: cacheKey },
+      { $set: cacheDoc },
+      { upsert: true }
+    ).catch(err => console.error('Cache write failed', err));
+
+    res.send({
+      success: true,
+      cleanAddress: result.cleanAddress,
+      thana: result.thana,
+      district: result.district,
+      confidence: result.confidence,
+      notes: result.notes,
+      cached: false,
+    });
+
+  } catch (err) {
+    console.error('Parse address failed', err);
+    res.status(500).send({
+      success: false,
+      message: 'Failed to parse address',
+    });
   }
 });
 
