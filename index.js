@@ -14,7 +14,6 @@ initFirebaseAdmin();
 
 // ── Gemini AI Address Parser ──
 const { parseAddressHybrid } = require('./services/hybridAddressParser');
-const { BANGLADESH_DISTRICTS } = require('./constants/bangladeshDistricts');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -1238,10 +1237,43 @@ app.get("/challan/recent", verifyToken, verifyNonVendor, async (req, res) => {
   }
 });
 
-// index.js file er api
 // ═══════════════════════════════════════════════════════════════════
-//  POST /parse-address — Gemini AI Address Parser
+//  PATCH: index.js  /parse-address endpoint  (server, v2)
+//  ───────────────────────────────────────────────────────────────────
+//  Apply these THREE changes to your existing index.js:
+//
+//   (1) Change the require() at the top of the file.
+//   (2) Inside POST /parse-address: REMOVE the `existingThanas` /
+//       `approvedThanas` DB lookup. It's not used anymore — the AI now
+//       gets the canonical thana→district mapping from
+//       bangladeshThanaData.js.
+//   (3) Change the parseAddressHybrid() call to pass the mapping.
+//
+//  (Optional) Add a small /gemini-status route to inspect key pool health.
 // ═══════════════════════════════════════════════════════════════════
+
+
+// ─────────────────────────────────────────────────────────────────
+//  (1) Top-of-file require
+// ─────────────────────────────────────────────────────────────────
+
+// ── OLD (around line 17 of your index.js): ──
+//   const { BANGLADESH_DISTRICTS } = require('./constants/bangladeshDistricts');
+
+// ── NEW: ──
+const {
+  DISTRICTS_WITH_THANAS,
+  BANGLADESH_DISTRICTS,
+} = require('./constants/bangladeshThanaData');
+
+// (Keep the existing line:)
+//   const { parseAddressHybrid } = require('./services/hybridAddressParser');
+
+
+// ─────────────────────────────────────────────────────────────────
+//  (2) & (3) /parse-address endpoint — full new version
+// ─────────────────────────────────────────────────────────────────
+
 app.post('/parse-address', verifyToken, verifyNonVendor, aiLimiter, async (req, res) => {
   try {
     const { address } = req.body;
@@ -1254,18 +1286,8 @@ app.post('/parse-address', verifyToken, verifyNonVendor, aiLimiter, async (req, 
     }
 
     const db = await connectDB();
-    const challanCollection = db.collection('challans');
 
-    // Get existing thanas from DB for context
-    const existingThanas = await challanCollection
-      .distinct('thana', { thana: { $exists: true, $ne: null, $ne: '' } });
-
-    const approvedThanas = existingThanas
-      .filter(t => typeof t === 'string' && t.trim().length > 0)
-      .map(t => t.trim())
-      .slice(0, 200);
-
-    // Check cache first
+    // ── Cache check (unchanged) ──
     const crypto = require('crypto');
     const cacheKey = crypto
       .createHash('sha256')
@@ -1283,17 +1305,27 @@ app.post('/parse-address', verifyToken, verifyNonVendor, aiLimiter, async (req, 
       });
     }
 
-    // Call Gemini
-const result = await parseAddressHybrid(
-  address,
-  approvedThanas,
-  BANGLADESH_DISTRICTS
-);
+    // ── REMOVED: the old DB lookup for `existingThanas` / `approvedThanas`.
+    //    It was pulling every user-typed thana value (including typos)
+    //    out of the challans collection and feeding them back to the AI
+    //    as "approved", which made the AI repeat the same wrong names.
+    //
+    //    The AI now gets the canonical thana→district mapping instead,
+    //    and any thana that doesn't belong to its returned district is
+    //    automatically dropped by the parser. ──
+
+    // ── Call Hybrid (Groq → Gemini fallback) with the canonical mapping ──
+    const result = await parseAddressHybrid(
+      address,
+      DISTRICTS_WITH_THANAS,
+      BANGLADESH_DISTRICTS
+    );
+
     if (!result.success) {
       return res.status(502).send(result);
     }
 
-    // Save to cache (30 days TTL)
+    // ── Save to cache (30 days TTL) ──
     const cacheDoc = {
       _id: cacheKey,
       input: address.trim(),
@@ -1312,7 +1344,7 @@ const result = await parseAddressHybrid(
       { _id: cacheKey },
       { $set: cacheDoc },
       { upsert: true }
-    ).catch(err => console.error('Cache write failed', err));
+    ).catch((err) => console.error('Cache write failed', err));
 
     res.send({
       success: true,
@@ -1323,7 +1355,6 @@ const result = await parseAddressHybrid(
       notes: result.notes,
       cached: false,
     });
-
   } catch (err) {
     console.error('Parse address failed', err);
     res.status(500).send({
@@ -1333,6 +1364,23 @@ const result = await parseAddressHybrid(
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────
+//  (OPTIONAL) /gemini-status — inspect key pool health
+//  ───────────────────────────────────────────────────────────────
+//  Useful when you want to see which Gemini keys are cooled down.
+//  Protect it with admin auth in production.
+// ─────────────────────────────────────────────────────────────────
+
+const { poolStatus } = require('./services/geminiAddressParser');
+
+app.get('/gemini-status', verifyToken, (req, res) => {
+  res.send({
+    success: true,
+    pool: poolStatus(),
+    note: 'Cooldowns are in-memory only; they reset on server restart.',
+  });
+});
 app.get("/challans", verifyToken, verifyNonVendor, async (req, res) => {
   try {
     const db = await connectDB();
