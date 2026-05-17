@@ -1238,6 +1238,7 @@ app.get("/challan/recent", verifyToken, verifyNonVendor, async (req, res) => {
   }
 });
 
+// index.js file er api
 // ═══════════════════════════════════════════════════════════════════
 //  POST /parse-address — Gemini AI Address Parser
 // ═══════════════════════════════════════════════════════════════════

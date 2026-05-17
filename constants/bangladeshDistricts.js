@@ -1,4 +1,4 @@
-/**
+/** bangladeshDistricts.js server site file
  * All 64 districts of Bangladesh (English names).
  * Used as the "approved list" for Gemini to prevent hallucination.
  */
