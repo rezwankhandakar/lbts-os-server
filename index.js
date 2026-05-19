@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require('express');
@@ -1202,6 +1203,13 @@ app.post("/challan", verifyToken, verifyNonVendor, validate([
   body('products.*.productName').trim().notEmpty().withMessage('Product name required'),
   body('products.*.model').trim().notEmpty().withMessage('Model required'),
   body('products.*.quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+  // capacity (string) and rate (number) are optional — auto-resolved by
+  // the client from with-model / without-model lookup tables.  When the
+  // client couldn't resolve a rate yet (e.g. without-model product whose
+  // capacity must be picked on the Delivered page), capacity/rate are
+  // sent as "" / 0 and the Delivered-page editor sets them later.
+  body('products.*.capacity').optional({ checkFalsy: false }).isString(),
+  body('products.*.rate').optional({ checkFalsy: false }).isNumeric(),
 ]), async (req, res) => {
   try {
     const db = await connectDB();
@@ -1212,7 +1220,13 @@ app.post("/challan", verifyToken, verifyNonVendor, validate([
         _id: new ObjectId().toString(),
         productName: p.productName,
         model: p.model,
-        quantity: Number(p.quantity)
+        quantity: Number(p.quantity),
+        // Persist capacity + rate as resolved by the client.  Defaults
+        // keep older rows / partial submissions intact:
+        //   capacity: "" when not yet known (e.g. Gas Stove pre-pick)
+        //   rate:     0  when not yet known
+        capacity: typeof p.capacity === 'string' ? p.capacity : '',
+        rate: Number(p.rate) || 0,
       }));
     }
     challan.createdAt = new Date();
@@ -1575,21 +1589,37 @@ app.put('/challan/:challanId/product/:productId', verifyToken, verifyNonVendor, 
   body('productName').trim().notEmpty().withMessage('Product name required'),
   body('model').trim().notEmpty().withMessage('Model required'),
   body('quantity').isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+  // capacity + rate are optional; client sends them after looking up the
+  // resolved value from with-model / without-model tables.  When the
+  // user only changes (say) quantity, capacity/rate may be omitted and
+  // existing values are preserved.
+  body('capacity').optional({ checkFalsy: false }).isString(),
+  body('rate').optional({ checkFalsy: false }).isNumeric(),
 ]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { challanId, productId } = req.params;
-    const { productName, model, quantity } = req.body;
+    const { productName, model, quantity, capacity, rate } = req.body;
+
+    // Build the $set patch — only include capacity/rate when the client
+    // explicitly supplied them so we don't accidentally wipe existing
+    // values on a quantity-only edit.
+    const setPatch = {
+      "products.$.productName": productName,
+      "products.$.model": model,
+      "products.$.quantity": Number(quantity),
+    };
+    if (typeof capacity === 'string') {
+      setPatch["products.$.capacity"] = capacity;
+    }
+    if (rate !== undefined && rate !== null && rate !== '') {
+      setPatch["products.$.rate"] = Number(rate) || 0;
+    }
+
     const result = await challanCollection.updateOne(
       { _id: new ObjectId(challanId), "products._id": productId },
-      {
-        $set: {
-          "products.$.productName": productName,
-          "products.$.model": model,
-          "products.$.quantity": Number(quantity)
-        }
-      }
+      { $set: setPatch }
     );
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Product not found" });
@@ -1632,19 +1662,24 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
   body('products.*.productName').optional().trim().notEmpty().withMessage('Product name required'),
   body('products.*.model').optional().trim().notEmpty().withMessage('Product model required'),
   body('products.*.quantity').optional().isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
+  body('products.*.capacity').optional({ checkFalsy: false }).isString(),
+  body('products.*.rate').optional({ checkFalsy: false }).isNumeric(),
 ]), async (req, res) => {
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
     const { customerName, receiverNumber, zone, address, thana, district, products, updatedBy } = req.body;
 
-    // Sanitize products — preserve _id, coerce quantity to number
+    // Sanitize products — preserve _id, coerce quantity to number,
+    // also pass through capacity + rate when supplied.
     const sanitizedProducts = Array.isArray(products)
       ? products.map(p => ({
           _id: p._id || new ObjectId().toString(),
           productName: String(p.productName || '').trim(),
           model: String(p.model || '').trim(),
           quantity: Number(p.quantity) || 0,
+          capacity: typeof p.capacity === 'string' ? p.capacity : '',
+          rate: Number(p.rate) || 0,
         }))
       : undefined;
 
@@ -2072,12 +2107,22 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
         address: d.address,
         thana: d.thana,
         district: d.district,
+        // location saved alongside the challan snapshot so the Delivered
+        // page's rate-matcher fallback can resolve rates for products
+        // whose capacity/rate weren't yet saved on the original challan.
+        location: d.location || null,
         receiverNumber: d.receiverNumber,
         products: (d.products || []).map(p => ({
           _id: p._id || new ObjectId().toString(),
           productName: p.productName,
           model: p.model,
-          quantity: Number(p.quantity)
+          quantity: Number(p.quantity),
+          // Persist rate-table fields onto the delivery snapshot.
+          // Defaults keep older flows safe:
+          //   capacity: "" when not yet known
+          //   rate:     0  when not yet known
+          capacity: typeof p.capacity === 'string' ? p.capacity : '',
+          rate: Number(p.rate) || 0,
         }))
       })),
       createdAt: new Date()
