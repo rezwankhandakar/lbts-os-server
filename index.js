@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require('express');
@@ -2442,6 +2441,91 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, verifyNo
   } catch (err) {
     logger.error("Add trip product failed", err);
     res.status(500).send({ success: false, message: "Failed to add product" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+//  Bulk Trip Do assignment
+//  ─────────────────────────────────────────────────────────────────
+//  Used by the Delivered page to stamp the same `tripDo` value onto
+//  many products at once (e.g. user filters down to a set of rows and
+//  enters one DO number that applies to all of them).
+//
+//  Body shape:
+//    {
+//      tripDo: "4681835",
+//      targets: [
+//        { challanId, productId },
+//        { challanId, productId },
+//        ...
+//      ]
+//    }
+//
+//  Writes to BOTH collections so the Delivered page (reads `deliveries`)
+//  and the canonical challan record (reads `challans`) stay in sync.
+//  Empty / null `tripDo` is allowed — it CLEARS the field.
+// ─────────────────────────────────────────────────────────────────────
+app.patch("/deliveries/bulk-trip-do", verifyToken, verifyRole('admin'), async (req, res) => {
+  try {
+    const { tripDo, targets } = req.body || {};
+    if (!Array.isArray(targets) || targets.length === 0) {
+      return res.status(400).send({ success: false, message: "No targets supplied" });
+    }
+    const clean = String(tripDo ?? "").trim();
+    const writeValue = clean.length ? clean : null; // null → unset
+
+    const db = await connectDB();
+    const challanCollection    = db.collection('challans');
+    const deliveriesCollection = db.collection('deliveries');
+
+    // Group targets by challanId for efficient updates
+    const byChallan = new Map();
+    for (const t of targets) {
+      if (!t?.challanId || !t?.productId) continue;
+      if (!byChallan.has(t.challanId)) byChallan.set(t.challanId, []);
+      byChallan.get(t.challanId).push(t.productId);
+    }
+
+    let touched = 0;
+    const operations = [];
+
+    for (const [challanId, productIds] of byChallan.entries()) {
+      // ── 1. Update challans collection ──
+      // Use arrayFilters to update many products in one shot
+      operations.push(
+        challanCollection.updateOne(
+          { _id: new ObjectId(challanId) },
+          writeValue === null
+            ? { $unset: { "products.$[el].tripDo": "" } }
+            : { $set:   { "products.$[el].tripDo": writeValue } },
+          { arrayFilters: [{ "el._id": { $in: productIds } }] }
+        ).then(r => { touched += r.modifiedCount || 0; })
+      );
+
+      // ── 2. Update deliveries collection (embedded copy) ──
+      // Same productIds may appear inside any trip's challans[].products.
+      // arrayFilters on nested arrays is supported by MongoDB.
+      operations.push(
+        deliveriesCollection.updateMany(
+          { "challans.challanId": challanId },
+          writeValue === null
+            ? { $unset: { "challans.$[c].products.$[p].tripDo": "" } }
+            : { $set:   { "challans.$[c].products.$[p].tripDo": writeValue } },
+          {
+            arrayFilters: [
+              { "c.challanId": challanId },
+              { "p._id": { $in: productIds } },
+            ],
+          }
+        )
+      );
+    }
+
+    await Promise.all(operations);
+    res.send({ success: true, touched });
+  } catch (err) {
+    logger.error("Bulk trip-do update failed", err);
+    res.status(500).send({ success: false, message: "Failed to update trip Do" });
   }
 });
 
