@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require('express');
@@ -2526,6 +2527,175 @@ app.patch("/deliveries/bulk-trip-do", verifyToken, verifyRole('admin'), async (r
   } catch (err) {
     logger.error("Bulk trip-do update failed", err);
     res.status(500).send({ success: false, message: "Failed to update trip Do" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+//  Split a product row by quantity
+//  ─────────────────────────────────────────────────────────────────
+//  Used by the Delivered page when an admin needs to assign different
+//  Trip Do numbers to portions of the same qty.  Example: a row has
+//  qty = 2 and the user wants to put 1 qty on one trip and 1 qty on
+//  another.  The user splits the row first — the original row's qty
+//  is reduced (e.g. 2 → 1) and a brand-new product entry is inserted
+//  (qty = 1) carrying the same productName/model/capacity/rate but a
+//  fresh _id and NO tripDo, so Trip Do can be set independently.
+//
+//  Body shape:
+//    {
+//      challanId: "<canonical challan _id>",
+//      productId: "<embedded product _id>",
+//      splitQty:  1     // qty to peel off into the new row
+//    }
+//
+//  Constraints:
+//    - splitQty must be a positive integer
+//    - splitQty must be strictly less than the original row's qty
+//      (i.e. the original always retains at least 1 qty; if you want
+//      to "move all qty", just edit Trip Do on the existing row)
+//
+//  Writes to BOTH collections (challans + deliveries) so the embedded
+//  copy on the trip and the canonical challan record stay in sync.
+// ─────────────────────────────────────────────────────────────────────
+app.post("/deliveries/split-product", verifyToken, verifyRole('admin'), async (req, res) => {
+  try {
+    const { challanId, productId, splitQty } = req.body || {};
+    if (!challanId || !productId) {
+      return res.status(400).send({ success: false, message: "challanId and productId required" });
+    }
+    const peel = Number(splitQty);
+    if (!Number.isInteger(peel) || peel <= 0) {
+      return res.status(400).send({ success: false, message: "splitQty must be a positive integer" });
+    }
+
+    const db = await connectDB();
+    const challanCollection    = db.collection('challans');
+    const deliveriesCollection = db.collection('deliveries');
+
+    // ── 1. Find the source row from the DELIVERIES collection ──
+    // The Delivered page reads from `deliveries` (trips embed challans),
+    // so the source of truth for what the user is looking at is the
+    // embedded copy — not the canonical `challans` document (which may
+    // have been deleted or never linked).  We look up by:
+    //   - challans.challanId (the embedded reference field)
+    //   - challans.products._id (the embedded product)
+    //
+    // Match on string OR ObjectId for challanId because historical data
+    // may have either.
+    const challanIdMatchers = [{ "challans.challanId": challanId }];
+    if (isValidObjectId(challanId)) {
+      challanIdMatchers.push({ "challans.challanId": new ObjectId(challanId) });
+    }
+    const trip = await deliveriesCollection.findOne({
+      $and: [
+        { $or: challanIdMatchers },
+        { "challans.products._id": productId },
+      ],
+    });
+    if (!trip) {
+      return res.status(404).send({ success: false, message: "Row not found in any trip" });
+    }
+
+    // Walk the embedded challans → products to grab the source product
+    let source = null;
+    let embeddedChallanIdValue = null; // preserve original type for arrayFilters
+    for (const c of (trip.challans || [])) {
+      const cid = c?.challanId;
+      const matches = cid === challanId || cid?.toString() === challanId;
+      if (!matches) continue;
+      const p = (c.products || []).find(pp => pp._id === productId || pp._id?.toString() === productId);
+      if (p) {
+        source = p;
+        embeddedChallanIdValue = cid;   // could be string or ObjectId
+        break;
+      }
+    }
+    if (!source) {
+      return res.status(404).send({ success: false, message: "Product not found in embedded challan" });
+    }
+
+    const originalQty = Number(source.quantity) || 0;
+    if (peel >= originalQty) {
+      return res.status(400).send({
+        success: false,
+        message: `splitQty (${peel}) must be less than current quantity (${originalQty})`,
+      });
+    }
+    const remainingQty = originalQty - peel;
+
+    // ── 2. Build the new product (clone source, fresh _id, no tripDo) ──
+    const newProduct = { ...source };
+    delete newProduct.tripDo;
+    newProduct._id = new ObjectId().toString();
+    newProduct.quantity = peel;
+    newProduct.splitFrom = source._id;
+
+    // ── 3. Update deliveries collection (the page's source of truth) ──
+    // arrayFilters need to match the embedded challanId in its original
+    // type (string or ObjectId), so we pass through `embeddedChallanIdValue`.
+    const deliveriesFilter = isValidObjectId(challanId)
+      ? { $or: [
+          { "challans.challanId": challanId },
+          { "challans.challanId": new ObjectId(challanId) },
+        ] }
+      : { "challans.challanId": challanId };
+
+    await deliveriesCollection.updateMany(
+      deliveriesFilter,
+      { $set: { "challans.$[c].products.$[p].quantity": remainingQty } },
+      {
+        arrayFilters: [
+          { "c.challanId": embeddedChallanIdValue },
+          { "p._id": productId },
+        ],
+      }
+    );
+    await deliveriesCollection.updateMany(
+      deliveriesFilter,
+      { $push: { "challans.$[c].products": newProduct } },
+      { arrayFilters: [{ "c.challanId": embeddedChallanIdValue }] }
+    );
+
+    // ── 4. Best-effort sync to canonical challans collection ──
+    // If the canonical challan still exists, keep it in sync.  If not,
+    // we don't fail — the Delivered page reads from `deliveries` anyway.
+    if (isValidObjectId(challanId)) {
+      try {
+        const canonical = await challanCollection.findOne(
+          { _id: new ObjectId(challanId) },
+          { projection: { _id: 1, "products._id": 1 } }
+        );
+        if (canonical) {
+          const hasProduct = (canonical.products || []).some(
+            p => p._id === productId || p._id?.toString() === productId
+          );
+          if (hasProduct) {
+            await challanCollection.updateOne(
+              { _id: new ObjectId(challanId), "products._id": productId },
+              { $set: { "products.$.quantity": remainingQty } }
+            );
+            await challanCollection.updateOne(
+              { _id: new ObjectId(challanId) },
+              { $push: { products: newProduct } }
+            );
+          }
+        }
+      } catch (syncErr) {
+        // Sync failure is non-fatal — log and move on.  The Delivered
+        // page is already updated; an admin can reconcile later if needed.
+        logger.warn?.("Canonical challan sync failed during split", { challanId, productId, err: syncErr?.message });
+      }
+    }
+
+    res.send({
+      success: true,
+      originalProductId: productId,
+      originalQuantity: remainingQty,
+      newProduct,
+    });
+  } catch (err) {
+    logger.error("Product split failed", err);
+    res.status(500).send({ success: false, message: "Failed to split product" });
   }
 });
 
