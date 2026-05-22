@@ -1328,7 +1328,7 @@ app.post('/parse-address', verifyToken, verifyNonVendor, aiLimiter, async (req, 
     //    and any thana that doesn't belong to its returned district is
     //    automatically dropped by the parser. ──
 
-    // ── Call Hybrid (Groq → Gemini fallback) with the canonical mapping ──
+    // ── Call Hybrid (Gemini only — Groq removed) with the canonical mapping ──
     const result = await parseAddressHybrid(
       address,
       DISTRICTS_WITH_THANAS,
@@ -4036,22 +4036,6 @@ if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
 }
 
 module.exports = app;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
