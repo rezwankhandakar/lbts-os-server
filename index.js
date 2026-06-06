@@ -2531,6 +2531,69 @@ app.patch("/deliveries/bulk-trip-do", verifyToken, verifyRole('admin'), async (r
 });
 
 // ─────────────────────────────────────────────────────────────────────
+//  Bulk CSD update
+//  ─────────────────────────────────────────────────────────────────
+//  CSD is a per-challan field (one value per challan), so unlike Trip Do
+//  the targets are distinct challanIds — productId is irrelevant here.
+//  Writes to the deliveries collection (the Delivered page's source of
+//  truth) and best-effort to the challans collection so other views stay
+//  in sync.  Empty value clears the CSD.
+//
+//  Body shape:  { csd: "<name>", challanIds: ["<id>", ...] }
+// ─────────────────────────────────────────────────────────────────────
+app.patch("/deliveries/bulk-csd", verifyToken, verifyRole('admin'), async (req, res) => {
+  try {
+    const { csd, challanIds } = req.body || {};
+    if (!Array.isArray(challanIds) || challanIds.length === 0) {
+      return res.status(400).send({ success: false, message: "No challans supplied" });
+    }
+    const clean = String(csd ?? "").trim();
+    const writeValue = clean.length ? clean : null;   // null → unset
+
+    const db = await connectDB();
+    const challanCollection    = db.collection('challans');
+    const deliveriesCollection = db.collection('deliveries');
+
+    // De-duplicate ids.
+    const ids = [...new Set(challanIds.filter(Boolean).map(String))];
+
+    let touched = 0;
+    const operations = [];
+
+    for (const challanId of ids) {
+      // ── 1. deliveries collection (embedded copy — authoritative here) ──
+      operations.push(
+        deliveriesCollection.updateMany(
+          { "challans.challanId": challanId },
+          writeValue === null
+            ? { $unset: { "challans.$[c].csd": "" }, $set: { "challans.$[c].csdUpdatedAt": new Date() } }
+            : { $set:   { "challans.$[c].csd": writeValue, "challans.$[c].csdUpdatedAt": new Date() } },
+          { arrayFilters: [{ "c.challanId": challanId }] }
+        ).then(r => { touched += r.modifiedCount || 0; })
+      );
+
+      // ── 2. challans collection (best-effort, keeps other views fresh) ──
+      if (isValidObjectId(challanId)) {
+        operations.push(
+          challanCollection.updateOne(
+            { _id: new ObjectId(challanId) },
+            writeValue === null
+              ? { $unset: { csd: "" }, $set: { csdUpdatedAt: new Date() } }
+              : { $set:   { csd: writeValue, csdUpdatedAt: new Date() } }
+          ).catch(() => { /* non-fatal — deliveries is the page's source */ })
+        );
+      }
+    }
+
+    await Promise.all(operations);
+    res.send({ success: true, touched });
+  } catch (err) {
+    logger.error("Bulk CSD update failed", err);
+    res.status(500).send({ success: false, message: "Failed to update CSD" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
 //  Split a product row by quantity
 //  ─────────────────────────────────────────────────────────────────
 //  Used by the Delivered page when an admin needs to assign different
@@ -2858,6 +2921,38 @@ app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, verifyNonV
   } catch (err) {
     logger.error("Note update failed", err);
     res.status(500).send({ success: false, message: "Failed to update note" });
+  }
+});
+
+// PATCH /deliveries/:tripId/challan/:challanId/csd
+// Update the per-challan CSD field directly from the Delivered page.
+// CSD is a challan-level attribute (not per-product), so we match the
+// embedded challan by its challanId and $set the field. Mirrors the
+// /note endpoint above.
+app.patch("/deliveries/:tripId/challan/:challanId/csd", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
+  try {
+    const db = await connectDB();
+    const deliveriesCollection = db.collection('deliveries');
+    const { tripId, challanId } = req.params;
+    const { csd, updatedBy } = req.body;
+    const clean = (csd ?? "").toString().trim();
+
+    const result = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId), "challans.challanId": challanId },
+      {
+        $set: {
+          "challans.$.csd": clean, "challans.$.csdUpdatedAt": new Date(),
+          lastUpdatedBy: updatedBy || req.user?.email || null,
+          lastUpdatedAt: new Date(),
+        }
+      }
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ success: false, message: "Challan not found" });
+    res.send({ success: true });
+  } catch (err) {
+    logger.error("CSD update failed", err);
+    res.status(500).send({ success: false, message: "Failed to update CSD" });
   }
 });
 
@@ -4036,6 +4131,3 @@ if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
 }
 
 module.exports = app;
-
-
-
