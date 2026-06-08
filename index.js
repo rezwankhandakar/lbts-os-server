@@ -1551,7 +1551,7 @@ app.patch('/challan/:id', verifyToken, verifyNonVendor, validateObjectId('id'), 
   try {
     const db = await connectDB();
     const challanCollection = db.collection('challans');
-    const { customerName, address, thana, district, receiverNumber, zone, currentUser, createdAt, updatedBy } = req.body;
+    const { customerName, address, thana, district, receiverNumber, zone, location, currentUser, createdAt, updatedBy } = req.body;
 
     // createdAt না পাঠালে DB থেকে নাও
     let dateToUse = createdAt ? new Date(createdAt) : null;
@@ -1568,6 +1568,12 @@ app.patch('/challan/:id', verifyToken, verifyNonVendor, validateObjectId('id'), 
       lastUpdatedBy: updatedBy || req.user?.email || 'unknown',
       lastUpdatedAt: new Date(),
     };
+
+    // location is recomputed client-side from the (possibly edited) thana +
+    // district. Only set it when supplied so a partial edit can't wipe it.
+    if (typeof location === 'string') {
+      setDoc.location = location;
+    }
 
     // এখন সবসময় month/year set হবে
     if (dateToUse && !isNaN(dateToUse.getTime())) {
@@ -2309,22 +2315,30 @@ app.patch("/deliveries/:tripId/challan/:challanId", verifyToken, verifyNonVendor
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-    const { customerName, address, thana, district, receiverNumber, zone, updatedBy } = req.body;
+    const { customerName, address, thana, district, receiverNumber, zone, location, updatedBy } = req.body;
+
+    // Build the $set patch.  `location` is recomputed client-side from the
+    // (possibly edited) thana + district and sent along so the Delivered
+    // page's Location column + downstream rate resolution stay in sync.
+    // Only set it when the client actually supplied a value so a partial
+    // edit can't accidentally wipe an existing location.
+    const setPatch = {
+      "challans.$.customerName": customerName,
+      "challans.$.address": address,
+      "challans.$.thana": thana,
+      "challans.$.district": district,
+      "challans.$.receiverNumber": receiverNumber,
+      "challans.$.zone": zone,
+      lastUpdatedBy: updatedBy || req.user?.email || null,
+      lastUpdatedAt: new Date(),
+    };
+    if (typeof location === 'string') {
+      setPatch["challans.$.location"] = location;
+    }
 
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId), "challans.challanId": challanId },
-      {
-        $set: {
-          "challans.$.customerName": customerName,
-          "challans.$.address": address,
-          "challans.$.thana": thana,
-          "challans.$.district": district,
-          "challans.$.receiverNumber": receiverNumber,
-          "challans.$.zone": zone,
-          lastUpdatedBy: updatedBy || req.user?.email || null,
-          lastUpdatedAt: new Date(),
-        }
-      }
+      { $set: setPatch }
     );
     if (result.matchedCount === 0)
       return res.status(404).send({ success: false, message: "Challan not found in trip" });
@@ -2342,7 +2356,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId, productId } = req.params;
-    const { productName, model, quantity, updatedBy } = req.body;
+    const { productName, model, quantity, capacity, rate, updatedBy } = req.body;
 
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
@@ -2362,17 +2376,28 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
     if (productIndex === -1) return res.status(404).send({ success: false, message: "Product not found" });
 
     const updateField = `challans.${challanIndex}.products.${productIndex}`;
+    const setPatch = {
+      [`${updateField}.productName`]: productName,
+      [`${updateField}.model`]: model,
+      [`${updateField}.quantity`]: Number(quantity),
+      lastUpdatedBy: updatedBy || req.user?.email || null,
+      lastUpdatedAt: new Date(),
+    };
+    // capacity + rate are recomputed client-side whenever product / model /
+    // capacity / location change, then sent here so the saved row carries an
+    // authoritative rate (instead of relying on the read-path fallback).
+    // Only set them when explicitly supplied so a quantity-only edit can't
+    // wipe an existing capacity/rate.
+    if (typeof capacity === 'string') {
+      setPatch[`${updateField}.capacity`] = capacity;
+    }
+    if (rate !== undefined && rate !== null && rate !== '') {
+      setPatch[`${updateField}.rate`] = Number(rate) || 0;
+    }
+
     const result = await deliveriesCollection.updateOne(
       { _id: new ObjectId(tripId) },
-      {
-        $set: {
-          [`${updateField}.productName`]: productName,
-          [`${updateField}.model`]: model,
-          [`${updateField}.quantity`]: Number(quantity),
-          lastUpdatedBy: updatedBy || req.user?.email || null,
-          lastUpdatedAt: new Date(),
-        }
-      }
+      { $set: setPatch }
     );
     res.send({ success: true, modifiedCount: result.modifiedCount });
   } catch (err) {
@@ -2417,7 +2442,7 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, verifyNo
     const db = await connectDB();
     const deliveriesCollection = db.collection('deliveries');
     const { tripId, challanId } = req.params;
-    const { productName, model, quantity } = req.body;
+    const { productName, model, quantity, capacity, rate } = req.body;
 
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
@@ -2431,7 +2456,9 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, verifyNo
       _id: new ObjectId().toString(),
       productName,
       model,
-      quantity: Number(quantity)
+      quantity: Number(quantity),
+      capacity: typeof capacity === 'string' ? capacity : "",
+      rate: Number(rate) || 0,
     };
 
     await deliveriesCollection.updateOne(
@@ -2839,6 +2866,160 @@ app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('ad
   } catch (err) {
     logger.error("Delete trip challan failed", err);
     res.status(500).send({ success: false, message: "Failed to delete challan" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// POST /deliveries/:tripId/add-challans
+//   Add one or more EXISTING pending challans to an ALREADY-CREATED trip.
+//   Mirrors the create-delivery flow but targets an existing trip:
+//     1. Atomic claim of the requested challans (race-safe, skips delivered)
+//     2. Embed them in the trip.challans array + bump totalChallan
+//     3. Finalize: status -> "delivered", set tripNumber, release claim
+//   On failure the claim is released and the embedded challans rolled back
+//   so the trip / challans never end up half-updated.
+//   Body: { challans: [ { challanId, customerName, zone, address, thana,
+//                         district, location, receiverNumber,
+//                         products: [{ _id?, productName, model, quantity,
+//                                      capacity?, rate? }] } ],
+//           addedBy? }
+// ─────────────────────────────────────────────────────────────────────
+app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
+  const { db } = await getConnection();
+  const deliveriesCollection = db.collection('deliveries');
+  const challanCollection = db.collection('challans');
+  const { tripId } = req.params;
+  const { challans, addedBy } = req.body;
+
+  if (!Array.isArray(challans) || challans.length === 0) {
+    return res.status(400).send({ success: false, message: "No challans provided" });
+  }
+
+  // Resolve & validate the target challan ObjectIds.
+  const challanIds = [];
+  for (const c of challans) {
+    if (!c.challanId || !ObjectId.isValid(c.challanId)) {
+      return res.status(400).send({ success: false, message: `Invalid challan id: ${c.challanId}` });
+    }
+    challanIds.push(new ObjectId(c.challanId));
+  }
+
+  const claimToken = `claim_${new ObjectId().toString()}`;
+  let claimedSuccessfully = false;
+  let embedded = false;
+  let embeddedIds = [];
+
+  try {
+    const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+    if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+    // Guard: don't add a challan that's already embedded in this trip.
+    const existingIds = new Set((trip.challans || []).map(c => String(c.challanId)));
+    const dupes = challans.filter(c => existingIds.has(String(c.challanId)));
+    if (dupes.length > 0) {
+      return res.status(409).send({
+        success: false,
+        message: `Already in this trip: ${dupes.map(c => c.customerName || c.challanId).join(", ")}`,
+      });
+    }
+
+    // ── Step 1: Atomic claim (only pending, unclaimed challans) ──
+    const claimResult = await challanCollection.updateMany(
+      { _id: { $in: challanIds }, status: { $ne: 'delivered' }, claimToken: { $exists: false } },
+      { $set: { claimToken, claimedAt: new Date() } }
+    );
+    claimedSuccessfully = true;
+
+    if (claimResult.matchedCount !== challanIds.length) {
+      // Release whatever we claimed and report the conflicting ones.
+      await challanCollection.updateMany(
+        { _id: { $in: challanIds }, claimToken },
+        { $unset: { claimToken: "", claimedAt: "" } }
+      );
+      claimedSuccessfully = false;
+      const conflictDocs = await challanCollection
+        .find({ _id: { $in: challanIds } })
+        .project({ customerName: 1, status: 1 }).toArray();
+      const alreadyDelivered = conflictDocs.filter(d => d.status === 'delivered');
+      const msg = alreadyDelivered.length > 0
+        ? `Already delivered: ${alreadyDelivered.map(c => c.customerName).join(", ")}`
+        : "Some challans could not be claimed (in another active dispatch). Try again.";
+      return res.status(409).send({ success: false, message: msg });
+    }
+
+    // ── Step 2: Build embedded snapshots & push into the trip ──
+    const embeddedChallans = challans.map(d => ({
+      challanId: String(d.challanId),
+      customerName: d.customerName,
+      zone: d.zone,
+      address: d.address,
+      thana: d.thana,
+      district: d.district,
+      location: d.location || null,
+      receiverNumber: d.receiverNumber,
+      products: (d.products || []).map(p => ({
+        _id: p._id || new ObjectId().toString(),
+        productName: p.productName,
+        model: p.model,
+        quantity: Number(p.quantity),
+        capacity: typeof p.capacity === 'string' ? p.capacity : '',
+        rate: Number(p.rate) || 0,
+      })),
+    }));
+    embeddedIds = embeddedChallans.map(c => c.challanId);
+
+    const pushResult = await deliveriesCollection.updateOne(
+      { _id: new ObjectId(tripId) },
+      {
+        $push: { challans: { $each: embeddedChallans } },
+        $inc: { totalChallan: embeddedChallans.length },
+        $set: { lastUpdatedBy: addedBy || req.user?.email || null, lastUpdatedAt: new Date() },
+      }
+    );
+    if (pushResult.modifiedCount === 0) throw new Error("Failed to embed challans into trip");
+    embedded = true;
+
+    // ── Step 3: Finalize challan status (claim -> delivered) ──
+    const finalizeResult = await challanCollection.updateMany(
+      { _id: { $in: challanIds }, claimToken },
+      {
+        $set: { status: "delivered", tripNumber: trip.tripNumber },
+        $unset: { claimToken: "", claimedAt: "" },
+      }
+    );
+    if (finalizeResult.matchedCount !== challanIds.length) {
+      throw new Error("Failed to finalize all challans");
+    }
+
+    return res.send({
+      success: true,
+      tripNumber: trip.tripNumber,
+      added: embeddedChallans.length,
+      addedChallans: embeddedChallans,
+    });
+  } catch (err) {
+    logger.error("Add challans to trip failed", err, { tripId });
+    // ── Rollback ──
+    try {
+      if (embedded && embeddedIds.length > 0) {
+        await deliveriesCollection.updateOne(
+          { _id: new ObjectId(tripId) },
+          {
+            $pull: { challans: { challanId: { $in: embeddedIds } } },
+            $inc: { totalChallan: -embeddedIds.length },
+          }
+        );
+      }
+      if (claimedSuccessfully) {
+        await challanCollection.updateMany(
+          { _id: { $in: challanIds }, claimToken },
+          { $unset: { claimToken: "", claimedAt: "" } }
+        );
+      }
+    } catch (rollbackErr) {
+      logger.error("Add-challans rollback FAILED — manual fix needed", { tripId, rollbackErr });
+    }
+    return res.status(500).send({ success: false, message: err.message || "Failed to add challans" });
   }
 });
 
