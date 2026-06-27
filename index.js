@@ -1,3 +1,5 @@
+const dns = require("dns");
+dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
 require("dotenv").config();
 
@@ -2529,20 +2531,30 @@ app.patch("/deliveries/bulk-trip-do", verifyToken, verifyRole('admin'), async (r
 
         for (const [challanId, productIds] of byChallan.entries()) {
             // ── 1. Update challans collection ──
-            // Use arrayFilters to update many products in one shot
-            operations.push(
-                challanCollection.updateOne(
-                    { _id: new ObjectId(challanId) },
-                    writeValue === null
-                        ? { $unset: { "products.$[el].tripDo": "" } }
-                        : { $set: { "products.$[el].tripDo": writeValue } },
-                    { arrayFilters: [{ "el._id": { $in: productIds } }] }
-                ).then(r => { touched += r.modifiedCount || 0; })
-            );
+            // Use arrayFilters to update many products in one shot.
+            // Return rows use a synthetic challanId like
+            // `return_<originalChallanId>_<timestamp>` which is NOT a valid
+            // Mongo ObjectId — `new ObjectId(challanId)` would throw for
+            // those and abort the whole request (see bulk-csd for the same
+            // guard). The canonical `challans` collection only ever holds
+            // real (non-return) challans, so just skip step 1 for those.
+            if (isValidObjectId(challanId)) {
+                operations.push(
+                    challanCollection.updateOne(
+                        { _id: new ObjectId(challanId) },
+                        writeValue === null
+                            ? { $unset: { "products.$[el].tripDo": "" } }
+                            : { $set: { "products.$[el].tripDo": writeValue } },
+                        { arrayFilters: [{ "el._id": { $in: productIds } }] }
+                    ).then(r => { touched += r.modifiedCount || 0; })
+                );
+            }
 
             // ── 2. Update deliveries collection (embedded copy) ──
             // Same productIds may appear inside any trip's challans[].products.
             // arrayFilters on nested arrays is supported by MongoDB.
+            // This is the source of truth for the Delivered page and works
+            // for both normal and return rows (matches by string challanId).
             operations.push(
                 deliveriesCollection.updateMany(
                     { "challans.challanId": challanId },
@@ -2555,7 +2567,7 @@ app.patch("/deliveries/bulk-trip-do", verifyToken, verifyRole('admin'), async (r
                             { "p._id": { $in: productIds } },
                         ],
                     }
-                )
+                ).then(r => { touched += r.modifiedCount || 0; })
             );
         }
 
