@@ -2222,6 +2222,12 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
         // FIX #3 — escape regex
         const search = escapeRegex(req.query.search || "");
         let query = {};
+        const isVendor = req.user?.role === 'vendor';
+        // Trip-level note is admin/manager/operator-only. Vendors must
+        // never receive it in the API response — strip it at the query
+        // level (not just hidden client-side) so a direct API call from
+        // a vendor account can't see it either.
+        const projection = isVendor ? { tripNote: 0, tripNoteUpdatedAt: 0, tripNoteUpdatedBy: 0 } : undefined;
 
         if (search) {
             // Global search — পুরো collection, limit 500
@@ -2241,14 +2247,14 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
             ];
 
             // Vendor filter — search এও apply হবে
-            if (req.user?.role === 'vendor') {
+            if (isVendor) {
                 const userCollection = db.collection('users');
                 const me = await userCollection.findOne({ email: req.user.email });
                 if (!me?.vendorName) return res.send({ success: true, data: [], pagination: { total: 0 } });
                 query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
             }
 
-            const data = await deliveriesCollection.find(query).sort({ createdAt: -1 }).limit(500).toArray();
+            const data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).limit(500).toArray();
             return res.send({ success: true, data, pagination: { total: data.length } });
         }
 
@@ -2262,14 +2268,14 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
         query.createdAt = { $gte: startDate, $lt: endDate };
 
         // FIX #15 — Vendor can only see their trips (double-check via DB)
-        if (req.user?.role === 'vendor') {
+        if (isVendor) {
             const userCollection = db.collection('users');
             const me = await userCollection.findOne({ email: req.user.email });
             if (!me?.vendorName) return res.send({ success: true, data: [], pagination: { total: 0 } });
             query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
         }
 
-        const data = await deliveriesCollection.find(query).sort({ createdAt: -1 }).toArray();
+        const data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).toArray();
         res.send({ success: true, data, pagination: { total: data.length } });
     } catch (err) {
         logger.error('Failed to fetch deliveries', err);
@@ -2446,6 +2452,74 @@ app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTo
     } catch (err) {
         logger.error("Delete trip product failed", err);
         res.status(500).send({ success: false, message: "Failed to delete product" });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+//  Hide a single row from the Delivered page ONLY.
+//
+//  "Row" on the Delivered page = one product line inside one challan
+//  inside one trip (deliveries document). The SAME `deliveries`
+//  documents are also read by the Trip Inventory page (and its trip
+//  details modal), so we must NOT physically delete anything from the
+//  document — that would remove the row from Trip Inventory too.
+//
+//  Instead this endpoint sets `hiddenFromDelivered: true` on just that
+//  one product. The Delivered page's row-builder filters out any
+//  product with this flag, so the row disappears there — while Trip
+//  Inventory (which doesn't check this flag) keeps showing it exactly
+//  as before.
+//
+//  IMPORTANT — isolation guarantee:
+//    - Never touches the `challans` collection (canonical challan
+//      records used by AllChallan / billing / status).
+//    - Never removes anything from the `deliveries` document either —
+//      it only sets a flag, so Trip Inventory / trip details are 100%
+//      unaffected.
+// ─────────────────────────────────────────────────────────────────────
+app.patch("/deliveries/:tripId/row/:challanId/:productId/hide", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
+    try {
+        const db = await connectDB();
+        const deliveriesCollection = db.collection('deliveries');
+        const { tripId, challanId, productId } = req.params;
+
+        const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+        if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+        if (!Array.isArray(trip.challans) || trip.challans.length === 0) {
+            return res.status(400).send({ success: false, message: "Trip has no challans" });
+        }
+        const challanIndex = trip.challans.findIndex(c =>
+            c.challanId === challanId || c.challanId?.toString() === challanId
+        );
+        if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
+
+        const challanProducts = Array.isArray(trip.challans[challanIndex].products) ? trip.challans[challanIndex].products : [];
+        const productIndex = challanProducts.findIndex(p => p._id === productId || p._id?.toString() === productId);
+        if (productIndex === -1) return res.status(404).send({ success: false, message: "Product row not found" });
+
+        await recordAudit({
+            db, req,
+            action: "HIDE_DELIVERED_ROW",
+            collectionName: "deliveries",
+            documentId: trip._id,
+            oldDoc: {
+                tripNumber: trip.tripNumber,
+                challanId: trip.challans[challanIndex].challanId,
+                customerName: trip.challans[challanIndex].customerName,
+                hiddenProduct: challanProducts[productIndex],
+            },
+            reason: req.body?.reason?.trim() || "",
+        });
+
+        const result = await deliveriesCollection.updateOne(
+            { _id: new ObjectId(tripId) },
+            { $set: { [`challans.${challanIndex}.products.${productIndex}.hiddenFromDelivered`]: true } }
+        );
+        res.send({ success: true, modifiedCount: result.modifiedCount });
+    } catch (err) {
+        logger.error("Hide delivered row failed", err);
+        res.status(500).send({ success: false, message: "Failed to delete row" });
     }
 });
 
@@ -3129,6 +3203,48 @@ app.patch("/deliveries/:tripId/challan/:challanId/note", verifyToken, verifyNonV
     }
 });
 
+// PATCH /deliveries/:tripId/note
+//   Trip-level note (one note per whole trip, separate from the
+//   per-challan note above). Used by the Trip Details page so an
+//   admin/manager/operator can jot down something about the trip as a
+//   whole (e.g. "driver delayed", "double-checked with customer").
+//
+//   Vendor visibility: vendors must NEVER see this note. The note is
+//   written/read only through NON_VENDOR-gated routes on the client
+//   (Trip Details page, behind the same guard as everything else in
+//   this file's /deliveries:tripId... family), and — as a second,
+//   server-side layer of protection — GET /deliveries strips this
+//   field out of the response whenever the requester's role is
+//   'vendor', so even a direct API call from a vendor account never
+//   receives the note's contents.
+app.patch("/deliveries/:tripId/note", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
+    try {
+        const db = await connectDB();
+        const deliveriesCollection = db.collection('deliveries');
+        const { tripId } = req.params;
+        const { note, updatedBy } = req.body;
+
+        const result = await deliveriesCollection.updateOne(
+            { _id: new ObjectId(tripId) },
+            {
+                $set: {
+                    tripNote: (note ?? "").toString(),
+                    tripNoteUpdatedAt: new Date(),
+                    tripNoteUpdatedBy: updatedBy || req.user?.email || null,
+                    lastUpdatedBy: updatedBy || req.user?.email || null,
+                    lastUpdatedAt: new Date(),
+                }
+            }
+        );
+        if (result.matchedCount === 0)
+            return res.status(404).send({ success: false, message: "Trip not found" });
+        res.send({ success: true });
+    } catch (err) {
+        logger.error("Trip note update failed", err);
+        res.status(500).send({ success: false, message: "Failed to update trip note" });
+    }
+});
+
 // PATCH /deliveries/:tripId/challan/:challanId/csd
 // Update the per-challan CSD field directly from the Delivered page.
 // CSD is a challan-level attribute (not per-product), so we match the
@@ -3249,6 +3365,11 @@ app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor
         const search = escapeRegex(req.query.search || "");
 
         let query = {};
+        const isVendor = req.user?.role === "vendor";
+        // Same trip documents are shared with /deliveries — the trip-level
+        // note must stay hidden from vendors here too. See the matching
+        // comment on GET /deliveries.
+        const projection = isVendor ? { tripNote: 0, tripNoteUpdatedAt: 0, tripNoteUpdatedBy: 0 } : undefined;
 
         if (search) {
             // Global search — পুরো collection, limit 500
@@ -3259,14 +3380,14 @@ app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor
                 { vehicleNumber: { $regex: search, $options: "i" } },
             ];
 
-            if (req.user?.role === "vendor") {
+            if (isVendor) {
                 const userCollection = db.collection('users');
                 const me = await userCollection.findOne({ email: req.user.email });
                 if (!me?.vendorName) return res.send({ success: true, data: [], pagination: { total: 0 } });
                 query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: "i" };
             }
 
-            const data = await deliveriesCollection.find(query).sort({ createdAt: -1 }).limit(500).toArray();
+            const data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).limit(500).toArray();
             return res.send({ success: true, data, pagination: { total: data.length } });
         }
 
@@ -3280,14 +3401,14 @@ app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor
         query.createdAt = { $gte: startDate, $lt: endDate };
 
         // FIX #6 — Fetch fresh vendorName from DB (JWT could be stale)
-        if (req.user?.role === "vendor") {
+        if (isVendor) {
             const userCollection = db.collection('users');
             const me = await userCollection.findOne({ email: req.user.email });
             if (!me?.vendorName) return res.send({ success: true, data: [], pagination: { total: 0 } });
             query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: "i" };
         }
 
-        const data = await deliveriesCollection.find(query).sort({ createdAt: -1 }).toArray();
+        const data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).toArray();
         res.send({ success: true, data, pagination: { total: data.length } });
     } catch (err) {
         logger.error("Car rent fetch failed", err);
