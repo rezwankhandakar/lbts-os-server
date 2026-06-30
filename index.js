@@ -2477,7 +2477,7 @@ app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTo
 //      it only sets a flag, so Trip Inventory / trip details are 100%
 //      unaffected.
 // ─────────────────────────────────────────────────────────────────────
-app.patch("/deliveries/:tripId/row/:challanId/:productId/hide", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
+app.patch("/deliveries/:tripId/row/:challanId/:productId/hide", verifyToken, verifyAdmin, validateObjectId('tripId'), async (req, res) => {
     try {
         const db = await connectDB();
         const deliveriesCollection = db.collection('deliveries');
