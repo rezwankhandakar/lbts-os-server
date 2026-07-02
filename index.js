@@ -1602,6 +1602,12 @@ app.patch('/challan/:id', verifyToken, verifyNonVendor, validateObjectId('id'), 
     }
 });
 
+// Remarks — admin-only note on a challan, editable from BOTH the All
+// Challan page and the Delivered page. See PATCH /challans/bulk-remarks
+// (near the other bulk-* routes) for the actual update logic — single-row
+// edits from either page just call it with a one-element `challanIds`
+// array, same pattern as Trip Do.
+
 app.put('/challan/:challanId/product/:productId', verifyToken, verifyNonVendor, validateObjectId('challanId'), validate([
     param('challanId').isMongoId().withMessage('Invalid challan ID'),
     body('productName').trim().notEmpty().withMessage('Product name required'),
@@ -1666,6 +1672,79 @@ app.delete("/challans/:challanId/product/:productId", verifyToken, verifyNonVend
     } catch (err) {
         logger.error('Failed to delete product', err);
         res.status(500).send({ success: false, message: "Failed to delete product" });
+    }
+});
+
+/**
+ * Bulk Remarks — stamps one Remarks value onto every challan supplied.
+ * Admin-only, and shared by BOTH the All Challan page and the Delivered
+ * page:
+ *   - a single-row edit on either page just calls this with a
+ *     one-element `challanIds` array (same pattern as Trip Do)
+ *   - the "Bulk Remarks" button on either page passes every distinct
+ *     challanId currently visible under the active filters
+ *
+ * Remarks are written to the `challans` collection (source of truth,
+ * shown on the All Challan page) AND mirrored onto any embedded copy in
+ * `deliveries.challans[]` (what the Delivered page actually reads), so
+ * editing from either page keeps both in sync. Empty string clears
+ * Remarks on those challans.
+ *
+ * IMPORTANT: this route MUST be registered before `/challans/:id` below —
+ * Express matches routes in registration order, and "bulk-remarks" would
+ * otherwise match the `:id` wildcard first (and get rejected by its
+ * validateObjectId check, since "bulk-remarks" isn't a Mongo ObjectId).
+ */
+app.patch("/challans/bulk-remarks", verifyToken, verifyRole('admin'), async (req, res) => {
+    try {
+        const { remarks, challanIds } = req.body || {};
+        if (!Array.isArray(challanIds) || challanIds.length === 0) {
+            return res.status(400).send({ success: false, message: "No challans supplied" });
+        }
+        const clean = String(remarks ?? "").trim();
+
+        const db = await connectDB();
+        const challanCollection = db.collection('challans');
+        const deliveriesCollection = db.collection('deliveries');
+
+        // De-duplicate ids.
+        const ids = [...new Set(challanIds.filter(Boolean).map(String))];
+
+        let touched = 0;
+        const operations = [];
+
+        for (const challanId of ids) {
+            // ── 1. challans collection (source of truth — All Challan page) ──
+            if (isValidObjectId(challanId)) {
+                operations.push(
+                    challanCollection.updateOne(
+                        { _id: new ObjectId(challanId) },
+                        {
+                            $set: {
+                                remarks: clean,
+                                remarksUpdatedBy: req.user?.email || 'unknown',
+                                remarksUpdatedAt: new Date(),
+                            },
+                        }
+                    ).then(r => { touched += r.matchedCount || 0; })
+                );
+            }
+
+            // ── 2. deliveries collection (embedded copy — Delivered page reads this) ──
+            operations.push(
+                deliveriesCollection.updateMany(
+                    { "challans.challanId": challanId },
+                    { $set: { "challans.$[c].remarks": clean, "challans.$[c].remarksUpdatedAt": new Date() } },
+                    { arrayFilters: [{ "c.challanId": challanId }] }
+                ).catch(() => { /* non-fatal — challans collection is still updated above */ })
+            );
+        }
+
+        await Promise.all(operations);
+        res.send({ success: true, touched, remarks: clean });
+    } catch (err) {
+        logger.error("Bulk Remarks update failed", err);
+        res.status(500).send({ success: false, message: "Failed to update remarks" });
     }
 });
 
@@ -2129,6 +2208,10 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
                 // page's rate-matcher fallback can resolve rates for products
                 // whose capacity/rate weren't yet saved on the original challan.
                 location: d.location || null,
+                // Remarks — admin-only note set on the AllChallan page.
+                // Snapshotted here so the Delivered page can show it
+                // without needing to look the original challan back up.
+                remarks: typeof d.remarks === 'string' ? d.remarks : '',
                 receiverNumber: d.receiverNumber,
                 products: (d.products || []).map(p => ({
                     _id: p._id || new ObjectId().toString(),
@@ -2716,6 +2799,12 @@ app.patch("/deliveries/bulk-csd", verifyToken, verifyRole('admin'), async (req, 
     }
 });
 
+// NOTE: PATCH /challans/bulk-remarks lives further up the file, directly
+// above `/challans/:id`, so Express matches the specific "bulk-remarks"
+// path before the `:id` wildcard route can shadow it (Express matches
+// routes in registration order, and "bulk-remarks" would otherwise get
+// swallowed by `:id`'s validateObjectId check → 400).
+
 // ─────────────────────────────────────────────────────────────────────
 //  Split a product row by quantity
 //  ─────────────────────────────────────────────────────────────────
@@ -3054,6 +3143,9 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
             thana: d.thana,
             district: d.district,
             location: d.location || null,
+            // Remarks — same snapshot behaviour as the main create-delivery
+            // route above.
+            remarks: typeof d.remarks === 'string' ? d.remarks : '',
             receiverNumber: d.receiverNumber,
             products: (d.products || []).map(p => ({
                 _id: p._id || new ObjectId().toString(),
