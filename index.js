@@ -2113,16 +2113,35 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
     let insertedDeliveryId = null;
     let claimedSuccessfully = false;
 
+    // ── Return-pending lookup ────────────────────────────────────────
+    // Challans created from a Trip-Details "Product Return" carry
+    // status "return-pending". When those are dispatched again they
+    // should finalize to "re-delivered" (not "delivered") so the
+    // All-Challan / Delivered pages can distinguish a first delivery
+    // from a re-delivery of a returned item.
+    let returnPendingIdSet = new Set();
+    try {
+        const preStatusDocs = await challanCollection
+            .find({ _id: { $in: challanIds } })
+            .project({ status: 1 })
+            .toArray();
+        returnPendingIdSet = new Set(
+            preStatusDocs.filter(d => d.status === 'return-pending').map(d => d._id.toString())
+        );
+    } catch (err) {
+        logger.error('Pre-claim status lookup failed', err);
+    }
+
     try {
         // ── Step 1: Atomic claim ───────────────────────────────────────
         // শুধু সেই challan গুলোই claim হবে যেগুলো:
         //   - exist করে (matched in $in)
-        //   - status delivered না (অথবা status field-ই নেই)
+        //   - status delivered/re-delivered না (অথবা status field-ই নেই)
         //   - কোনো claim token attached না (অন্য concurrent request পেন্ডিং না)
         const claimResult = await challanCollection.updateMany(
             {
                 _id: { $in: challanIds },
-                status: { $ne: 'delivered' },
+                status: { $nin: ['delivered', 're-delivered'] },
                 claimToken: { $exists: false },
             },
             {
@@ -2149,8 +2168,8 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
 
             const foundIds = new Set(conflictDocs.map(d => d._id.toString()));
             const missing = challanIds.filter(id => !foundIds.has(id.toString()));
-            const alreadyDelivered = conflictDocs.filter(d => d.status === 'delivered');
-            const lockedByOther = conflictDocs.filter(d => d.status !== 'delivered'); // claim token দখলে
+            const alreadyDelivered = conflictDocs.filter(d => d.status === 'delivered' || d.status === 're-delivered');
+            const lockedByOther = conflictDocs.filter(d => d.status !== 'delivered' && d.status !== 're-delivered'); // claim token দখলে
 
             if (alreadyDelivered.length > 0) {
                 return res.status(400).send({
@@ -2213,6 +2232,10 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
                 // without needing to look the original challan back up.
                 remarks: typeof d.remarks === 'string' ? d.remarks : '',
                 receiverNumber: d.receiverNumber,
+                // Marks this snapshot as a re-delivery of a previously
+                // returned item — the Delivered page shows "Re-Delivered"
+                // in the Type column for these rows.
+                isReDelivery: returnPendingIdSet.has(String(d.challanId)),
                 products: (d.products || []).map(p => ({
                     _id: p._id || new ObjectId().toString(),
                     productName: p.productName,
@@ -2231,17 +2254,36 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
         const result = await deliveriesCollection.insertOne(tripDocument);
         insertedDeliveryId = result.insertedId;
 
-        // ── Step 5: Finalize challan status (claim → delivered) ───────
-        // claimToken filter দিয়ে নিশ্চিত করি যে শুধু আমাদের claim করা docs-ই update হবে
-        const finalizeResult = await challanCollection.updateMany(
-            { _id: { $in: challanIds }, claimToken },
-            {
-                $set: { status: "delivered", tripNumber },
-                $unset: { claimToken: "", claimedAt: "" },
-            }
-        );
+        // ── Step 5: Finalize challan status (claim → delivered / re-delivered) ───────
+        // claimToken filter দিয়ে নিশ্চিত করি যে শুধু আমাদের claim করা docs-ই update হবে.
+        // Challans that were "return-pending" finalize to "re-delivered";
+        // everything else finalizes to the normal "delivered".
+        const returnPendingChallanIds = challanIds.filter(id => returnPendingIdSet.has(id.toString()));
+        const regularChallanIds = challanIds.filter(id => !returnPendingIdSet.has(id.toString()));
 
-        if (finalizeResult.matchedCount !== challanIds.length) {
+        let finalizedCount = 0;
+        if (regularChallanIds.length > 0) {
+            const r = await challanCollection.updateMany(
+                { _id: { $in: regularChallanIds }, claimToken },
+                {
+                    $set: { status: "delivered", tripNumber },
+                    $unset: { claimToken: "", claimedAt: "" },
+                }
+            );
+            finalizedCount += r.matchedCount;
+        }
+        if (returnPendingChallanIds.length > 0) {
+            const r = await challanCollection.updateMany(
+                { _id: { $in: returnPendingChallanIds }, claimToken },
+                {
+                    $set: { status: "re-delivered", tripNumber },
+                    $unset: { claimToken: "", claimedAt: "" },
+                }
+            );
+            finalizedCount += r.matchedCount;
+        }
+
+        if (finalizedCount !== challanIds.length) {
             // সাধারণত এটা hit হবে না (claim আমাদের লক ছিল), কিন্তু safety
             throw new Error('Failed to finalize all challans');
         }
@@ -2275,12 +2317,24 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
                         // (অন্য কারো success-কে ভাঙব না)
                     }
                 );
-                // status revert আলাদা — শুধু আমাদের trip-এর জন্য
+                // status revert আলাদা — শুধু আমাদের trip-এর জন্য।
+                // যেসব challan return-pending ছিল, সেগুলো আবার
+                // return-pending-এ ফিরবে; বাকিগুলো plain pending-এ।
                 if (tripNumber) {
-                    await challanCollection.updateMany(
-                        { _id: { $in: challanIds }, tripNumber },
-                        { $set: { status: "pending" }, $unset: { tripNumber: "" } }
-                    );
+                    const revertReturnPendingIds = challanIds.filter(id => returnPendingIdSet.has(id.toString()));
+                    const revertRegularIds = challanIds.filter(id => !returnPendingIdSet.has(id.toString()));
+                    if (revertRegularIds.length > 0) {
+                        await challanCollection.updateMany(
+                            { _id: { $in: revertRegularIds }, tripNumber },
+                            { $set: { status: "pending" }, $unset: { tripNumber: "" } }
+                        );
+                    }
+                    if (revertReturnPendingIds.length > 0) {
+                        await challanCollection.updateMany(
+                            { _id: { $in: revertReturnPendingIds }, tripNumber },
+                            { $set: { status: "return-pending" }, $unset: { tripNumber: "" } }
+                        );
+                    }
                 }
                 logger.info('Delivery rollback successful', { tripNumber });
             } catch (rollbackErr) {
@@ -2977,6 +3031,84 @@ app.post("/deliveries/split-product", verifyToken, verifyRole('admin'), async (r
 });
 
 // FIX #25 — When removing challan from trip, restore original challan's status
+// ─────────────────────────────────────────────────────────────────────
+// DELETE /deliveries/:tripId
+//   Delete an ENTIRE trip from Trip Inventory. Unlike the single-challan
+//   delete below, this removes the whole trip document and undoes
+//   everything it did:
+//     - Every real (non-return) embedded challan reverts to its
+//       pre-dispatch status — "pending" normally, or "return-pending"
+//       if it was a re-delivery of a previously returned item — and
+//       loses its tripNumber so it's available again on All-Challan /
+//       Create-Delivery.
+//     - Any "Product Return" recorded on this trip created a fresh
+//       "return-pending" challan for re-delivery; if that item hasn't
+//       been re-delivered yet, it's removed too (deleting the trip
+//       undoes the return along with everything else on it).
+//   Admin/Manager only.
+// ─────────────────────────────────────────────────────────────────────
+app.delete("/deliveries/:tripId", verifyToken, verifyRole('admin', 'manager'), validateObjectId('tripId'), async (req, res) => {
+    const { db } = await getConnection();
+    const deliveriesCollection = db.collection('deliveries');
+    const challanCollection = db.collection('challans');
+    const { tripId } = req.params;
+
+    try {
+        const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+        if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+        await recordAudit({
+            db, req,
+            action: "DELETE_TRIP",
+            collectionName: "deliveries",
+            documentId: trip._id,
+            oldDoc: trip,
+            reason: req.body?.reason?.trim() || "",
+        });
+
+        const challans = Array.isArray(trip.challans) ? trip.challans : [];
+
+        // Revert real (non-return) challans to their pre-dispatch status.
+        const regularIds = [];
+        const reDeliveryIds = [];
+        challans.forEach(c => {
+            if (c.isReturn) return;
+            if (!ObjectId.isValid(c.challanId)) return;
+            (c.isReDelivery ? reDeliveryIds : regularIds).push(new ObjectId(c.challanId));
+        });
+
+        if (regularIds.length > 0) {
+            await challanCollection.updateMany(
+                { _id: { $in: regularIds } },
+                { $set: { status: 'pending' }, $unset: { tripNumber: '' } }
+            );
+        }
+        if (reDeliveryIds.length > 0) {
+            await challanCollection.updateMany(
+                { _id: { $in: reDeliveryIds } },
+                { $set: { status: 'return-pending' }, $unset: { tripNumber: '' } }
+            );
+        }
+
+        // Undo any Product Return recorded on this trip — remove the
+        // re-deliverable challan it created, unless it's already been
+        // re-delivered (status would no longer be "return-pending").
+        if (trip.tripNumber) {
+            await challanCollection.deleteMany({
+                returnedFromTripNumber: trip.tripNumber,
+                status: 'return-pending',
+            });
+        }
+
+        await deliveriesCollection.deleteOne({ _id: new ObjectId(tripId) });
+
+        res.send({ success: true, tripNumber: trip.tripNumber });
+    } catch (err) {
+        logger.error("Delete trip failed", err);
+        res.status(500).send({ success: false, message: "Failed to delete trip" });
+    }
+});
+
 app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('admin', 'manager'), validateObjectId('tripId'), async (req, res) => {
     const { db } = await getConnection();
     const deliveriesCollection = db.collection('deliveries');
@@ -3372,6 +3504,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/csd", verifyToken, verifyNonVe
 app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
     const { client, db } = await getConnection();
     const deliveriesCollection = db.collection('deliveries');
+    const challanCollection = db.collection('challans');
     const { tripId } = req.params;
     const {
         originalChallanId, customerName, zone, address,
@@ -3404,11 +3537,48 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, val
         challanReturnStatus: null,
     };
 
+    // ── Re-deliverable challan ───────────────────────────────────────
+    // A returned product needs to go back out for re-delivery. We create
+    // a brand-new document in the `challans` collection (status
+    // "return-pending") that behaves exactly like a normal pending
+    // challan on All-Challan / Create-Delivery, except it carries a
+    // "Return-Pending" status badge and, once dispatched again, is
+    // finalized to "re-delivered" instead of "delivered" (see POST
+    // /deliveries). capacity/rate are copied from the original challan's
+    // matching product snapshot (embedded on the trip) so Rate/Amount
+    // stay consistent when this item is re-delivered.
+    const originalChallanSnapshot = (trip.challans || []).find(c => c.challanId === originalChallanId);
+    const newPendingChallan = {
+        customerName, zone, address, thana, district, receiverNumber,
+        location: originalChallanSnapshot?.location || null,
+        remarks: originalChallanSnapshot?.remarks || "",
+        products: (returnedProducts || []).map(p => {
+            const orig = originalChallanSnapshot?.products?.find(op => op._id === p._id) || {};
+            return {
+                _id: new ObjectId().toString(),
+                productName: p.productName,
+                model: p.model,
+                quantity: Number(p.returnQty || p.quantity),
+                capacity: typeof orig.capacity === 'string' ? orig.capacity : '',
+                rate: Number(orig.rate) || 0,
+            };
+        }),
+        status: "return-pending",
+        returnedFromTripNumber: trip.tripNumber || null,
+        returnedFromChallanId: originalChallanId,
+        createdAt: new Date(),
+        createdBy: req.user?.email || 'unknown',
+    };
+
     // ── FIX: ২টো update একই delivery document-এ ($_id same) ────────
     // আগে: transaction দিয়ে ২টা আলাদা updateOne (M0-তে fail হতো)
     // এখন: bulkWrite দিয়ে একটা atomic operation — transaction-ই দরকার নেই
     //   bulkWrite ordered=true → প্রথমটা fail হলে দ্বিতীয়টা চলে না
     try {
+        // নতুন re-deliverable challan সবার আগে insert করি — এটা fail করলে
+        // trip document touch-ই করব না।
+        await challanCollection.insertOne(newPendingChallan);
+
         await deliveriesCollection.bulkWrite([
             // ১ম: return challan যোগ করো
             {
@@ -3437,7 +3607,7 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, val
             }
         ], { ordered: true }); // ordered=true → atomic sequence
 
-        res.send({ success: true, returnChallan });
+        res.send({ success: true, returnChallan, newPendingChallan });
     } catch (err) {
         logger.error("Return challan add failed", err);
         res.status(500).send({ success: false, message: "Failed to add return challan" });
@@ -4344,6 +4514,58 @@ app.post("/walton-bills", verifyToken, verifyRole('admin', 'manager', 'ceo'), va
     } catch (err) {
         logger.error('Walton bill create failed', err);
         res.status(500).send({ success: false, message: 'Failed to create bill' });
+    }
+});
+
+// PATCH /walton-bills/:id — edit an existing bill's items/note.
+// Recomputes totalAmount + status (payments/totalPaid are untouched —
+// use the /payment endpoints for those). Model/pics/amount validated
+// the same way as bill creation.
+app.patch("/walton-bills/:id", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId('id'), validate([
+    body('items').isArray({ min: 1 }).withMessage('At least one item required'),
+    body('items.*.model').trim().notEmpty().withMessage('Item model required'),
+    body('items.*.pics').optional().isInt({ min: 0 }).withMessage('Pics must be non-negative integer'),
+    body('items.*.amount').isFloat({ min: 0 }).withMessage('Amount must be non-negative'),
+]), async (req, res) => {
+    try {
+        const db = await connectDB();
+        const col = db.collection('walton-bills');
+        const bill = await col.findOne({ _id: new ObjectId(req.params.id) });
+        if (!bill) return res.status(404).send({ success: false, message: 'Bill not found' });
+
+        const { items, note } = req.body;
+        const sanitizedItems = items.map(i => ({
+            model: String(i.model || '').trim(),
+            pics: Number(i.pics) || 0,
+            amount: Number(i.amount) || 0,
+        }));
+        const totalAmount = sanitizedItems.reduce((s, i) => s + i.amount, 0);
+
+        // Re-derive status against the (possibly changed) total — payments
+        // themselves aren't touched by an item edit.
+        const currentTotalPaid = Number(bill.totalPaid) || 0;
+        const newStatus = totalAmount > 0 && currentTotalPaid >= totalAmount
+            ? 'paid'
+            : currentTotalPaid > 0 ? 'partial' : 'unpaid';
+
+        await col.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            {
+                $set: {
+                    items: sanitizedItems,
+                    totalAmount,
+                    note: note ?? bill.note ?? '',
+                    status: newStatus,
+                    updatedAt: new Date(),
+                    lastEditedBy: req.user?.email || 'unknown',
+                }
+            }
+        );
+        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+        res.send({ success: true, data: updated });
+    } catch (err) {
+        logger.error('Walton bill edit failed', err);
+        res.status(500).send({ success: false, message: 'Failed to edit bill' });
     }
 });
 
