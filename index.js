@@ -1994,7 +1994,7 @@ app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
             const db = await connectDB();
             const vendorsCollection = db.collection('vendors');
             const { vendorId, vehicleId } = req.params;
-            const { vehicleModel, vehicleNumber, driverName, driverPhone, driverImg } = req.body;
+            const { vehicleModel, vehicleNumber, driverName, driverPhone, driverImg, vehicleImg } = req.body;
 
             // Partial update — undefined field পাঠালে overwrite হবে না
             const updateFields = {};
@@ -2003,6 +2003,7 @@ app.put("/vehicles/:vendorId/:vehicleId", verifyToken, verifyNonVendor,
             if (driverName !== undefined) updateFields["vehicles.$[elem].driverName"] = driverName;
             if (driverPhone !== undefined) updateFields["vehicles.$[elem].driverPhone"] = driverPhone;
             if (driverImg !== undefined) updateFields["vehicles.$[elem].driverImg"] = driverImg;
+            if (vehicleImg !== undefined) updateFields["vehicles.$[elem].vehicleImg"] = vehicleImg;
 
             if (Object.keys(updateFields).length === 0) {
                 return res.status(400).send({ success: false, message: "No fields to update" });
@@ -2366,6 +2367,33 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
         // a vendor account can't see it either.
         const projection = isVendor ? { tripNote: 0, tripNoteUpdatedAt: 0, tripNoteUpdatedBy: 0 } : undefined;
 
+        // Attach vehicleImg (from vendor vehicles, matched by vehicleNumber) so
+        // list pages can show a vehicle photo. Trip docs store only the number.
+        const attachVehicleImg = async (rows) => {
+            try {
+                const numbers = [...new Set(rows.map(r => (r.vehicleNumber || "").trim().toLowerCase()).filter(Boolean))];
+                if (numbers.length === 0) return rows;
+                const vendorsCol = db.collection('vendors');
+                const vendorDocs = await vendorsCol.find(
+                    {}, { projection: { "vehicles.vehicleNumber": 1, "vehicles.vehicleImg": 1 } }
+                ).toArray();
+                const imgMap = new Map();
+                for (const vd of vendorDocs) {
+                    for (const v of (vd.vehicles || [])) {
+                        const key = (v.vehicleNumber || "").trim().toLowerCase();
+                        if (key && v.vehicleImg && !imgMap.has(key)) imgMap.set(key, v.vehicleImg);
+                    }
+                }
+                return rows.map(r => {
+                    const key = (r.vehicleNumber || "").trim().toLowerCase();
+                    return imgMap.has(key) ? { ...r, vehicleImg: imgMap.get(key) } : r;
+                });
+            } catch (e) {
+                logger.error("attachVehicleImg (deliveries) failed", e);
+                return rows;
+            }
+        };
+
         if (search) {
             // Global search — পুরো collection, limit 500
             query.$or = [
@@ -2391,7 +2419,8 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
                 query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
             }
 
-            const data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).limit(500).toArray();
+            let data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).limit(500).toArray();
+            data = await attachVehicleImg(data);
             return res.send({ success: true, data, pagination: { total: data.length } });
         }
 
@@ -2412,7 +2441,8 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
             query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: 'i' };
         }
 
-        const data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).toArray();
+        let data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).toArray();
+        data = await attachVehicleImg(data);
         res.send({ success: true, data, pagination: { total: data.length } });
     } catch (err) {
         logger.error('Failed to fetch deliveries', err);
@@ -3109,7 +3139,7 @@ app.delete("/deliveries/:tripId", verifyToken, verifyRole('admin', 'manager'), v
     }
 });
 
-app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('admin', 'manager'), validateObjectId('tripId'), async (req, res) => {
+app.delete("/deliveries/:tripId/challan/:challanId", verifyToken, verifyRole('admin', 'manager', 'operator'), validateObjectId('tripId'), async (req, res) => {
     const { db } = await getConnection();
     const deliveriesCollection = db.collection('deliveries');
     const challanCollection = db.collection('challans');
@@ -3626,6 +3656,34 @@ app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor
         let year = parseInt(req.query.year);
         const search = escapeRegex(req.query.search || "");
 
+        // Build a vehicleNumber → vehicleImg map from vendor vehicles so the
+        // Car-Rent list can show a vehicle photo (trip docs only store the
+        // vehicleNumber, not the image). Case-insensitive keys.
+        const attachVehicleImg = async (rows) => {
+            try {
+                const numbers = [...new Set(rows.map(r => (r.vehicleNumber || "").trim().toLowerCase()).filter(Boolean))];
+                if (numbers.length === 0) return rows;
+                const vendorsCol = db.collection('vendors');
+                const vendorDocs = await vendorsCol.find(
+                    {}, { projection: { "vehicles.vehicleNumber": 1, "vehicles.vehicleImg": 1 } }
+                ).toArray();
+                const imgMap = new Map();
+                for (const vd of vendorDocs) {
+                    for (const v of (vd.vehicles || [])) {
+                        const key = (v.vehicleNumber || "").trim().toLowerCase();
+                        if (key && v.vehicleImg && !imgMap.has(key)) imgMap.set(key, v.vehicleImg);
+                    }
+                }
+                return rows.map(r => {
+                    const key = (r.vehicleNumber || "").trim().toLowerCase();
+                    return imgMap.has(key) ? { ...r, vehicleImg: imgMap.get(key) } : r;
+                });
+            } catch (e) {
+                logger.error("attachVehicleImg failed", e);
+                return rows;
+            }
+        };
+
         let query = {};
         const isVendor = req.user?.role === "vendor";
         // Same trip documents are shared with /deliveries — the trip-level
@@ -3649,7 +3707,8 @@ app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor
                 query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: "i" };
             }
 
-            const data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).limit(500).toArray();
+            let data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).limit(500).toArray();
+            data = await attachVehicleImg(data);
             return res.send({ success: true, data, pagination: { total: data.length } });
         }
 
@@ -3670,7 +3729,8 @@ app.get("/car-rents", verifyToken, verifyRole('admin', 'manager', 'ceo', 'vendor
             query.vendorName = { $regex: `^${escapeRegex(me.vendorName)}$`, $options: "i" };
         }
 
-        const data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).toArray();
+        let data = await deliveriesCollection.find(query, { projection }).sort({ createdAt: -1 }).toArray();
+        data = await attachVehicleImg(data);
         res.send({ success: true, data, pagination: { total: data.length } });
     } catch (err) {
         logger.error("Car rent fetch failed", err);
@@ -4231,24 +4291,62 @@ app.get('/accounts/bulk-export', verifyToken, verifyRole('admin', 'manager', 'ce
     }
 });
 
+// ── Advance PAY (supports partial payment) ──
+// Body: { payAmount }  -> increments paidAmount, clamped to [0, amount].
+//   status is derived from paidAmount vs amount: unpaid / partial / paid.
+// Backward-compatible: { status: "paid" | "unpaid" } still works
+//   ("paid" => paidAmount = amount, "unpaid" => paidAmount = 0).
 app.patch("/accounts/:id/status", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId("id"), async (req, res) => {
     try {
         const db = await connectDB();
         const col = db.collection("accounts");
-        const { status } = req.body;
-        if (!["paid", "unpaid"].includes(status))
-            return res.status(400).send({ success: false, message: "Invalid status" });
-        const result = await col.updateOne(
-            { _id: new ObjectId(req.params.id), type: "manual_advance" },
-            { $set: { status, statusUpdatedAt: new Date(), statusUpdatedBy: req.user?.email || null } }
-        );
-        if (result.matchedCount === 0)
+
+        const adv = await col.findOne({ _id: new ObjectId(req.params.id), type: "manual_advance" });
+        if (!adv)
             return res.status(404).send({ success: false, message: "Advance not found" });
-        const updated = await col.findOne({ _id: new ObjectId(req.params.id) });
+
+        const total   = Number(adv.amount) || 0;
+        const curPaid = Number(adv.paidAmount) || 0;
+
+        let newPaid;
+
+        if (req.body.payAmount !== undefined) {
+            // Partial / additional payment — increment by payAmount.
+            const pay = Number(req.body.payAmount);
+            if (Number.isNaN(pay) || pay <= 0)
+                return res.status(400).send({ success: false, message: "Pay amount must be a positive number" });
+            newPaid = curPaid + pay;
+        } else if (req.body.setPaidAmount !== undefined) {
+            // Set absolute paid amount (used for edits / corrections).
+            const set = Number(req.body.setPaidAmount);
+            if (Number.isNaN(set) || set < 0)
+                return res.status(400).send({ success: false, message: "Paid amount must be a non-negative number" });
+            newPaid = set;
+        } else if (req.body.status !== undefined) {
+            // Legacy toggle — full paid or reset to unpaid.
+            if (!["paid", "unpaid"].includes(req.body.status))
+                return res.status(400).send({ success: false, message: "Invalid status" });
+            newPaid = req.body.status === "paid" ? total : 0;
+        } else {
+            return res.status(400).send({ success: false, message: "payAmount, setPaidAmount or status required" });
+        }
+
+        // Clamp to [0, total]
+        newPaid = Math.max(0, Math.min(total, newPaid));
+
+        const status = newPaid >= total && total > 0 ? "paid"
+            : newPaid > 0 ? "partial"
+            : "unpaid";
+
+        await col.updateOne(
+            { _id: adv._id },
+            { $set: { paidAmount: newPaid, status, statusUpdatedAt: new Date(), statusUpdatedBy: req.user?.email || null } }
+        );
+        const updated = await col.findOne({ _id: adv._id });
         res.send({ success: true, data: updated });
     } catch (err) {
-        logger.error("Advance status update failed", err);
-        res.status(500).send({ success: false, message: "Failed to update status" });
+        logger.error("Advance payment update failed", err);
+        res.status(500).send({ success: false, message: "Failed to update advance" });
     }
 });
 
