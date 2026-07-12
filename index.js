@@ -27,14 +27,18 @@ const axios = require('axios');
 const helmet = require('helmet');
 
 // ═══════════════════════════════════════════════════════════════════
-// FIX #3 — Regex escape helper (prevents ReDoS + regex injection)
+// FIX #49 — Pure helpers extracted to utils/helpers.js (testable, de-monolith step 1)
+// FIX #50 — Server-side authoritative rate resolver (services/rateResolver.js)
+// FIX #51 — Mongo-backed serverless-safe rate limiter (utils/mongoRateLimit.js)
 // ═══════════════════════════════════════════════════════════════════
-function escapeRegex(str) {
-    if (typeof str !== 'string') return '';
-    // Limit length to prevent abuse (search should be under 100 chars)
-    const safe = str.slice(0, 100);
-    return safe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+const {
+    escapeRegex,
+    isRealImage,
+    getDhakaCurrentMonthYear,
+    getDhakaMonthRange,
+} = require('./utils/helpers');
+const { resolveAuthoritativeRate } = require('./services/rateResolver');
+const { createMongoRateLimit } = require('./utils/mongoRateLimit');
 
 const multerUpload = multer({
     storage: multer.memoryStorage(),
@@ -49,21 +53,7 @@ const multerUpload = multer({
     }
 });
 
-// FIX #30 — Magic-byte image validation
-// Multer mimetype check is client-reported and spoofable. These
-// magic bytes are the actual file format signature at byte 0.
-function isRealImage(buffer) {
-    if (!buffer || buffer.length < 12) return false;
-    // JPEG: FF D8 FF
-    if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'jpeg';
-    // PNG: 89 50 4E 47 0D 0A 1A 0A
-    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47 &&
-        buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A) return 'png';
-    // WEBP: RIFF....WEBP (bytes 0-3 'RIFF', bytes 8-11 'WEBP')
-    if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
-        buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) return 'webp';
-    return false;
-}
+// FIX #30 — Magic-byte image validation → moved to utils/helpers.js (isRealImage)
 
 const { body, param, query, validationResult } = require('express-validator');
 
@@ -133,27 +123,7 @@ async function recordAudit({ db, action, collectionName, documentId, oldDoc, new
 // `new Date(year, month-1, 1)` creates in server TZ — wrong for queries.
 // These helpers produce UTC Date objects that correspond exactly to
 // Dhaka month boundaries.
-const DHAKA_OFFSET_HOURS = 6;
-const DHAKA_OFFSET_MS = DHAKA_OFFSET_HOURS * 60 * 60 * 1000;
-
-/** Get current month/year as interpreted in Asia/Dhaka timezone. */
-function getDhakaCurrentMonthYear() {
-    const dhakaNow = new Date(Date.now() + DHAKA_OFFSET_MS);
-    return {
-        month: dhakaNow.getUTCMonth() + 1,
-        year: dhakaNow.getUTCFullYear(),
-    };
-}
-
-/** Dhaka-local month start/end, returned as UTC Date for MongoDB queries. */
-function getDhakaMonthRange(year, month) {
-    // Dhaka's Jan 1 00:00 = UTC Dec 31 18:00 (previous day)
-    // So Dhaka start of month in UTC = Date.UTC(y, m-1, 1) - 6 hours
-    const startDate = new Date(Date.UTC(year, month - 1, 1) - DHAKA_OFFSET_MS);
-    // Dhaka end of month in UTC = Date.UTC(y, m, 1) - 6 hours
-    const endDate = new Date(Date.UTC(year, month, 1) - DHAKA_OFFSET_MS);
-    return { startDate, endDate };
-}
+// Helpers moved to utils/helpers.js (getDhakaCurrentMonthYear, getDhakaMonthRange)
 
 // ── Rate Limiters ──────────────────────────────────────────────────
 // FIX #20 — Three-tier rate limiting:
@@ -195,6 +165,31 @@ const aiLimiter = rateLimit({
     legacyHeaders: false,
     validate: { xForwardedForHeader: false },
     message: { success: false, message: 'Too many AI requests, please wait a moment' }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// FIX #51 — Serverless-safe rate limiters (MongoDB-backed)
+// ═══════════════════════════════════════════════════════════════════
+// express-rate-limit-এর in-memory counter Vercel-এর প্রতিটা instance-এ
+// আলাদা — cold start-এ শূন্য হয়ে যায়, তাই আসল সুরক্ষা দেয় না।
+// এই limiter-গুলো counter MongoDB-তে রাখে (সব instance shared)।
+// In-memory limiter গুলো first-line হিসেবে থেকেই যাচ্ছে (সস্তা,
+// একই instance-এ burst আটকায়)। connectDB নিচে function declaration
+// হিসেবে আছে (hoisted) এবং getDb শুধু request time-এ call হয় — safe।
+const mongoAuthLimiter = createMongoRateLimit({
+    getDb: (...a) => connectDB(...a), logger, name: 'auth',
+    windowMs: 15 * 60 * 1000, max: 20,
+    message: 'Too many login attempts, please try again after 15 minutes',
+});
+const mongoUploadLimiter = createMongoRateLimit({
+    getDb: (...a) => connectDB(...a), logger, name: 'upload',
+    windowMs: 15 * 60 * 1000, max: 30,
+    message: 'Too many upload requests, please slow down',
+});
+const mongoAiLimiter = createMongoRateLimit({
+    getDb: (...a) => connectDB(...a), logger, name: 'ai',
+    windowMs: 60 * 1000, max: 15,
+    message: 'Too many AI requests, please wait a moment',
 });
 
 // ── CORS ───────────────────────────────────────────────────────────
@@ -242,7 +237,10 @@ if (missingEnv.length > 0) {
 }
 
 // ── MongoDB Connection (Serverless-Optimized) ──────────────────────
-const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority&appName=LBTS-OS`;
+// FIX #52 — Cluster host আর hardcoded নয়; DB_HOST env দিয়ে override করা যায়
+// (fallback পুরনো মান — deploy-এ কিছু ভাঙবে না)
+const DB_HOST = process.env.DB_HOST || 'cluster0.fu1n5ti.mongodb.net';
+const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@${DB_HOST}/?retryWrites=true&w=majority&appName=LBTS-OS`;
 
 let cachedConnection = null;
 let connectionPromise = null;
@@ -346,7 +344,49 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 // ═══════════════════════════════════════════════════════════════════
 // Auth Middlewares
 // ═══════════════════════════════════════════════════════════════════
-function verifyToken(req, res, next) {
+// ═══════════════════════════════════════════════════════════════════
+// FIX #53 — Fresh role/status check (stale-JWT hole বন্ধ)
+// ═══════════════════════════════════════════════════════════════════
+// সমস্যা: role + status JWT-এর ভেতরে বেক করা ছিল আর token ৭ দিন বৈধ
+// থাকত। কাউকে block/demote করলেও সে পুরনো token দিয়ে ৭ দিন পর্যন্ত
+// আগের role-এ কাজ চালাতে পারত।
+//
+// সমাধান: প্রতিটা authenticated request-এ DB থেকে টাটকা role/status
+// পড়া হয় (৬০ সেকেন্ডের in-memory cache সহ, যাতে প্রতি request-এ DB
+// hit না লাগে)। ফলে block/role-change সর্বোচ্চ ৬০ সেকেন্ডের মধ্যে
+// কার্যকর হয়। DB সাময়িক down থাকলে token-এর claim-এ fallback করি
+// (fail-open) — না হলে DB hiccup-এ সবাই logout হয়ে যেত।
+const FRESH_USER_TTL_MS = 60 * 1000;
+const freshUserCache = new Map(); // email -> { claims, at }
+
+function bustFreshUserCache(email) {
+    if (email) freshUserCache.delete(email);
+}
+
+async function getFreshUserClaims(email) {
+    const hit = freshUserCache.get(email);
+    if (hit && Date.now() - hit.at < FRESH_USER_TTL_MS) return hit.claims;
+
+    const db = await connectDB();
+    const doc = await db.collection('users').findOne(
+        { email },
+        { projection: { role: 1, status: 1, vendorName: 1 } }
+    );
+    // doc === null মানে user DB থেকে delete হয়ে গেছে → claims: null
+    const claims = doc
+        ? {
+            role: doc.role || 'user',
+            status: doc.status || 'pending',
+            ...(doc.vendorName ? { vendorName: doc.vendorName } : {}),
+        }
+        : null;
+
+    freshUserCache.set(email, { claims, at: Date.now() });
+    if (freshUserCache.size > 5000) freshUserCache.clear(); // memory guard
+    return claims;
+}
+
+async function verifyToken(req, res, next) {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -355,13 +395,34 @@ function verifyToken(req, res, next) {
 
     const token = authHeader.split(' ')[1];
 
+    let decoded;
     try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = decoded;
-        next();
+        decoded = jwt.verify(token, JWT_SECRET);
     } catch (err) {
         return res.status(401).send({ success: false, message: 'Unauthorized: Invalid or expired token' });
     }
+
+    req.user = decoded;
+
+    // ── FIX #53: DB থেকে টাটকা role/status overlay ──
+    try {
+        const fresh = await getFreshUserClaims(decoded.email);
+        if (fresh === null) {
+            // User deleted from DB — token আর বৈধ নয়
+            return res.status(401).send({ success: false, message: 'Unauthorized: Account no longer exists' });
+        }
+        req.user = {
+            ...decoded,
+            role: fresh.role,
+            status: fresh.status,
+            ...(fresh.vendorName ? { vendorName: fresh.vendorName } : {}),
+        };
+    } catch (err) {
+        // DB hiccup — token claims-এ fallback, কিন্তু log রাখি
+        logger.warn('Fresh role check failed — falling back to token claims', { error: err?.message });
+    }
+
+    next();
 }
 
 // FIX #5 — Require approved status (blocks pending/rejected users)
@@ -404,6 +465,42 @@ function verifyNonVendor(req, res, next) {
         return res.status(403).send({ success: false, message: 'Forbidden: Vendor role not allowed here' });
     }
     next();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FIX #54 — Stale claimToken auto-release
+// ═══════════════════════════════════════════════════════════════════
+// সমস্যা: delivery create / trip-add flow-তে challan-এ claimToken বসিয়ে
+// কাজ করা হয়। Vercel function যদি claim-এর পরে কিন্তু finalize/rollback-এর
+// আগে timeout/crash করে, claimToken চিরকাল লেগে থাকত — ওই challan দিয়ে
+// আর কখনো delivery করা যেত না (বারবার 409 CONCURRENT_DELIVERY)।
+//
+// সমাধান: প্রতিবার claim করার আগে, target challan-গুলোর মধ্যে যেগুলোর
+// claim ২ মিনিটের বেশি পুরনো (Vercel maxDuration 60s — তাই ২ মিনিট মানেই
+// ওই request মরে গেছে), সেগুলোর claim ছেড়ে দেওয়া হয়। ফলে user আবার
+// চেষ্টা করলেই আটকে থাকা challan নিজে নিজে মুক্ত হয়ে যায়।
+const STALE_CLAIM_MS = 2 * 60 * 1000;
+
+async function releaseStaleClaims(challanCollection, challanIds) {
+    try {
+        const cutoff = new Date(Date.now() - STALE_CLAIM_MS);
+        const r = await challanCollection.updateMany(
+            {
+                _id: { $in: challanIds },
+                claimToken: { $exists: true },
+                claimedAt: { $lt: cutoff },
+            },
+            { $unset: { claimToken: "", claimedAt: "" } }
+        );
+        if (r.modifiedCount > 0) {
+            logger.warn('Released stale challan claims (crashed request cleanup)', {
+                count: r.modifiedCount,
+            });
+        }
+    } catch (err) {
+        // Cleanup fail করলে মূল flow আটকাবে না — পরের চেষ্টায় আবার হবে
+        logger.error('Stale claim release failed', err);
+    }
 }
 
 // ── ObjectId Validation Helper ─────────────────────────────────────
@@ -451,7 +548,7 @@ app.get('/warmup', async (req, res) => {
 });
 
 // ── Image Upload ───────────────────────────────────────────────────
-app.post('/upload-image', uploadLimiter, multerUpload.single('image'), async (req, res) => {
+app.post('/upload-image', uploadLimiter, mongoUploadLimiter, multerUpload.single('image'), async (req, res) => {
     try {
         // Firebase ID token অথবা App JWT — দুটোই accept করো
         const authHeader = req.headers.authorization;
@@ -521,7 +618,15 @@ app.post('/upload-image', uploadLimiter, multerUpload.single('image'), async (re
 // ═══════════════════════════════════════════════════════════════════
 // /jwt — Issue Application JWT after Firebase ID Token Verification
 // ═══════════════════════════════════════════════════════════════════
-app.post('/jwt', authLimiter, async (req, res) => {
+// ── FIX #50c — Rate table read endpoint ────────────────────────────
+// Client চাইলে এখান থেকে সর্বশেষ rate table নিতে পারে — ভবিষ্যতে
+// client-এর static copy সরিয়ে এটাকেই single source of truth করা যাবে।
+app.get('/rate-table', verifyToken, verifyApproved, (req, res) => {
+    const { WITH_MODEL_DATA, WITHOUT_MODEL_DATA } = require('./constants/rateTable');
+    res.send({ success: true, withModel: WITH_MODEL_DATA, withoutModel: WITHOUT_MODEL_DATA });
+});
+
+app.post('/jwt', authLimiter, mongoAuthLimiter, async (req, res) => {
     try {
         let idToken = req.body?.idToken;
         if (!idToken) {
@@ -606,7 +711,10 @@ app.post('/jwt', authLimiter, async (req, res) => {
             ...(user?.vendorName ? { vendorName: user.vendorName } : {}),
         };
 
-        const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+        // FIX #53b — 7d → 1d. Client-এর useAxiosSecure 401 পেলে Firebase দিয়ে
+        // নিজেই silently নতুন JWT নেয়, তাই user-এর কিছু টের পাওয়ার কথা না।
+        // ছোট মেয়াদ = চুরি হওয়া token-এর ক্ষতির window-ও ছোট।
+        const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '1d' });
 
         res.send({
             success: true,
@@ -656,7 +764,7 @@ app.get('/verify-token', verifyToken, (req, res) => {
 //  - Email comes from the verified token, never from request body
 //  - Account must be < 5 minutes old (prevents abusing this endpoint
 //    after a user deletes their own DB record to bypass email verification)
-app.post('/register', authLimiter, async (req, res) => {
+app.post('/register', authLimiter, mongoAuthLimiter, async (req, res) => {
     try {
         const { idToken, displayName, photoURL } = req.body;
 
@@ -818,6 +926,11 @@ app.patch('/users/role/:id', verifyToken, verifyAdmin, validateObjectId('id'), v
             { _id: new ObjectId(req.params.id) },
             { $set: setDoc }
         );
+        // FIX #53 — role change এই instance-এ সাথে সাথে কার্যকর হোক
+        const changedUser = await userCollection.findOne(
+            { _id: new ObjectId(req.params.id) }, { projection: { email: 1 } }
+        );
+        bustFreshUserCache(changedUser?.email);
         res.send(result);
     } catch (err) {
         logger.error('Failed to update role', err);
@@ -837,6 +950,11 @@ app.patch('/users/status/:id', verifyToken, verifyAdmin, validateObjectId('id'),
             { _id: new ObjectId(req.params.id) },
             { $set: { status } }
         );
+        // FIX #53 — block/approve এই instance-এ সাথে সাথে কার্যকর হোক
+        const changedUser = await userCollection.findOne(
+            { _id: new ObjectId(req.params.id) }, { projection: { email: 1 } }
+        );
+        bustFreshUserCache(changedUser?.email);
         res.send(result);
     } catch (err) {
         logger.error('Failed to update status', err);
@@ -1228,18 +1346,29 @@ app.post("/challan", verifyToken, verifyNonVendor, validate([
         const challanCollection = db.collection('challans');
         const challan = req.body;
         if (challan.products && Array.isArray(challan.products)) {
-            challan.products = challan.products.map(p => ({
-                _id: new ObjectId().toString(),
-                productName: p.productName,
-                model: p.model,
-                quantity: Number(p.quantity),
-                // Persist capacity + rate as resolved by the client.  Defaults
-                // keep older rows / partial submissions intact:
-                //   capacity: "" when not yet known (e.g. Gas Stove pre-pick)
-                //   rate:     0  when not yet known
-                capacity: typeof p.capacity === 'string' ? p.capacity : '',
-                rate: Number(p.rate) || 0,
-            }));
+            challan.products = challan.products.map(p => {
+                // FIX #50 — rate আর client থেকে বিশ্বাস করা হয় না; server
+                // নিজের rate table থেকে resolve করে। Client-এর মান শুধু
+                // cross-check + tamper-log-এর জন্য।
+                const guarded = resolveAuthoritativeRate({
+                    productName: p.productName,
+                    model: p.model,
+                    location: challan.location || null,
+                    capacity: p.capacity,
+                    clientRate: p.rate,
+                    logger,
+                    context: 'POST /challan',
+                    userEmail: req.user?.email,
+                });
+                return {
+                    _id: new ObjectId().toString(),
+                    productName: p.productName,
+                    model: p.model,
+                    quantity: Number(p.quantity),
+                    capacity: guarded.capacity,
+                    rate: guarded.rate,
+                };
+            });
         }
         challan.createdAt = new Date();
         challan.createdBy = req.user?.email || 'unknown';
@@ -1300,7 +1429,7 @@ const {
 //  (2) & (3) /parse-address endpoint — full new version
 // ─────────────────────────────────────────────────────────────────
 
-app.post('/parse-address', verifyToken, verifyNonVendor, aiLimiter, async (req, res) => {
+app.post('/parse-address', verifyToken, verifyNonVendor, aiLimiter, mongoAiLimiter, async (req, res) => {
     try {
         const { address } = req.body;
 
@@ -1634,11 +1763,23 @@ app.put('/challan/:challanId/product/:productId', verifyToken, verifyNonVendor, 
             "products.$.model": model,
             "products.$.quantity": Number(quantity),
         };
-        if (typeof capacity === 'string') {
-            setPatch["products.$.capacity"] = capacity;
-        }
-        if (rate !== undefined && rate !== null && rate !== '') {
-            setPatch["products.$.rate"] = Number(rate) || 0;
+        if (typeof capacity === 'string' || (rate !== undefined && rate !== null && rate !== '')) {
+            // FIX #50 — client capacity/rate পাঠালে server নিজে resolve করে
+            // save করে; challan doc থেকে location পড়ি।
+            const parentChallan = await challanCollection.findOne(
+                { _id: new ObjectId(challanId) }, { projection: { location: 1 } }
+            );
+            const guarded = resolveAuthoritativeRate({
+                productName, model,
+                location: parentChallan?.location || null,
+                capacity,
+                clientRate: rate,
+                logger,
+                context: 'PUT /challan/:id/product/:pid',
+                userEmail: req.user?.email,
+            });
+            setPatch["products.$.capacity"] = guarded.capacity;
+            setPatch["products.$.rate"] = guarded.rate;
         }
 
         const result = await challanCollection.updateOne(
@@ -1767,17 +1908,36 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
         const challanCollection = db.collection('challans');
         const { customerName, receiverNumber, zone, address, thana, district, products, updatedBy } = req.body;
 
-        // Sanitize products — preserve _id, coerce quantity to number,
-        // also pass through capacity + rate when supplied.
+        // FIX #50 — rate server-side resolve করার জন্য challan-এর location লাগে
+        const existingChallan = Array.isArray(products)
+            ? await challanCollection.findOne(
+                { _id: new ObjectId(req.params.id) }, { projection: { location: 1 } }
+            )
+            : null;
+
+        // Sanitize products — preserve _id, coerce quantity to number.
+        // capacity + rate এখন server নিজে resolve করে (client মান শুধু cross-check)।
         const sanitizedProducts = Array.isArray(products)
-            ? products.map(p => ({
-                _id: p._id || new ObjectId().toString(),
-                productName: String(p.productName || '').trim(),
-                model: String(p.model || '').trim(),
-                quantity: Number(p.quantity) || 0,
-                capacity: typeof p.capacity === 'string' ? p.capacity : '',
-                rate: Number(p.rate) || 0,
-            }))
+            ? products.map(p => {
+                const guarded = resolveAuthoritativeRate({
+                    productName: String(p.productName || '').trim(),
+                    model: String(p.model || '').trim(),
+                    location: existingChallan?.location || null,
+                    capacity: p.capacity,
+                    clientRate: p.rate,
+                    logger,
+                    context: 'PATCH /challans/:id',
+                    userEmail: req.user?.email,
+                });
+                return {
+                    _id: p._id || new ObjectId().toString(),
+                    productName: String(p.productName || '').trim(),
+                    model: String(p.model || '').trim(),
+                    quantity: Number(p.quantity) || 0,
+                    capacity: guarded.capacity,
+                    rate: guarded.rate,
+                };
+            })
             : undefined;
 
         const setDoc = {
@@ -2134,6 +2294,9 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
     }
 
     try {
+        // ── FIX #54: আগের কোনো crashed request-এর আটকে থাকা claim ছাড়ো ──
+        await releaseStaleClaims(challanCollection, challanIds);
+
         // ── Step 1: Atomic claim ───────────────────────────────────────
         // শুধু সেই challan গুলোই claim হবে যেগুলো:
         //   - exist করে (matched in $in)
@@ -2237,18 +2400,28 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
                 // returned item — the Delivered page shows "Re-Delivered"
                 // in the Type column for these rows.
                 isReDelivery: returnPendingIdSet.has(String(d.challanId)),
-                products: (d.products || []).map(p => ({
-                    _id: p._id || new ObjectId().toString(),
-                    productName: p.productName,
-                    model: p.model,
-                    quantity: Number(p.quantity),
-                    // Persist rate-table fields onto the delivery snapshot.
-                    // Defaults keep older flows safe:
-                    //   capacity: "" when not yet known
-                    //   rate:     0  when not yet known
-                    capacity: typeof p.capacity === 'string' ? p.capacity : '',
-                    rate: Number(p.rate) || 0,
-                }))
+                products: (d.products || []).map(p => {
+                    // FIX #50 — snapshot-এ rate server-resolved মান পায়;
+                    // client মান শুধু cross-check।
+                    const guarded = resolveAuthoritativeRate({
+                        productName: p.productName,
+                        model: p.model,
+                        location: d.location || null,
+                        capacity: p.capacity,
+                        clientRate: p.rate,
+                        logger,
+                        context: 'POST /deliveries',
+                        userEmail: req.user?.email,
+                    });
+                    return {
+                        _id: p._id || new ObjectId().toString(),
+                        productName: p.productName,
+                        model: p.model,
+                        quantity: Number(p.quantity),
+                        capacity: guarded.capacity,
+                        rate: guarded.rate,
+                    };
+                })
             })),
             createdAt: new Date()
         };
@@ -2343,10 +2516,10 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
             }
         }
 
+        // FIX #55 — internal error details client-কে leak করা হয় না
         return res.status(500).send({
             success: false,
-            message: "Delivery failed",
-            error: err.message,
+            message: "Delivery failed. Please try again.",
         });
     }
 });
@@ -2568,16 +2741,21 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
             lastUpdatedBy: updatedBy || req.user?.email || null,
             lastUpdatedAt: new Date(),
         };
-        // capacity + rate are recomputed client-side whenever product / model /
-        // capacity / location change, then sent here so the saved row carries an
-        // authoritative rate (instead of relying on the read-path fallback).
-        // Only set them when explicitly supplied so a quantity-only edit can't
-        // wipe an existing capacity/rate.
-        if (typeof capacity === 'string') {
-            setPatch[`${updateField}.capacity`] = capacity;
-        }
-        if (rate !== undefined && rate !== null && rate !== '') {
-            setPatch[`${updateField}.rate`] = Number(rate) || 0;
+        // FIX #50 — capacity/rate client পাঠালে server নিজে rate table থেকে
+        // resolve করে save করে; location আসে trip-এর challan snapshot থেকে।
+        // Quantity-only edit-এ (capacity/rate না পাঠালে) আগের মান অক্ষত থাকে।
+        if (typeof capacity === 'string' || (rate !== undefined && rate !== null && rate !== '')) {
+            const guarded = resolveAuthoritativeRate({
+                productName, model,
+                location: trip.challans[challanIndex]?.location || null,
+                capacity,
+                clientRate: rate,
+                logger,
+                context: 'PATCH /deliveries/:t/challan/:c/product/:p',
+                userEmail: req.user?.email,
+            });
+            setPatch[`${updateField}.capacity`] = guarded.capacity;
+            setPatch[`${updateField}.rate`] = guarded.rate;
         }
 
         const result = await deliveriesCollection.updateOne(
@@ -2705,13 +2883,23 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, verifyNo
         );
         if (challanIndex === -1) return res.status(404).send({ success: false, message: "Challan not found" });
 
+        // FIX #50 — rate server-resolved; location parent challan snapshot থেকে
+        const guarded = resolveAuthoritativeRate({
+            productName, model,
+            location: trip.challans[challanIndex]?.location || null,
+            capacity,
+            clientRate: rate,
+            logger,
+            context: 'POST /deliveries/:t/challan/:c/product',
+            userEmail: req.user?.email,
+        });
         const newProduct = {
             _id: new ObjectId().toString(),
             productName,
             model,
             quantity: Number(quantity),
-            capacity: typeof capacity === 'string' ? capacity : "",
-            rate: Number(rate) || 0,
+            capacity: guarded.capacity,
+            rate: guarded.rate,
         };
 
         await deliveriesCollection.updateOne(
@@ -3272,6 +3460,9 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
             });
         }
 
+        // ── FIX #54: আগের কোনো crashed request-এর আটকে থাকা claim ছাড়ো ──
+        await releaseStaleClaims(challanCollection, challanIds);
+
         // ── Step 1: Atomic claim (only pending, unclaimed challans) ──
         const claimResult = await challanCollection.updateMany(
             { _id: { $in: challanIds }, status: { $ne: 'delivered' }, claimToken: { $exists: false } },
@@ -3309,14 +3500,27 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
             // route above.
             remarks: typeof d.remarks === 'string' ? d.remarks : '',
             receiverNumber: d.receiverNumber,
-            products: (d.products || []).map(p => ({
-                _id: p._id || new ObjectId().toString(),
-                productName: p.productName,
-                model: p.model,
-                quantity: Number(p.quantity),
-                capacity: typeof p.capacity === 'string' ? p.capacity : '',
-                rate: Number(p.rate) || 0,
-            })),
+            products: (d.products || []).map(p => {
+                // FIX #50 — server-resolved rate, client মান শুধু cross-check
+                const guarded = resolveAuthoritativeRate({
+                    productName: p.productName,
+                    model: p.model,
+                    location: d.location || null,
+                    capacity: p.capacity,
+                    clientRate: p.rate,
+                    logger,
+                    context: 'POST /deliveries/:tripId/challans (embed)',
+                    userEmail: req.user?.email,
+                });
+                return {
+                    _id: p._id || new ObjectId().toString(),
+                    productName: p.productName,
+                    model: p.model,
+                    quantity: Number(p.quantity),
+                    capacity: guarded.capacity,
+                    rate: guarded.rate,
+                };
+            }),
         }));
         embeddedIds = embeddedChallans.map(c => c.challanId);
 
@@ -3403,31 +3607,240 @@ app.patch("/deliveries/:tripId/trip-info", verifyToken, verifyNonVendor, validat
     }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// FIX #58 — Product Return: edit sync + removal
+// ═══════════════════════════════════════════════════════════════════
+// Return issue করলে ৩ জায়গায় data বসে:
+//   (a) original challan snapshot-এ returnedProducts mark
+//   (b) trip-এর ভেতরে একটা embedded return card (isReturn: true)
+//   (c) challans collection-এ একটা re-deliverable "return-pending" challan
+//
+// আগের সমস্যা:
+//   - Edit করলে শুধু (a) আপডেট হতো — (b) আর (c) পুরনো quantity নিয়ে
+//     বসে থাকত (out of sync)
+//   - Return remove করার কোনো পথই ছিল না (client-ও আটকাতো, route-ও নেই)
+//
+// এখন: PATCH তিনটাই sync করে; DELETE (নিচে) তিনটাই undo করে।
 app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
     try {
         const db = await connectDB();
         const deliveriesCollection = db.collection('deliveries');
+        const challanCollection = db.collection('challans');
         const { tripId, challanId } = req.params;
         const { returnedProducts, returnNote, updatedBy } = req.body;
 
-        const result = await deliveriesCollection.updateOne(
-            { _id: new ObjectId(tripId), "challans.challanId": challanId },
+        // খালি list মানে return তুলে নেওয়া — সেটার জন্য DELETE route
+        if (!Array.isArray(returnedProducts) || returnedProducts.length === 0) {
+            return res.status(400).send({
+                success: false,
+                message: "No return items — use Remove Return to clear this return",
+            });
+        }
+
+        const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+        if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+        const originalSnapshot = (trip.challans || []).find(
+            c => c.challanId === challanId && !c.isReturn
+        );
+        if (!originalSnapshot) {
+            return res.status(404).send({ success: false, message: "Challan not found" });
+        }
+
+        // (b) embedded return card-এর products — quantity = returnQty
+        const returnCardProducts = returnedProducts.map(p => ({
+            _id: p._id || new ObjectId().toString(),
+            productName: p.productName,
+            model: p.model,
+            quantity: Number(p.returnQty || p.quantity) || 0,
+        }));
+
+        await deliveriesCollection.bulkWrite([
+            // (a) original snapshot-এ return mark আপডেট
+            {
+                updateOne: {
+                    filter: { _id: new ObjectId(tripId), "challans.challanId": challanId },
+                    update: {
+                        $set: {
+                            "challans.$.returnedProducts": returnedProducts,
+                            "challans.$.returnNote": returnNote || "",
+                            "challans.$.returnedAt": new Date(),
+                            lastUpdatedBy: updatedBy || req.user?.email || null,
+                            lastUpdatedAt: new Date(),
+                        }
+                    }
+                }
+            },
+            // (b) embedded return card sync (থাকলে)
+            {
+                updateOne: {
+                    filter: { _id: new ObjectId(tripId) },
+                    update: {
+                        $set: {
+                            "challans.$[ret].products": returnCardProducts,
+                            "challans.$[ret].returnNote": returnNote || "",
+                        }
+                    },
+                    arrayFilters: [{ "ret.isReturn": true, "ret.originalChallanId": challanId }],
+                }
+            }
+        ], { ordered: true });
+
+        // (c) re-deliverable pending challan sync — শুধু যদি এখনো
+        // dispatch না হয়ে থাকে (status return-pending, কেউ claim করেনি)।
+        // capacity/rate original snapshot থেকে copy (creation-এর মতোই)।
+        const pendingProducts = returnedProducts.map(p => {
+            const orig = originalSnapshot.products?.find(op => op._id === p._id) || {};
+            return {
+                _id: new ObjectId().toString(),
+                productName: p.productName,
+                model: p.model,
+                quantity: Number(p.returnQty || p.quantity) || 0,
+                capacity: typeof orig.capacity === 'string' ? orig.capacity : '',
+                rate: Number(orig.rate) || 0,
+            };
+        });
+        const pendingSync = await challanCollection.updateOne(
+            {
+                returnedFromChallanId: challanId,
+                returnedFromTripNumber: trip.tripNumber || null,
+                status: 'return-pending',
+                claimToken: { $exists: false },
+            },
             {
                 $set: {
-                    "challans.$.returnedProducts": returnedProducts,
-                    "challans.$.returnNote": returnNote || "",
-                    "challans.$.returnedAt": new Date(),
+                    products: pendingProducts,
                     lastUpdatedBy: updatedBy || req.user?.email || null,
                     lastUpdatedAt: new Date(),
                 }
             }
         );
-        if (result.matchedCount === 0)
-            return res.status(404).send({ success: false, message: "Challan not found" });
-        res.send({ success: true });
+
+        res.send({
+            success: true,
+            pendingChallanSynced: pendingSync.matchedCount > 0,
+        });
     } catch (err) {
         logger.error("Return update failed", err);
         res.status(500).send({ success: false, message: "Failed to update return" });
+    }
+});
+
+// ── FIX #58b — Return সম্পূর্ণ remove ──────────────────────────────
+// তিন জায়গার data-ই undo হয়। Idempotent — আগেরবার আধাআধি fail করলে
+// আবার call করলেই বাকিটা পরিষ্কার হয়ে যায়।
+// Safety: return item ইতিমধ্যে re-deliver হয়ে গেলে remove block হয়।
+app.delete("/deliveries/:tripId/challan/:challanId/return", verifyToken, verifyNonVendor, validateObjectId('tripId'), async (req, res) => {
+    try {
+        const db = await connectDB();
+        const deliveriesCollection = db.collection('deliveries');
+        const challanCollection = db.collection('challans');
+        const { tripId, challanId } = req.params;
+
+        const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
+        if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+        const originalSnapshot = (trip.challans || []).find(
+            c => c.challanId === challanId && !c.isReturn
+        );
+        if (!originalSnapshot) {
+            return res.status(404).send({ success: false, message: "Challan not found" });
+        }
+
+        // (c) pending re-deliverable challan-গুলোর অবস্থা check
+        const pendingFilter = {
+            returnedFromChallanId: challanId,
+            returnedFromTripNumber: trip.tripNumber || null,
+        };
+        const pendings = await challanCollection.find(pendingFilter).toArray();
+
+        const dispatched = pendings.find(p => p.status !== 'return-pending');
+        if (dispatched) {
+            return res.status(409).send({
+                success: false,
+                message: "Return item already re-delivered in another trip — remove that delivery first",
+            });
+        }
+        const beingClaimed = pendings.find(p => p.claimToken);
+        if (beingClaimed) {
+            return res.status(409).send({
+                success: false,
+                message: "Return item is being dispatched right now — try again in a moment",
+            });
+        }
+
+        const embeddedReturns = (trip.challans || []).filter(
+            c => c.isReturn && c.originalChallanId === challanId
+        );
+
+        // Step 1: trip cleanup — (b) return card সরাও + (a) mark unset
+        await deliveriesCollection.bulkWrite([
+            {
+                updateOne: {
+                    filter: { _id: new ObjectId(tripId) },
+                    update: {
+                        $pull: { challans: { isReturn: true, originalChallanId: challanId } },
+                        ...(embeddedReturns.length > 0
+                            ? { $inc: { totalChallan: -embeddedReturns.length } }
+                            : {}),
+                    }
+                }
+            },
+            {
+                updateOne: {
+                    filter: { _id: new ObjectId(tripId), "challans.challanId": challanId },
+                    update: {
+                        $unset: {
+                            "challans.$.returnedProducts": "",
+                            "challans.$.returnNote": "",
+                            "challans.$.returnedAt": "",
+                        },
+                        $set: {
+                            lastUpdatedBy: req.user?.email || null,
+                            lastUpdatedAt: new Date(),
+                        }
+                    }
+                }
+            }
+        ], { ordered: true });
+
+        // Step 2: (c) pending challan delete (এখনো pending + unclaimed গুলোই)
+        let removedPending = 0;
+        if (pendings.length > 0) {
+            const del = await challanCollection.deleteMany({
+                ...pendingFilter,
+                status: 'return-pending',
+                claimToken: { $exists: false },
+            });
+            removedPending = del.deletedCount || 0;
+        }
+
+        // Audit trail — কে কখন return মুছল
+        await recordAudit({
+            db,
+            action: 'REMOVE_RETURN',
+            collectionName: 'deliveries',
+            documentId: tripId,
+            oldDoc: {
+                challanId,
+                customerName: originalSnapshot.customerName || '',
+                returnedProducts: originalSnapshot.returnedProducts || [],
+                returnNote: originalSnapshot.returnNote || '',
+                removedReturnCards: embeddedReturns.length,
+                removedPendingChallans: removedPending,
+            },
+            reason: 'Product return removed from Trip Details',
+            req,
+        });
+
+        res.send({
+            success: true,
+            removedReturnCards: embeddedReturns.length,
+            removedPendingChallans: removedPending,
+        });
+    } catch (err) {
+        logger.error("Return remove failed", err);
+        res.status(500).send({ success: false, message: "Failed to remove return" });
     }
 });
 
@@ -4399,13 +4812,24 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
         }
 
         // Try cache first
+        // FIX #61 — ?fresh=1 দিলে cache bypass (Dashboard-এর ↻ Refresh button)।
+        // টাটকা হিসাব হয়ে আবার cache-এ বসে যায় — পরের ৫ মিনিট বাকিরা
+        // সেই টাটকা data-ই পাবে।
         const cacheKey = `${month}-${year}`;
-        const cached = getCachedDashboard(cacheKey);
-        if (cached) {
-            return res.send({ success: true, data: cached, cached: true });
+        const wantFresh = req.query.fresh === '1' || req.query.fresh === 'true';
+        if (!wantFresh) {
+            const cached = getCachedDashboard(cacheKey);
+            if (cached) {
+                return res.send({ success: true, data: cached, cached: true });
+            }
         }
 
         const { startDate: monthStart, endDate: monthEnd } = getDhakaMonthRange(year, month);
+
+        // FIX #59 — গত মাসের সাথে তুলনার জন্য previous month range
+        const prevMonth = month === 1 ? 12 : month - 1;
+        const prevYear = month === 1 ? year - 1 : year;
+        const { startDate: prevStart, endDate: prevEnd } = getDhakaMonthRange(prevYear, prevMonth);
 
         // ── FIX: ১৫টি query একসাথে → M0-তে timeout হওয়ার সম্ভাবনা ছিল
         // এখন ৩টি batch-এ ভাগ — প্রতি batch-এ ৫টি করে query
@@ -4421,6 +4845,7 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
             tripMonthCount, tripTotalCount, activeTripCount,
             vendorCount, userCount,
             accountsTxs, carRentThisMonth,
+            prevChallanCount, prevTripCount, challanMonthCount, prevGpCount,
         ] = await Promise.all([
             db.collection('gate-pass').countDocuments({ tripMonth: month, tripYear: year }),
             db.collection('gate-pass').countDocuments(),
@@ -4441,11 +4866,17 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
                 { createdAt: { $gte: monthStart, $lt: monthEnd } },
                 { projection: { advance: 1 } }
             ).toArray(),
+
+            // FIX #59 — trend: গত মাসের challan + trip সংখ্যা
+            db.collection('challans').countDocuments({ createdAt: { $gte: prevStart, $lt: prevEnd } }),
+            db.collection('deliveries').countDocuments({ createdAt: { $gte: prevStart, $lt: prevEnd } }),
+            db.collection('challans').countDocuments({ createdAt: { $gte: monthStart, $lt: monthEnd } }),
+            db.collection('gate-pass').countDocuments({ tripMonth: prevMonth, tripYear: prevYear }),
         ]);
 
         // ── Batch 2: Medium aggregations (challan status, zone, gatepass) ──
         const [
-            challanStatusAgg, topDeliveryPoints, gpUnitAgg,
+            challanStatusAgg, topDeliveryPoints, gpFacetAgg, vendorFacetAgg,
         ] = await Promise.all([
             db.collection('challans').aggregate([
                 { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
@@ -4461,38 +4892,108 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
                 { $match: { tripMonth: month, tripYear: year } },
                 { $unwind: '$products' },
                 {
-                    $group: {
-                        _id: { $toUpper: '$unit' },
-                        qty: { $sum: '$products.quantity' },
-                        passCount: { $addToSet: '$_id' },
+                    $facet: {
+                        units: [
+                            {
+                                $group: {
+                                    _id: { $toUpper: '$unit' },
+                                    qty: { $sum: '$products.quantity' },
+                                    passCount: { $addToSet: '$_id' },
+                                }
+                            },
+                            { $addFields: { passCount: { $size: '$passCount' } } },
+                            { $sort: { qty: -1 } },
+                            { $limit: 10 },
+                        ],
+                        // FIX #60 — এ মাসে মোট কত PCS ঢুকল (warehouse header-এর জন্য)
+                        totals: [
+                            { $group: { _id: null, qty: { $sum: '$products.quantity' } } },
+                        ],
                     }
                 },
-                { $addFields: { passCount: { $size: '$passCount' } } },
-                { $sort: { qty: -1 } },
-                { $limit: 10 },
+            ]).toArray(),
+            // FIX #59 — এ মাসের top vendor + মোট challan-সংখ্যা এক pass-এ
+            db.collection('deliveries').aggregate([
+                { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
+                {
+                    $facet: {
+                        topVendors: [
+                            { $group: { _id: '$vendorName', trips: { $sum: 1 }, challans: { $sum: { $ifNull: ['$totalChallan', 0] } } } },
+                            { $sort: { trips: -1 } },
+                            { $limit: 5 },
+                        ],
+                        totals: [
+                            { $group: { _id: null, challans: { $sum: { $ifNull: ['$totalChallan', 0] } } } },
+                        ],
+                    }
+                },
             ]).toArray(),
         ]);
 
-        // ── Batch 3: Heavy double-unwind aggregations ───────────────────
+        // ── Batch 3: Heavy unwind aggregations — $facet দিয়ে এক pass-এ
+        //    top products + মোট PCS + (deliveries-তে) return পরিসংখ্যান ──
         const [
-            challanProductAgg, deliveryProductAgg,
+            challanFacetArr, deliveryFacetArr,
         ] = await Promise.all([
             db.collection('challans').aggregate([
                 { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
                 { $unwind: '$products' },
-                { $group: { _id: '$products.productName', qty: { $sum: '$products.quantity' } } },
-                { $sort: { qty: -1 } },
-                { $limit: 8 },
+                {
+                    $facet: {
+                        top: [
+                            { $group: { _id: '$products.productName', qty: { $sum: '$products.quantity' } } },
+                            { $sort: { qty: -1 } },
+                            { $limit: 8 },
+                        ],
+                        totals: [
+                            { $group: { _id: null, qty: { $sum: '$products.quantity' } } },
+                        ],
+                    }
+                },
             ]).toArray(),
             db.collection('deliveries').aggregate([
                 { $match: { createdAt: { $gte: monthStart, $lt: monthEnd } } },
                 { $unwind: '$challans' },
-                { $unwind: '$challans.products' },
-                { $group: { _id: '$challans.products.productName', qty: { $sum: '$challans.products.quantity' } } },
-                { $sort: { qty: -1 } },
-                { $limit: 8 },
+                {
+                    $facet: {
+                        // Return card বাদ দিয়ে আসল delivered products
+                        top: [
+                            { $match: { 'challans.isReturn': { $ne: true } } },
+                            { $unwind: '$challans.products' },
+                            { $group: { _id: '$challans.products.productName', qty: { $sum: '$challans.products.quantity' } } },
+                            { $sort: { qty: -1 } },
+                            { $limit: 8 },
+                        ],
+                        totals: [
+                            { $match: { 'challans.isReturn': { $ne: true } } },
+                            { $unwind: '$challans.products' },
+                            { $group: { _id: null, qty: { $sum: '$challans.products.quantity' } } },
+                        ],
+                        // FIX #59 — এ মাসে কয়টা return হলো, কত PCS
+                        returns: [
+                            { $match: { 'challans.isReturn': true } },
+                            { $unwind: '$challans.products' },
+                            {
+                                $group: {
+                                    _id: null,
+                                    qty: { $sum: '$challans.products.quantity' },
+                                    cards: { $addToSet: '$challans.challanId' },
+                                }
+                            },
+                            { $addFields: { cards: { $size: '$cards' } } },
+                        ],
+                    }
+                },
             ]).toArray(),
         ]);
+
+        const challanFacet = challanFacetArr[0] || {};
+        const deliveryFacet = deliveryFacetArr[0] || {};
+        const vendorFacet = vendorFacetAgg[0] || {};
+        const gpFacet = gpFacetAgg[0] || {};
+        const gpUnitAgg = gpFacet.units || [];
+        const challanProductAgg = challanFacet.top || [];
+        const deliveryProductAgg = deliveryFacet.top || [];
 
         const csMap = {};
         challanStatusAgg.forEach(s => { csMap[s._id || 'pending'] = s.count; });
@@ -4512,20 +5013,33 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
             gatePass: {
                 totalCount: gpTotalCount,
                 monthCount: gpMonthCount,
+                prevMonthCount: prevGpCount,               // FIX #60 — trend
+                totalPcs: gpFacet.totals?.[0]?.qty || 0,   // FIX #60 — মোট PCS
                 unitBreakdown: gpUnitAgg,
             },
             challan: {
                 totalCount: challanTotalCount,
-                monthTotal: challanStatusAgg.reduce((s, x) => s + x.count, 0),
-                delivered: csMap['delivered'] || 0,
+                monthTotal: challanMonthCount,
+                // Status breakdown — সব status আলাদা করে (আগে re-delivered /
+                // return-pending বাদ পড়ত, হিসাব মিলত না)
+                delivered: (csMap['delivered'] || 0) + (csMap['re-delivered'] || 0),
                 pending: csMap['pending'] || 0,
+                returnPending: csMap['return-pending'] || 0,
                 returned: csMap['returned'] || 0,
+                prevMonthTotal: prevChallanCount,          // FIX #59 — trend
+                totalPcs: challanFacet.totals?.[0]?.qty || 0,
                 productBreakdown: challanProductAgg,
             },
             trip: {
                 totalCount: tripTotalCount,
                 monthCount: tripMonthCount,
                 activeCount: activeTripCount,
+                prevMonthCount: prevTripCount,             // FIX #59 — trend
+                monthChallans: vendorFacet.totals?.[0]?.challans || 0,
+                deliveredPcs: deliveryFacet.totals?.[0]?.qty || 0,
+                returnCards: deliveryFacet.returns?.[0]?.cards || 0,
+                returnPcs: deliveryFacet.returns?.[0]?.qty || 0,
+                topVendors: vendorFacet.topVendors || [],
                 productBreakdown: deliveryProductAgg,
             },
             vendor: { totalCount: vendorCount },

@@ -28,10 +28,17 @@
  * ═══════════════════════════════════════════════════════════════════
  */
 
+// ── DNS Fix ────────────────────────────────────────────────────────
+// index.js-এর মতোই: কিছু ISP-র DNS MongoDB-র SRV lookup resolve করতে
+// পারে না (querySrv ECONNREFUSED)। Google DNS দিয়ে bypass করা হয়।
+const dns = require("dns");
+dns.setServers(["8.8.8.8", "8.8.4.4"]);
+
 require('dotenv').config();
 const { MongoClient, ServerApiVersion } = require('mongodb');
 
-const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@cluster0.fu1n5ti.mongodb.net/?retryWrites=true&w=majority&appName=LBTS-OS-Migration`;
+const DB_HOST = process.env.DB_HOST || 'cluster0.fu1n5ti.mongodb.net';
+const uri = `mongodb+srv://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASS)}@${DB_HOST}/?retryWrites=true&w=majority&appName=LBTS-OS-Migration`;
 
 // ── Color output for terminal ─────────────────────────────────────
 const c = {
@@ -137,6 +144,16 @@ const INDEX_PLAN = {
   //    - aggregate for filter options                                  [Line 2745-2772]
   // ─────────────────────────────────────────────────────────────────
   challans: [
+    {
+      // FIX #54 — stale claim cleanup query: { claimToken exists, claimedAt < cutoff }
+      // Partial index তাই খুব ছোট থাকে (শুধু claimed docs index হয়)।
+      keys: { claimedAt: 1 },
+      options: {
+        name: 'stale_claim_cleanup',
+        partialFilterExpression: { claimToken: { $exists: true } },
+      },
+      why: 'releaseStaleClaims() — crashed request-এর আটকে থাকা claim খুঁজতে',
+    },
     {
       keys: { createdAt: -1 },
       options: { name: 'created_desc' },
@@ -344,6 +361,24 @@ const INDEX_PLAN = {
   ],
 
   // ─────────────────────────────────────────────────────────────────
+  //  RATE_LIMITS collection (FIX #51 — serverless-safe limiter counters)
+  //  utils/mongoRateLimit.js নিজেও প্রথম call-এ index তৈরি করে,
+  //  কিন্তু এখানে declare করা থাকলে setup script একবারেই সব বানায়।
+  // ─────────────────────────────────────────────────────────────────
+  rate_limits: [
+    {
+      keys: { key: 1 },
+      options: { name: 'key_unique', unique: true },
+      why: 'Fixed-window counter lookup: findOneAndUpdate({ key })',
+    },
+    {
+      keys: { expiresAt: 1 },
+      options: { name: 'expiresAt_ttl', expireAfterSeconds: 0 },
+      why: 'Auto-delete expired window counters',
+    },
+  ],
+
+  // ─────────────────────────────────────────────────────────────────
   //  COUNTERS collection (for trip number sequence)
   //  Query patterns: findOneAndUpdate({ _id: "tripNumber" }) [Line 3127]
   //  _id is already auto-indexed, no extra index needed
@@ -388,7 +423,16 @@ async function main() {
       console.log(c.gray('─'.repeat(60)));
 
       const collection = db.collection(collectionName);
-      const existingIndexes = await collection.indexes();
+      // Collection এখনো exist না করলে (যেমন rate_limits প্রথমবার)
+      // indexes() NamespaceNotFound (code 26) throw করে — সেক্ষেত্রে
+      // খালি list ধরে এগোই; createIndex নিজেই collection বানিয়ে নেবে।
+      let existingIndexes = [];
+      try {
+        existingIndexes = await collection.indexes();
+      } catch (err) {
+        if (err.code !== 26) throw err;
+        console.log(c.gray('   (collection does not exist yet — will be created)'));
+      }
       const existingNames = new Set(existingIndexes.map((idx) => idx.name));
 
       let created = 0;

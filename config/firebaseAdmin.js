@@ -72,7 +72,6 @@ function initFirebaseAdmin() {
       const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf-8');
       serviceAccount = JSON.parse(decoded);
     }
-    // ── None provided ──
     else {
       throw new Error(
         '❌ Firebase Admin credentials MISSING.\n\n' +
@@ -88,6 +87,16 @@ function initFirebaseAdmin() {
         'Get credentials from: Firebase Console → Project Settings → Service Accounts → Generate new private key'
       );
     }
+
+    // ── FIX #57 — Google-এর আসল service account JSON snake_case ব্যবহার
+    // করে (project_id, client_email, private_key), কিন্তু admin.credential.cert
+    // এখানে camelCase আশা করা হচ্ছিল — ফলে Format B/C আসল Google file দিয়ে
+    // কখনো কাজ করত না। এখন দুই format-ই normalize করা হয়।
+    serviceAccount = {
+      projectId: serviceAccount.projectId || serviceAccount.project_id,
+      clientEmail: serviceAccount.clientEmail || serviceAccount.client_email,
+      privateKey: (serviceAccount.privateKey || serviceAccount.private_key || '').replace(/\\n/g, '\n'),
+    };
 
     // Validate required fields
     if (!serviceAccount.projectId || !serviceAccount.clientEmail || !serviceAccount.privateKey) {
