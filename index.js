@@ -1054,6 +1054,7 @@ app.post('/gate-pass', verifyToken, verifyRole('admin', 'manager', 'operator'), 
     body('tripDate').isISO8601().withMessage('Valid date required'),
     body('customerName').trim().notEmpty().withMessage('Customer name required'),
     body('csd').trim().notEmpty().withMessage('CSD required'),
+    body('unit').trim().notEmpty().withMessage('Unit required'),
     body('vehicleNo').trim().notEmpty().withMessage('Vehicle number required'),
     body('zone').trim().notEmpty().withMessage('Zone required'),
     body('products').isArray({ min: 1 }).withMessage('At least one product required'),
@@ -1075,8 +1076,12 @@ app.post('/gate-pass', verifyToken, verifyRole('admin', 'manager', 'operator'), 
         }
         gatePass.createdAt = new Date();
         gatePass.createdBy = req.user?.email || 'unknown';
-        gatePass.tripMonth = new Date(gatePass.tripDate).getMonth() + 1;
-        gatePass.tripYear = new Date(gatePass.tripDate).getFullYear();
+        // Date string থেকে সরাসরি parse — server timezone-এ month পিছলে
+        // যাওয়ার bug fix (new Date('YYYY-MM-DD').getMonth() negative-offset
+        // TZ-এ আগের month দিত, gate pass ভুল month-এ পড়ত)
+        const [tpY, tpM] = String(gatePass.tripDate).slice(0, 10).split('-').map(Number);
+        gatePass.tripMonth = tpM;
+        gatePass.tripYear = tpY;
         const result = await gatePassCollection.insertOne(gatePass);
         // Invalidate dashboard cache so summary updates immediately
         invalidateDashboardCache(gatePass.tripMonth, gatePass.tripYear);
@@ -1110,6 +1115,18 @@ app.get("/gate-pass", verifyToken, verifyNonVendor, async (req, res) => {
                 { "products.model": { $regex: search, $options: "i" } },
             ];
             const data = await gatePassCollection.find(query).sort({ createdAt: -1 }).limit(500).toArray();
+            return res.send({ data, pagination: { total: data.length } });
+        }
+
+        // FIX — ?limit=N (month ছাড়া): সর্বশেষ N টা pass, month-boundary
+        // নির্বিশেষে। আগে limit ignore হয়ে পুরো current month আসত, আর
+        // মাসের শুরুতে (শেষ pass আগের মাসে হলে) "Recently Added" খালি দেখাত।
+        const recentLimit = parseInt(req.query.limit) || 0;
+        if (recentLimit > 0 && !req.query.month) {
+            const data = await gatePassCollection.find({})
+                .sort({ createdAt: -1 })
+                .limit(Math.min(recentLimit, 50))
+                .toArray();
             return res.send({ data, pagination: { total: data.length } });
         }
 
@@ -4353,7 +4370,7 @@ app.post("/accounts", verifyToken, verifyRole('admin', 'manager', 'ceo'), valida
     body("description").trim().notEmpty().withMessage("Description required"),
 ]), async (req, res) => {
     try {
-        const { type, description, amount, date, note, vendorName, recipientName } = req.body;
+        const { type, description, amount, date, note, vendorName, recipientName, month: bodyMonth, year: bodyYear } = req.body;
         const amt = Number(amount);
 
         // FIX #4 — Sign validation per type (prevent negative balance hacking)
@@ -4374,7 +4391,23 @@ app.post("/accounts", verifyToken, verifyRole('admin', 'manager', 'ceo'), valida
 
         const db = await connectDB();
         const col = db.collection("accounts");
-        const d = new Date(date);
+
+        // ── Ledger month/year নির্ধারণ ──────────────────────────────
+        // Client explicit month/year পাঠালে (যেমন: Accounts dashboard-এ
+        // previous month select করা অবস্থায় Pay Vendor) সেটাই ledger
+        // month হবে — date field তখন শুধু "কবে টাকা দেওয়া হলো" তার record।
+        // month/year না পাঠালে আগের মতো date থেকে বের হবে — তবে এখন
+        // string থেকে সরাসরি parse, তাই server timezone-এ month পিছলে
+        // যাওয়ার bug আর নেই (আগে new Date('YYYY-MM-DD').getMonth()
+        // negative-offset timezone-এ আগের month দিত)।
+        const [dYear, dMonth] = String(date).slice(0, 10).split('-').map(Number);
+        let ledgerMonth = parseInt(bodyMonth);
+        let ledgerYear = parseInt(bodyYear);
+        if (!ledgerMonth || ledgerMonth < 1 || ledgerMonth > 12 || !ledgerYear || ledgerYear < 2000 || ledgerYear > 2100) {
+            ledgerMonth = dMonth;
+            ledgerYear = dYear;
+        }
+
         const doc = {
             type,
             description: description.trim(),
@@ -4383,8 +4416,8 @@ app.post("/accounts", verifyToken, verifyRole('admin', 'manager', 'ceo'), valida
             note: note?.trim() || "",
             vendorName: vendorName?.trim() || "",
             recipientName: recipientName?.trim() || "",
-            month: d.getMonth() + 1,
-            year: d.getFullYear(),
+            month: ledgerMonth,
+            year: ledgerYear,
             createdBy: req.user?.email || "unknown",
             createdAt: new Date(),
         };
@@ -4445,7 +4478,10 @@ app.delete("/accounts/:id", verifyToken, verifyRole('admin', 'manager', 'ceo'), 
     }
 });
 
-app.get("/audit-logs", verifyToken, verifyRole('admin', 'ceo'), async (req, res) => {
+// manager delete করতে পারে (DELETE /accounts) — তাই audit log-ও দেখতে
+// পারা দরকার। আগে শুধু admin/ceo ছিল বলে manager-এর কাছে 403 যেত আর
+// Deleted tab খালি দেখাত।
+app.get("/audit-logs", verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
     try {
         const db = await connectDB();
         const col = db.collection("audit_logs");
@@ -4470,7 +4506,10 @@ app.get("/audit-logs", verifyToken, verifyRole('admin', 'ceo'), async (req, res)
     }
 });
 
-app.patch("/audit-logs/:id/restored", verifyToken, verifyRole('admin', 'ceo'), validateObjectId("id"), async (req, res) => {
+// Restore flow: manager /accounts-এ restore POST করতে পারে, কিন্তু এই
+// PATCH-এ 403 পেত — ফলে tx restore হয়ে যেত অথচ log-এ "Restored" mark
+// হতো না (double-restore এর ঝুঁকি)। এখন consistent।
+app.patch("/audit-logs/:id/restored", verifyToken, verifyRole('admin', 'manager', 'ceo'), validateObjectId("id"), async (req, res) => {
     try {
         const db = await connectDB();
         const col = db.collection("audit_logs");
@@ -4846,6 +4885,7 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
             vendorCount, userCount,
             accountsTxs, carRentThisMonth,
             prevChallanCount, prevTripCount, challanMonthCount, prevGpCount,
+            lastTripArr,
         ] = await Promise.all([
             db.collection('gate-pass').countDocuments({ tripMonth: month, tripYear: year }),
             db.collection('gate-pass').countDocuments(),
@@ -4872,6 +4912,13 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
             db.collection('deliveries').countDocuments({ createdAt: { $gte: prevStart, $lt: prevEnd } }),
             db.collection('challans').countDocuments({ createdAt: { $gte: monthStart, $lt: monthEnd } }),
             db.collection('gate-pass').countDocuments({ tripMonth: prevMonth, tripYear: prevYear }),
+
+            // Dashboard "Active" badge-এ সর্বশেষ trip number দেখানোর জন্য
+            db.collection('deliveries')
+                .find({ tripNumber: { $exists: true, $ne: null } }, { projection: { tripNumber: 1 } })
+                .sort({ createdAt: -1 })
+                .limit(1)
+                .toArray(),
         ]);
 
         // ── Batch 2: Medium aggregations (challan status, zone, gatepass) ──
@@ -4948,6 +4995,11 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
                         totals: [
                             { $group: { _id: null, qty: { $sum: '$products.quantity' } } },
                         ],
+                        // Delivery Progress-এ challan-সংখ্যার বদলে product qty (PCS)
+                        // দেখানোর জন্য status-ভিত্তিক PCS breakdown
+                        statusPcs: [
+                            { $group: { _id: { $ifNull: ['$status', 'pending'] }, qty: { $sum: '$products.quantity' } } },
+                        ],
                     }
                 },
             ]).toArray(),
@@ -4998,6 +5050,10 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
         const csMap = {};
         challanStatusAgg.forEach(s => { csMap[s._id || 'pending'] = s.count; });
 
+        // Status-ভিত্তিক PCS map (Delivery Progress-এর qty ভিউয়ের জন্য)
+        const cpMap = {};
+        (challanFacet.statusPcs || []).forEach(s => { cpMap[s._id || 'pending'] = s.qty; });
+
         const n = (v) => (v != null ? Number(v) : 0);
         const income = accountsTxs.filter(t => t.type === 'income').reduce((s, t) => s + n(t.amount), 0);
         const expense = accountsTxs.filter(t => t.type === 'expense').reduce((s, t) => s + n(t.amount), 0);
@@ -5028,12 +5084,19 @@ app.get("/dashboard-stats", verifyToken, verifyApproved, async (req, res) => {
                 returned: csMap['returned'] || 0,
                 prevMonthTotal: prevChallanCount,          // FIX #59 — trend
                 totalPcs: challanFacet.totals?.[0]?.qty || 0,
+                // Product qty (PCS) অনুযায়ী status breakdown
+                deliveredPcs: (cpMap['delivered'] || 0) + (cpMap['re-delivered'] || 0),
+                pendingPcs: cpMap['pending'] || 0,
+                returnPendingPcs: cpMap['return-pending'] || 0,
+                returnedPcs: cpMap['returned'] || 0,
                 productBreakdown: challanProductAgg,
             },
             trip: {
                 totalCount: tripTotalCount,
                 monthCount: tripMonthCount,
                 activeCount: activeTripCount,
+                lastTripNumber: lastTripArr?.[0]?.tripNumber || null, // সর্বশেষ trip
+
                 prevMonthCount: prevTripCount,             // FIX #59 — trend
                 monthChallans: vendorFacet.totals?.[0]?.challans || 0,
                 deliveredPcs: deliveryFacet.totals?.[0]?.qty || 0,
