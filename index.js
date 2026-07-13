@@ -1915,15 +1915,19 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
     body('receiverNumber').trim().notEmpty().withMessage('Receiver number required'),
     body('products').optional().isArray().withMessage('Products must be an array'),
     body('products.*.productName').optional().trim().notEmpty().withMessage('Product name required'),
-    body('products.*.model').optional().trim().notEmpty().withMessage('Product model required'),
+    // FIX — model খালি string হতে পারে: without-model product গুলোর
+    // (rate table-এর N/M items) model থাকে না। আগের notEmpty() validation
+    // এদের edit save করতে দিত না (400 "Product model required")।
+    body('products.*.model').optional({ checkFalsy: false }).isString(),
     body('products.*.quantity').optional().isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
     body('products.*.capacity').optional({ checkFalsy: false }).isString(),
     body('products.*.rate').optional({ checkFalsy: false }).isNumeric(),
+    body('location').optional({ checkFalsy: false }).isString(),
 ]), async (req, res) => {
     try {
         const db = await connectDB();
         const challanCollection = db.collection('challans');
-        const { customerName, receiverNumber, zone, address, thana, district, products, updatedBy } = req.body;
+        const { customerName, receiverNumber, zone, address, thana, district, products, updatedBy, location } = req.body;
 
         // FIX #50 — rate server-side resolve করার জন্য challan-এর location লাগে
         const existingChallan = Array.isArray(products)
@@ -1932,6 +1936,12 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
             )
             : null;
 
+        // FIX — thana/district edit হলে client নতুন location পাঠায়;
+        // সেটাই authoritative, নাহলে পুরনো location দিয়ে ভুল rate resolve হতো।
+        const effectiveLocation = (typeof location === 'string' && location.trim())
+            ? location.trim()
+            : (existingChallan?.location || null);
+
         // Sanitize products — preserve _id, coerce quantity to number.
         // capacity + rate এখন server নিজে resolve করে (client মান শুধু cross-check)।
         const sanitizedProducts = Array.isArray(products)
@@ -1939,7 +1949,7 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
                 const guarded = resolveAuthoritativeRate({
                     productName: String(p.productName || '').trim(),
                     model: String(p.model || '').trim(),
-                    location: existingChallan?.location || null,
+                    location: effectiveLocation,
                     capacity: p.capacity,
                     clientRate: p.rate,
                     logger,
@@ -1962,6 +1972,7 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
             lastUpdatedBy: updatedBy || req.user?.email || 'unknown',
             lastUpdatedAt: new Date(),
         };
+        if (typeof location === 'string' && location.trim()) setDoc.location = location.trim();
         if (sanitizedProducts !== undefined) setDoc.products = sanitizedProducts;
 
         const result = await challanCollection.updateOne(
@@ -2144,9 +2155,26 @@ app.post("/vehicles", verifyToken, verifyNonVendor, validate([
         const db = await connectDB();
         const vendorsCollection = db.collection('vendors');
         const { vendorId, ...vehicleData } = req.body;
+
+        // ── Duplicate guard: vehicleNumber unique হওয়া দরকার (case-insensitive)।
+        //    Delivery planner-এর autocomplete আর trip-এর vehicleImg attach
+        //    দুটোই vehicleNumber match-এর উপর চলে — duplicate থাকলে ভুল
+        //    vendor/driver auto-fill হয়ে যেতে পারত।
+        const vNum = String(vehicleData.vehicleNumber || '').trim();
+        const dup = await vendorsCollection.findOne(
+            { "vehicles.vehicleNumber": { $regex: `^${escapeRegex(vNum)}$`, $options: 'i' } },
+            { projection: { vendorName: 1 } }
+        );
+        if (dup) {
+            return res.status(409).send({
+                success: false,
+                message: `Vehicle "${vNum}" already exists under vendor "${dup.vendorName}"`,
+            });
+        }
+
         const result = await vendorsCollection.updateOne(
             { _id: new ObjectId(vendorId) },
-            { $push: { vehicles: { _id: new ObjectId(), ...vehicleData, createdAt: new Date() } } }
+            { $push: { vehicles: { _id: new ObjectId(), ...vehicleData, vehicleNumber: vNum, createdAt: new Date() } } }
         );
         if (result.modifiedCount > 0) {
             res.send({ success: true, insertedId: true });
@@ -2637,6 +2665,57 @@ app.get("/deliveries", verifyToken, verifyApproved, async (req, res) => {
     } catch (err) {
         logger.error('Failed to fetch deliveries', err);
         res.status(500).send({ success: false, message: "Failed to fetch deliveries" });
+    }
+});
+
+/* ── GET /deliveries/single/:tripId ──────────────────────────────────
+   Fetch ONE trip by its _id — used by the Trip Details page (/trip/:id).
+   আগে client-কে trip খুঁজতে ৬ মাসের সব deliveries download করতে হতো
+   (up to 6 requests, হাজার হাজার doc) — এখন এক query-তেই কাজ হয়।
+   Path-এ "/single/" রাখা হয়েছে যাতে "/deliveries/bulk-export"-এর মতো
+   static route-এর সাথে conflict না হয়।
+   Security: same rules as GET /deliveries —
+     • vendor হলে শুধু নিজের vendorName-এর trip দেখতে পারবে
+     • vendor-দের response থেকে tripNote strip হয়
+   vehicleImg-ও attach হয় (list page-এর মতোই)। */
+app.get("/deliveries/single/:tripId", verifyToken, verifyApproved, validateObjectId('tripId'), async (req, res) => {
+    try {
+        const db = await connectDB();
+        const deliveriesCollection = db.collection('deliveries');
+        const isVendor = req.user?.role === 'vendor';
+        const projection = isVendor ? { tripNote: 0, tripNoteUpdatedAt: 0, tripNoteUpdatedBy: 0 } : undefined;
+
+        const trip = await deliveriesCollection.findOne(
+            { _id: new ObjectId(req.params.tripId) },
+            projection ? { projection } : undefined
+        );
+        if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+
+        // Vendor ownership check — নিজের trip না হলে 404 (existence leak এড়াতে 403 নয়)
+        if (isVendor) {
+            const me = await db.collection('users').findOne({ email: req.user.email });
+            const mine = me?.vendorName &&
+                String(trip.vendorName || "").trim().toLowerCase() === String(me.vendorName).trim().toLowerCase();
+            if (!mine) return res.status(404).send({ success: false, message: "Trip not found" });
+        }
+
+        // vehicleImg attach (vendors collection থেকে, vehicleNumber match করে)
+        try {
+            const key = (trip.vehicleNumber || "").trim().toLowerCase();
+            if (key) {
+                const vendorDoc = await db.collection('vendors').findOne(
+                    { "vehicles.vehicleNumber": { $regex: `^${escapeRegex(trip.vehicleNumber.trim())}$`, $options: 'i' } },
+                    { projection: { "vehicles.vehicleNumber": 1, "vehicles.vehicleImg": 1 } }
+                );
+                const v = (vendorDoc?.vehicles || []).find(x => (x.vehicleNumber || "").trim().toLowerCase() === key && x.vehicleImg);
+                if (v) trip.vehicleImg = v.vehicleImg;
+            }
+        } catch (e) { logger.error("attachVehicleImg (single trip) failed", e); }
+
+        res.send({ success: true, data: trip });
+    } catch (err) {
+        logger.error('Failed to fetch single trip', err);
+        res.status(500).send({ success: false, message: "Failed to fetch trip" });
     }
 });
 
@@ -5388,7 +5467,10 @@ app.patch("/deliveries/:tripId/challan/:challanId/status",
     });
 
 // GET /labor-bill?month=4&year=2025 — challans with floor or carrying entry
-app.get("/labor-bill", verifyToken, async (req, res) => {
+// SECURITY FIX — আগে শুধু verifyToken ছিল: যেকোনো logged-in user
+// (vendor, এমনকি unapproved account-ও) customer phone/address সহ
+// labor data দেখতে পারত। Client route-এর মতোই role-gate করা হলো।
+app.get("/labor-bill", verifyToken, verifyRole('admin', 'manager', 'ceo', 'operator'), async (req, res) => {
     try {
         const db = await connectDB();
         const col = db.collection('deliveries');
