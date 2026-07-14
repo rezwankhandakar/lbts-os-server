@@ -1853,6 +1853,109 @@ app.delete("/challans/:challanId/product/:productId", verifyToken, verifyNonVend
  * otherwise match the `:id` wildcard first (and get rejected by its
  * validateObjectId check, since "bulk-remarks" isn't a Mongo ObjectId).
  */
+// ─────────────────────────────────────────────────────────────────────
+//  Gate Pass ↔ Challan linkage
+//  ─────────────────────────────────────────────────────────────────
+//  POST /challans/by-trip-do
+//  Body: { tripDos: ["4681835", ...] }  (max 3000)
+//  Returns minimal challan docs whose products carry any of the given
+//  Trip Do numbers. AllGatePass page এটা দিয়ে current + previous
+//  month-এর gate pass গুলোর delivery status compute করে (fuzzy
+//  customer/model matching client-side হয়)। Month-এর সীমানা মানা হয়
+//  না — জুলাইয়ের gate pass আগস্টের challan দিয়ে deliver হলেও ধরা পড়ে।
+// ─────────────────────────────────────────────────────────────────────
+app.post("/challans/by-trip-do", verifyToken, verifyNonVendor, async (req, res) => {
+    try {
+        const { tripDos } = req.body || {};
+        if (!Array.isArray(tripDos) || tripDos.length === 0) {
+            return res.send({ success: true, data: [] });
+        }
+        const clean = [...new Set(
+            tripDos.map(t => String(t ?? "").trim()).filter(Boolean)
+        )].slice(0, 3000);
+        if (clean.length === 0) return res.send({ success: true, data: [] });
+
+        const db = await connectDB();
+        const data = await db.collection('challans').find(
+            { "products.tripDo": { $in: clean } },
+            { projection: {
+                customerName: 1, status: 1, csd: 1, unit: 1, tripNumber: 1,
+                createdAt: 1, zone: 1,
+                "products._id": 1, "products.productName": 1, "products.model": 1,
+                "products.quantity": 1, "products.tripDo": 1,
+            } }
+        ).limit(5000).toArray();
+        res.send({ success: true, data });
+    } catch (err) {
+        logger.error("by-trip-do fetch failed", err);
+        res.status(500).send({ success: false, message: "Failed to fetch linked challans" });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+//  PATCH /challans/bulk-gate-sync
+//  Body: { assignments: [{ challanId, csd, unit }, ...] }
+//  Gate pass-এর সাথে match হওয়া challan-এ gp-এর CSD ও Unit বসায় —
+//  challans collection (All-Challan page) এবং deliveries-এর embedded
+//  copy (Delivered page) দুটোতেই, bulk-csd-এর মতোই। Client matching
+//  করে explicit assignment পাঠায়, তাই server-side fuzzy guess নেই —
+//  পুরোটা deterministic ও auditable।
+// ─────────────────────────────────────────────────────────────────────
+app.patch("/challans/bulk-gate-sync", verifyToken, verifyRole('admin', 'manager', 'operator'), async (req, res) => {
+    try {
+        const { assignments } = req.body || {};
+        if (!Array.isArray(assignments) || assignments.length === 0) {
+            return res.status(400).send({ success: false, message: "No assignments supplied" });
+        }
+        const db = await connectDB();
+        const challanCollection = db.collection('challans');
+        const deliveriesCollection = db.collection('deliveries');
+
+        let touched = 0;
+        const ops = [];
+        const syncedBy = req.user?.email || "unknown";
+        const syncedAt = new Date();
+
+        for (const a of assignments.slice(0, 2000)) {
+            const challanId = String(a?.challanId || "").trim();
+            if (!challanId) continue;
+            const csd  = String(a?.csd  ?? "").trim();
+            const unit = String(a?.unit ?? "").trim();
+            if (!csd && !unit) continue;
+
+            const setChallan = { gateSyncedAt: syncedAt, gateSyncedBy: syncedBy };
+            if (csd)  setChallan.csd  = csd;
+            if (unit) setChallan.unit = unit;
+
+            if (isValidObjectId(challanId)) {
+                ops.push(
+                    challanCollection.updateOne(
+                        { _id: new ObjectId(challanId) },
+                        { $set: setChallan }
+                    ).then(r => { touched += r.modifiedCount || 0; })
+                );
+            }
+
+            const setEmb = {};
+            if (csd)  setEmb["challans.$[c].csd"]  = csd;
+            if (unit) setEmb["challans.$[c].unit"] = unit;
+            ops.push(
+                deliveriesCollection.updateMany(
+                    { "challans.challanId": challanId },
+                    { $set: setEmb },
+                    { arrayFilters: [{ "c.challanId": challanId }] }
+                ).then(r => { touched += r.modifiedCount || 0; })
+            );
+        }
+
+        await Promise.all(ops);
+        res.send({ success: true, touched });
+    } catch (err) {
+        logger.error("bulk-gate-sync failed", err);
+        res.status(500).send({ success: false, message: "Gate sync failed" });
+    }
+});
+
 app.patch("/challans/bulk-remarks", verifyToken, verifyRole('admin'), async (req, res) => {
     try {
         const { remarks, challanIds } = req.body || {};
@@ -2465,6 +2568,10 @@ app.post("/deliveries", verifyToken, verifyNonVendor, validate([
                         quantity: Number(p.quantity),
                         capacity: guarded.capacity,
                         rate: guarded.rate,
+                        // Trip Do — All-Challan page-এ dispatch-এর আগেই set করা
+                        // থাকতে পারে; remarks-এর মতোই snapshot-এ carry হয়, নাহলে
+                        // Delivered page-এ গিয়ে হারিয়ে যেত (sync gap)।
+                        ...(typeof p.tripDo === 'string' && p.tripDo.trim() ? { tripDo: p.tripDo.trim() } : {}),
                     };
                 })
             })),
