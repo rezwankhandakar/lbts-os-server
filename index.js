@@ -1876,15 +1876,104 @@ app.post("/challans/by-trip-do", verifyToken, verifyNonVendor, async (req, res) 
         if (clean.length === 0) return res.send({ success: true, data: [] });
 
         const db = await connectDB();
-        const data = await db.collection('challans').find(
+        const challanCol = db.collection('challans');
+        const projection = {
+            customerName: 1, status: 1, csd: 1, unit: 1, tripNumber: 1,
+            createdAt: 1, zone: 1, returnedFromChallanId: 1,
+            "products._id": 1, "products.productName": 1, "products.model": 1,
+            "products.quantity": 1, "products.tripDo": 1,
+        };
+        const data = await challanCol.find(
             { "products.tripDo": { $in: clean } },
-            { projection: {
-                customerName: 1, status: 1, csd: 1, unit: 1, tripNumber: 1,
-                createdAt: 1, zone: 1,
-                "products._id": 1, "products.productName": 1, "products.model": 1,
-                "products.quantity": 1, "products.tripDo": 1,
-            } }
+            { projection }
         ).limit(5000).toArray();
+
+        // ── Self-heal: legacy return challan-এ Trip Do backfill ─────────
+        // Fix-এর আগে তৈরি return-pending / re-delivered challan-গুলোর
+        // products-এ tripDo নেই, তাই উপরের query-তে ওগুলো ধরাই পড়ে না —
+        // ফলে All-Gate-Pass-এ Return status কখনো আসত না। এখানে found
+        // original গুলোর derived return challan খুঁজে original product
+        // থেকে tripDo inherit করে DB-তে বসিয়ে দেওয়া হয় (একবারই লাগে),
+        // আর এই response-এই সেগুলো যোগ হয় যাতে status সাথে সাথে আসে।
+        try {
+            const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9\u0980-\u09FF]/g, "");
+            const originalsById = new Map(
+                data.filter(d => !d.returnedFromChallanId)
+                    .map(d => [String(d._id), d])
+            );
+            const foundIds = [...originalsById.keys()];
+            if (foundIds.length) {
+                // FULL products আনতে হবে — $set-এ পুরো array বসে, projected
+                // subset বসালে capacity/rate হারিয়ে যেত
+                const derived = await challanCol.find(
+                    {
+                        returnedFromChallanId: { $in: foundIds },
+                        products: { $elemMatch: { tripDo: { $in: [null, ""] } } },
+                    },
+                    { projection: {
+                        customerName: 1, status: 1, csd: 1, unit: 1, tripNumber: 1,
+                        createdAt: 1, zone: 1, returnedFromChallanId: 1, products: 1,
+                    } }
+                ).limit(1000).toArray();
+
+                const healOps = [];
+                const cardFills = []; // deliveries return card-এও ফাঁকা tripDo fill
+                for (const d of derived) {
+                    const orig = originalsById.get(String(d.returnedFromChallanId));
+                    if (!orig) continue;
+                    let changed = false;
+                    const healedPairs = []; // { cardProductId, tripDo }
+                    for (const p of (d.products || [])) {
+                        if (typeof p.tripDo === 'string' && p.tripDo.trim()) continue;
+                        const src = (orig.products || []).find(op =>
+                            (p.sourceProductId && String(op._id) === String(p.sourceProductId)) ||
+                            (norm(op.productName) === norm(p.productName) && norm(op.model) === norm(p.model))
+                        );
+                        if (src && typeof src.tripDo === 'string' && src.tripDo.trim()) {
+                            p.tripDo = src.tripDo.trim();
+                            if (!p.sourceProductId) p.sourceProductId = src._id;
+                            healedPairs.push({ cardProductId: String(src._id), tripDo: p.tripDo });
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
+                        healOps.push({
+                            updateOne: {
+                                filter: { _id: d._id },
+                                update: { $set: {
+                                    products: d.products,
+                                    tripDoBackfilledAt: new Date(),
+                                } },
+                            }
+                        });
+                        // Delivered page-এর return card-ও fill হয় — card
+                        // product-এর _id = original product-এর _id
+                        const origId = String(d.returnedFromChallanId);
+                        for (const { cardProductId, tripDo } of healedPairs) {
+                            cardFills.push(
+                                db.collection('deliveries').updateMany(
+                                    { challans: { $elemMatch: { isReturn: true, originalChallanId: origId } } },
+                                    { $set: { "challans.$[c].products.$[p].tripDo": tripDo } },
+                                    { arrayFilters: [
+                                        { "c.isReturn": true, "c.originalChallanId": origId },
+                                        { "p._id": cardProductId, "p.tripDo": { $in: [null, ""] } },
+                                    ] }
+                                ).catch(() => {})
+                            );
+                        }
+                        // এই response-এই যোগ করা হয় — শুধু requested tripDo-র
+                        // product গুলোই relevant, তবু পুরো doc পাঠালে ক্ষতি নেই
+                        if (!data.some(x => String(x._id) === String(d._id))) data.push(d);
+                    }
+                }
+                if (healOps.length) await challanCol.bulkWrite(healOps, { ordered: false });
+                if (cardFills.length) await Promise.all(cardFills);
+            }
+        } catch (healErr) {
+            // Backfill best-effort — fail করলেও মূল read ভাঙবে না
+            logger.error("by-trip-do return backfill failed", healErr);
+        }
+
         res.send({ success: true, data });
     } catch (err) {
         logger.error("by-trip-do fetch failed", err);
@@ -1911,10 +2000,18 @@ app.patch("/challans/bulk-gate-sync", verifyToken, verifyRole('admin', 'manager'
         const challanCollection = db.collection('challans');
         const deliveriesCollection = db.collection('deliveries');
 
-        let touched = 0;
-        const ops = [];
         const syncedBy = req.user?.email || "unknown";
         const syncedAt = new Date();
+
+        // আগে প্রতি assignment-এ ২টা করে আলাদা update fire হতো
+        // (Promise.all) — শ'খানেক assignment-এ শ'দুয়েক parallel অপারেশন,
+        // M0/serverless-এ connection pool/timeout-এ একটা fail করলেই পুরো
+        // request 500 দিত, অথচ বাকিগুলো লিখে ফেলত (data বসে কিন্তু
+        // "Gate sync failed" দেখায়)। এখন: প্রতি collection-এ ১টা করে
+        // bulkWrite (ordered:false) — দ্রুত, pool-safe, আর partial
+        // failure হলেও যা লেগেছে তার হিসাব দিয়ে success ফেরত যায়।
+        const challanOps = [];
+        const deliveryOps = [];
 
         for (const a of assignments.slice(0, 2000)) {
             const challanId = String(a?.challanId || "").trim();
@@ -1928,31 +2025,55 @@ app.patch("/challans/bulk-gate-sync", verifyToken, verifyRole('admin', 'manager'
             if (unit) setChallan.unit = unit;
 
             if (isValidObjectId(challanId)) {
-                ops.push(
-                    challanCollection.updateOne(
-                        { _id: new ObjectId(challanId) },
-                        { $set: setChallan }
-                    ).then(r => { touched += r.modifiedCount || 0; })
-                );
+                challanOps.push({
+                    updateOne: {
+                        filter: { _id: new ObjectId(challanId) },
+                        update: { $set: setChallan },
+                    }
+                });
             }
 
             const setEmb = {};
             if (csd)  setEmb["challans.$[c].csd"]  = csd;
             if (unit) setEmb["challans.$[c].unit"] = unit;
-            ops.push(
-                deliveriesCollection.updateMany(
-                    { "challans.challanId": challanId },
-                    { $set: setEmb },
-                    { arrayFilters: [{ "c.challanId": challanId }] }
-                ).then(r => { touched += r.modifiedCount || 0; })
-            );
+            deliveryOps.push({
+                updateMany: {
+                    filter: { "challans.challanId": challanId },
+                    update: { $set: setEmb },
+                    arrayFilters: [{ "c.challanId": challanId }],
+                }
+            });
         }
 
-        await Promise.all(ops);
-        res.send({ success: true, touched });
+        let touched = 0;
+        const errors = [];
+        const runBulk = async (col, ops, label) => {
+            if (!ops.length) return;
+            try {
+                const r = await col.bulkWrite(ops, { ordered: false });
+                touched += r.modifiedCount || 0;
+            } catch (e) {
+                // ordered:false → error হলেও বাকি op গুলো চলে; যা লেগেছে গুনি
+                touched += e?.result?.modifiedCount || e?.result?.nModified || 0;
+                errors.push(`${label}: ${e.message}`);
+                logger.error(`bulk-gate-sync ${label} partial failure`, e);
+            }
+        };
+        await runBulk(challanCollection, challanOps, "challans");
+        await runBulk(deliveriesCollection, deliveryOps, "deliveries");
+
+        // কিছুই না লাগলে-ই কেবল fail; আংশিক হলে success + warning।
+        // engine field টা version marker — client console-এ দেখলেই বোঝা
+        // যায় নতুন server code live আছে কিনা।
+        if (errors.length && touched === 0) {
+            return res.status(500).send({ success: false, engine: "gate-sync-v2", message: "Gate sync failed", detail: errors.join(" | "), errors });
+        }
+        res.send({ success: true, engine: "gate-sync-v2", touched, ...(errors.length ? { warning: "Some updates failed", errors } : {}) });
     } catch (err) {
         logger.error("bulk-gate-sync failed", err);
-        res.status(500).send({ success: false, message: "Gate sync failed" });
+        // আসল error message response-এ পাঠানো হয় যাতে UI-তেই root cause
+        // দেখা যায় — generic "Gate sync failed" দিয়ে debug করা যেত না
+        res.status(500).send({ success: false, engine: "gate-sync-v2", message: "Gate sync failed", detail: err?.message || String(err) });
     }
 });
 
@@ -3203,6 +3324,172 @@ app.patch("/deliveries/bulk-trip-do", verifyToken, verifyRole('admin'), async (r
             );
         }
 
+        // ── 3. Return-artifact propagation ─────────────────────────────
+        // Trip Do বসানোর আগে Return হোক বা Return হওয়ার পর Trip Do বসানো
+        // হোক না কেন — return product-এর Trip Do সবসময় re-deliverable
+        // "return-pending" challan (challans collection)-এও পৌঁছাতে হবে,
+        // কারণ All-Gate-Pass-এর matching ওই collection-ই পড়ে। Return
+        // rows-এর synthetic challanId `return_<origId>_<ts>` step 1-এ
+        // skip হয়, তাই এখানে আলাদা করে stamp করা হয়:
+        //   3a. Return row target → ওই origChallan থেকে জন্মানো pending
+        //       challan-এ set/clear (admin সরাসরি return row-এ লিখেছে)
+        //   3b. Normal row target → তার return card (deliveries) এবং
+        //       derived pending challan-এ শুধু ফাঁকা tripDo গুলো fill হয়
+        //       (admin অন্য DO বসিয়ে থাকলে overwrite হয় না; clear
+        //       propagate হয় না)
+        const RETURN_ID_RE = /^return_(.+)_\d+$/;
+        const returnTargets = [];
+        const normalTargets = [];
+        for (const [challanId, productIds] of byChallan.entries()) {
+            const m = RETURN_ID_RE.exec(challanId);
+            if (m) returnTargets.push({ origId: m[1], returnChallanId: challanId, productIds });
+            else if (isValidObjectId(challanId)) normalTargets.push({ challanId, productIds });
+        }
+
+        const tripDoWrite = writeValue === null
+            ? { $unset: { "products.$[el].tripDo": "" } }
+            : { $set: { "products.$[el].tripDo": writeValue } };
+        // model ফাঁকা/missing দুটোই match করাতে
+        const modelCond = (model) => (model ? model : { $in: [null, ""] });
+
+        if (returnTargets.length) {
+            // Legacy pending challans-এ sourceProductId নেই — name/model
+            // fallback-এর জন্য return card-এর products লাগে (এক query-তে)
+            const rcIds = returnTargets.map(t => t.returnChallanId);
+            const tripsWithCards = await deliveriesCollection.find(
+                { "challans.challanId": { $in: rcIds } },
+                { projection: { "challans.challanId": 1, "challans.isReturn": 1, "challans.products": 1 } }
+            ).toArray();
+            const cardMap = new Map(); // returnChallanId → products[]
+            for (const t of tripsWithCards) for (const c of (t.challans || [])) {
+                if (c.isReturn && rcIds.includes(c.challanId)) cardMap.set(c.challanId, c.products || []);
+            }
+
+            for (const { origId, returnChallanId, productIds } of returnTargets) {
+                const filter = { returnedFromChallanId: origId };
+                // Modern docs — sourceProductId দিয়ে exact match
+                operations.push(
+                    challanCollection.updateMany(filter, tripDoWrite, {
+                        arrayFilters: [{ "el.sourceProductId": { $in: productIds } }],
+                    }).then(r => { touched += r.modifiedCount || 0; })
+                );
+                // Legacy docs — productName + model দিয়ে
+                const namePairs = (cardMap.get(returnChallanId) || [])
+                    .filter(p => productIds.includes(p._id));
+                for (const p of namePairs) {
+                    operations.push(
+                        challanCollection.updateMany(filter, tripDoWrite, {
+                            arrayFilters: [{
+                                "el.sourceProductId": { $exists: false },
+                                "el.productName": p.productName ?? "",
+                                "el.model": modelCond(p.model),
+                            }],
+                        }).then(r => { touched += r.modifiedCount || 0; })
+                    );
+                }
+            }
+        }
+
+        if (normalTargets.length) {
+            const ids = normalTargets.map(t => t.challanId);
+            // এক query-তে target doc গুলো — কোনটা original আর কোনটা নিজেই
+            // derived return challan (returnedFromChallanId আছে) সেটা বোঝা
+            // যায়; legacy name/model fallback-এর তথ্যও এখান থেকেই আসে
+            const targetDocs = await challanCollection.find(
+                { _id: { $in: ids.map(id => new ObjectId(id)) } },
+                { projection: { returnedFromChallanId: 1, "products._id": 1, "products.sourceProductId": 1, "products.productName": 1, "products.model": 1 } }
+            ).toArray();
+            const docMap = new Map(targetDocs.map(d => [String(d._id), d]));
+            // কোন original গুলোর derived return challan আছে (এক query)
+            const derivedDocs = await challanCollection.find(
+                { returnedFromChallanId: { $in: ids } },
+                { projection: { returnedFromChallanId: 1 } }
+            ).toArray();
+            const hasDerived = new Set(derivedDocs.map(d => String(d.returnedFromChallanId)));
+
+            const inIds = (pid, productIds) => productIds.includes(String(pid)) || productIds.includes(pid);
+            const fillEmpty = { "el.tripDo": { $in: [null, ""] } };
+
+            for (const { challanId, productIds } of normalTargets) {
+                const doc = docMap.get(challanId);
+
+                // ── CASE A: target নিজেই derived return challan (All-Challan
+                // page-এর return-pending row) → deliveries-এর return card-এ
+                // পুরো mirror (set এবং clear দুটোই)। এই path-টাই আগে ছিল না,
+                // তাই All-Challan থেকে return product-এ Trip Do বসালে
+                // Delivered page-এর return row-এ যেত না।
+                if (doc?.returnedFromChallanId) {
+                    const origId = String(doc.returnedFromChallanId);
+                    const targeted = (doc.products || []).filter(p => inIds(p._id, productIds));
+                    const cardFilter = { challans: { $elemMatch: { isReturn: true, originalChallanId: origId } } };
+                    const cardWrite = writeValue === null
+                        ? { $unset: { "challans.$[c].products.$[p].tripDo": "" } }
+                        : { $set:   { "challans.$[c].products.$[p].tripDo": writeValue } };
+                    const cFilter = { "c.isReturn": true, "c.originalChallanId": origId };
+                    // Modern: pending product-এর sourceProductId = card product-এর _id
+                    const srcIds = targeted.map(p => p.sourceProductId).filter(Boolean).map(String);
+                    if (srcIds.length) {
+                        operations.push(
+                            deliveriesCollection.updateMany(cardFilter, cardWrite, {
+                                arrayFilters: [cFilter, { "p._id": { $in: srcIds } }],
+                            }).then(r => { touched += r.modifiedCount || 0; })
+                        );
+                    }
+                    // Legacy: sourceProductId নেই → name/model দিয়ে card product match
+                    for (const p of targeted.filter(p => !p.sourceProductId)) {
+                        operations.push(
+                            deliveriesCollection.updateMany(cardFilter, cardWrite, {
+                                arrayFilters: [cFilter, {
+                                    "p.productName": p.productName ?? "",
+                                    "p.model": modelCond(p.model),
+                                }],
+                            }).then(r => { touched += r.modifiedCount || 0; })
+                        );
+                    }
+                    continue; // derived target original-এর মতো আর propagate হয় না
+                }
+
+                // ── CASE B: original row → return artifacts-এ শুধু ফাঁকা
+                // tripDo fill হয় (set-এর সময়; clear propagate হয় না)
+                if (writeValue === null) continue;
+                operations.push(
+                    deliveriesCollection.updateMany(
+                        { challans: { $elemMatch: { isReturn: true, originalChallanId: challanId } } },
+                        { $set: { "challans.$[c].products.$[p].tripDo": writeValue } },
+                        {
+                            arrayFilters: [
+                                { "c.isReturn": true, "c.originalChallanId": challanId },
+                                { "p._id": { $in: productIds }, "p.tripDo": { $in: [null, ""] } },
+                            ],
+                        }
+                    ).then(r => { touched += r.modifiedCount || 0; })
+                );
+                if (!hasDerived.has(challanId)) continue;
+                const filter = { returnedFromChallanId: challanId };
+                operations.push(
+                    challanCollection.updateMany(filter,
+                        { $set: { "products.$[el].tripDo": writeValue } },
+                        { arrayFilters: [{ "el.sourceProductId": { $in: productIds }, ...fillEmpty }] }
+                    ).then(r => { touched += r.modifiedCount || 0; })
+                );
+                const namePairs = (doc?.products || [])
+                    .filter(p => inIds(p._id, productIds));
+                for (const p of namePairs) {
+                    operations.push(
+                        challanCollection.updateMany(filter,
+                            { $set: { "products.$[el].tripDo": writeValue } },
+                            { arrayFilters: [{
+                                "el.sourceProductId": { $exists: false },
+                                "el.productName": p.productName ?? "",
+                                "el.model": modelCond(p.model),
+                                ...fillEmpty,
+                            }] }
+                        ).then(r => { touched += r.modifiedCount || 0; })
+                    );
+                }
+            }
+        }
+
         await Promise.all(operations);
         res.send({ success: true, touched });
     } catch (err) {
@@ -3850,13 +4137,45 @@ app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, verifyNo
             return res.status(404).send({ success: false, message: "Challan not found" });
         }
 
+        // Trip Do resolve — return card-এ admin আগে নিজে Trip Do বসিয়ে
+        // থাকলে সেটাই থাকবে; নাহলে original product-এর Trip Do (থাকলে)।
+        // Edit-এ products rebuild হয়, তাই এটা না রাখলে Trip Do মুছে যেত।
+        const existingReturnCard = (trip.challans || []).find(
+            c => c.isReturn && c.originalChallanId === challanId
+        );
+        // Canonical challan doc fallback — Trip Do শুধু challans
+        // collection-এ থাকলেও যেন return-এ সেটা যায়
+        let canonTripDoProducts = [];
+        if (isValidObjectId(challanId)) {
+            try {
+                const canon = await challanCollection.findOne(
+                    { _id: new ObjectId(challanId) },
+                    { projection: { "products._id": 1, "products.tripDo": 1 } }
+                );
+                canonTripDoProducts = canon?.products || [];
+            } catch (_) { /* best-effort */ }
+        }
+        const resolveTripDo = (p) => {
+            const fromCard = existingReturnCard?.products?.find(ep => ep._id === p._id)?.tripDo;
+            if (typeof fromCard === 'string' && fromCard.trim()) return fromCard.trim();
+            const fromOrig = originalSnapshot.products?.find(op => op._id === p._id)?.tripDo;
+            if (typeof fromOrig === 'string' && fromOrig.trim()) return fromOrig.trim();
+            const fromCanon = canonTripDoProducts.find(op => String(op._id) === String(p._id))?.tripDo;
+            if (typeof fromCanon === 'string' && fromCanon.trim()) return fromCanon.trim();
+            return null;
+        };
+
         // (b) embedded return card-এর products — quantity = returnQty
-        const returnCardProducts = returnedProducts.map(p => ({
-            _id: p._id || new ObjectId().toString(),
-            productName: p.productName,
-            model: p.model,
-            quantity: Number(p.returnQty || p.quantity) || 0,
-        }));
+        const returnCardProducts = returnedProducts.map(p => {
+            const tripDo = resolveTripDo(p);
+            return {
+                _id: p._id || new ObjectId().toString(),
+                productName: p.productName,
+                model: p.model,
+                quantity: Number(p.returnQty || p.quantity) || 0,
+                ...(tripDo ? { tripDo } : {}),
+            };
+        });
 
         await deliveriesCollection.bulkWrite([
             // (a) original snapshot-এ return mark আপডেট
@@ -3894,13 +4213,16 @@ app.patch("/deliveries/:tripId/challan/:challanId/return", verifyToken, verifyNo
         // capacity/rate original snapshot থেকে copy (creation-এর মতোই)।
         const pendingProducts = returnedProducts.map(p => {
             const orig = originalSnapshot.products?.find(op => op._id === p._id) || {};
+            const tripDo = resolveTripDo(p);
             return {
                 _id: new ObjectId().toString(),
+                sourceProductId: p._id || null,
                 productName: p.productName,
                 model: p.model,
                 quantity: Number(p.returnQty || p.quantity) || 0,
                 capacity: typeof orig.capacity === 'string' ? orig.capacity : '',
                 rate: Number(orig.rate) || 0,
+                ...(tripDo ? { tripDo } : {}),
             };
         });
         const pendingSync = await challanCollection.updateOne(
@@ -4161,6 +4483,36 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, val
     const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
     if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
 
+    // Original embedded challan snapshot — needed BOTH for the return
+    // card and the re-deliverable challan below (tripDo / capacity / rate
+    // are copied from here). Trip Do আগে বসানো থাকলে return-এর সাথে
+    // সাথে সেটা return card + re-deliverable challan-এ চলে যায়, ফলে
+    // All-Gate-Pass-এর Trip Do matching-এ Return status ধরা পড়ে।
+    const originalChallanSnapshot = (trip.challans || []).find(c => c.challanId === originalChallanId);
+
+    // Fallback source — canonical challan doc (challans collection)।
+    // Trip Do কখনো কখনো শুধু ওখানে থাকে (যেমন trip তৈরির client payload-এ
+    // tripDo না এলে embedded copy-তে থাকে না)। দুই জায়গা মিলিয়ে দেখা হয়,
+    // যাতে Trip Do বসানো থাকলে return-pending challan-এ সেটা যাবেই।
+    let canonicalProducts = [];
+    if (isValidObjectId(originalChallanId)) {
+        try {
+            const canon = await challanCollection.findOne(
+                { _id: new ObjectId(originalChallanId) },
+                { projection: { "products._id": 1, "products.tripDo": 1 } }
+            );
+            canonicalProducts = canon?.products || [];
+        } catch (_) { /* fallback best-effort */ }
+    }
+    const findOrigProduct = (pid) => {
+        const snap  = originalChallanSnapshot?.products?.find(op => op._id === pid) || {};
+        if (typeof snap.tripDo === 'string' && snap.tripDo.trim()) return snap;
+        const canon = canonicalProducts.find(op => String(op._id) === String(pid));
+        return (canon && typeof canon.tripDo === 'string' && canon.tripDo.trim())
+            ? { ...snap, tripDo: canon.tripDo }
+            : snap;
+    };
+
     const returnChallan = {
         challanId: `return_${originalChallanId}_${Date.now()}`,
         isReturn: true,
@@ -4171,12 +4523,18 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, val
         thana,
         district,
         receiverNumber,
-        products: (returnedProducts || []).map(p => ({
-            _id: p._id || new ObjectId().toString(),
-            productName: p.productName,
-            model: p.model,
-            quantity: Number(p.returnQty || p.quantity),
-        })),
+        products: (returnedProducts || []).map(p => {
+            const orig = findOrigProduct(p._id);
+            return {
+                _id: p._id || new ObjectId().toString(),
+                productName: p.productName,
+                model: p.model,
+                quantity: Number(p.returnQty || p.quantity),
+                // original product-এ Trip Do থাকলে return card-ও সেটা বহন করে
+                ...(typeof orig.tripDo === 'string' && orig.tripDo.trim()
+                    ? { tripDo: orig.tripDo.trim() } : {}),
+            };
+        }),
         returnNote: returnNote || "",
         returnedAt: new Date(),
         deliveryStatus: "return",
@@ -4192,21 +4550,27 @@ app.post("/deliveries/:tripId/return-challan", verifyToken, verifyNonVendor, val
     // finalized to "re-delivered" instead of "delivered" (see POST
     // /deliveries). capacity/rate are copied from the original challan's
     // matching product snapshot (embedded on the trip) so Rate/Amount
-    // stay consistent when this item is re-delivered.
-    const originalChallanSnapshot = (trip.challans || []).find(c => c.challanId === originalChallanId);
+    // stay consistent when this item is re-delivered. tripDo is copied
+    // too (থাকলে) so the All-Gate-Pass matching picks this challan up as
+    // "return-pending" for the same DO. sourceProductId points back to
+    // the original product _id so a later Trip Do entry on the Delivered
+    // page can find and stamp this row as well.
     const newPendingChallan = {
         customerName, zone, address, thana, district, receiverNumber,
         location: originalChallanSnapshot?.location || null,
         remarks: originalChallanSnapshot?.remarks || "",
         products: (returnedProducts || []).map(p => {
-            const orig = originalChallanSnapshot?.products?.find(op => op._id === p._id) || {};
+            const orig = findOrigProduct(p._id);
             return {
                 _id: new ObjectId().toString(),
+                sourceProductId: p._id || null,
                 productName: p.productName,
                 model: p.model,
                 quantity: Number(p.returnQty || p.quantity),
                 capacity: typeof orig.capacity === 'string' ? orig.capacity : '',
                 rate: Number(orig.rate) || 0,
+                ...(typeof orig.tripDo === 'string' && orig.tripDo.trim()
+                    ? { tripDo: orig.tripDo.trim() } : {}),
             };
         }),
         status: "return-pending",
