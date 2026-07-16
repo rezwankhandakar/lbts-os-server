@@ -503,6 +503,119 @@ async function releaseStaleClaims(challanCollection, challanIds) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Leftover split — partial delivery support
+// ═══════════════════════════════════════════════════════════════════
+// CreateDelivery-র edit modal বা Trip-Details-এর Edit-Challan modal থেকে
+// কোনো product row remove করলে বা quantity কমালে (৫ → ২), বাদ পড়া অংশটা
+// (৩ pcs) হারিয়ে না গিয়ে একটা আলাদা "leftover" challan হিসেবে challans
+// collection-এ ঢোকে — status: "pending", তাই All-Challan-এ আবার next
+// delivery-র জন্য available থাকে।
+//
+// Link fields:
+//   - challan doc:  splitFromChallanId = original challan-এর _id (string)
+//   - product row:  sourceProductId    = original product-এর _id
+//     (bulk-trip-do propagation + merge-dedupe এই দুটো দিয়েই match করে)
+//
+// tripDo: original product-এ Trip Do আগেই বসানো থাকলে leftover product-ও
+// সেটা inherit করে; পরে বসালে bulk-trip-do propagation ফাঁকা গুলো fill
+// করে — দুই ক্ষেত্রেই All-Gate-Pass-এর pending qty হিসেব ঠিক থাকে।
+
+/** old vs new products তুলনা করে বাদ-পড়া/কমে-যাওয়া অংশ বের করা (match by _id) */
+function computeLeftoverProducts(oldProducts, newProducts) {
+    const nextById = new Map(
+        (newProducts || []).filter(p => p && p._id).map(p => [String(p._id), p])
+    );
+    const leftovers = [];
+    for (const op of (oldProducts || [])) {
+        const oldQty = Number(op?.quantity) || 0;
+        if (oldQty <= 0 || !String(op?.productName || '').trim()) continue;
+        const np = op._id ? nextById.get(String(op._id)) : null;
+        const newQty = np ? (Number(np.quantity) || 0) : 0;
+        const diff = oldQty - newQty;
+        if (diff > 0) {
+            leftovers.push({
+                productName: op.productName || '',
+                model: op.model || '',
+                quantity: diff,
+                ...(op.capacity ? { capacity: op.capacity } : {}),
+                ...(op.rate !== undefined && op.rate !== null ? { rate: op.rate } : {}),
+                ...(typeof op.tripDo === 'string' && op.tripDo.trim() ? { tripDo: op.tripDo.trim() } : {}),
+                sourceProductId: String(op._id || ''),
+            });
+        }
+    }
+    return leftovers;
+}
+
+/**
+ * Leftover challan তৈরি (বা একই source-এর আগের pending leftover-এ merge)।
+ * @returns { created, merged, quantity, challanId }
+ */
+async function spawnLeftoverChallan(db, { sourceChallanId, sourceInfo, leftoverProducts, createdBy }) {
+    const challanCollection = db.collection('challans');
+    const items = (leftoverProducts || [])
+        .map(p => ({ ...p, quantity: Number(p.quantity) || 0 }))
+        .filter(p => p.quantity > 0 && String(p.productName || '').trim());
+    if (items.length === 0) return { created: false, merged: false, quantity: 0, challanId: null };
+
+    const norm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9\u0980-\u09FF]/g, '');
+    const totalQty = items.reduce((s, p) => s + p.quantity, 0);
+    const now = new Date();
+
+    // একই challan থেকে বারবার কমালে আলাদা আলাদা doc না বানিয়ে
+    // আগের still-pending leftover-এ qty যোগ হয় — All-Challan পরিষ্কার থাকে।
+    const existing = await challanCollection.findOne({
+        splitFromChallanId: String(sourceChallanId),
+        status: 'pending',
+        claimToken: { $exists: false }, // dispatch চলমান থাকলে নতুন doc-ই বানাই
+    });
+    if (existing) {
+        const products = Array.isArray(existing.products) ? existing.products.map(p => ({ ...p })) : [];
+        for (const p of items) {
+            const idx = products.findIndex(ep =>
+                (p.sourceProductId && String(ep.sourceProductId || '') === String(p.sourceProductId)) ||
+                (norm(ep.productName) === norm(p.productName) && norm(ep.model) === norm(p.model))
+            );
+            if (idx >= 0) {
+                products[idx] = {
+                    ...products[idx],
+                    quantity: (Number(products[idx].quantity) || 0) + p.quantity,
+                    ...(p.tripDo && !String(products[idx].tripDo || '').trim() ? { tripDo: p.tripDo } : {}),
+                };
+            } else {
+                products.push({ _id: new ObjectId().toString(), ...p });
+            }
+        }
+        await challanCollection.updateOne(
+            { _id: existing._id },
+            { $set: { products, lastUpdatedAt: now, lastUpdatedBy: createdBy || 'system' } }
+        );
+        return { created: false, merged: true, quantity: totalQty, challanId: String(existing._id) };
+    }
+
+    const doc = {
+        customerName: sourceInfo?.customerName || '',
+        receiverNumber: sourceInfo?.receiverNumber || '',
+        zone: sourceInfo?.zone || '',
+        address: sourceInfo?.address || '',
+        thana: sourceInfo?.thana || '',
+        district: sourceInfo?.district || '',
+        ...(sourceInfo?.location ? { location: sourceInfo.location } : {}),
+        ...(sourceInfo?.remarks ? { remarks: sourceInfo.remarks } : {}),
+        ...(sourceInfo?.csd ? { csd: sourceInfo.csd } : {}),
+        ...(sourceInfo?.unit ? { unit: sourceInfo.unit } : {}),
+        products: items.map(p => ({ _id: new ObjectId().toString(), ...p })),
+        status: 'pending',
+        splitFromChallanId: String(sourceChallanId),
+        splitAt: now,
+        createdAt: now,
+        createdBy: createdBy || 'system',
+    };
+    const r = await challanCollection.insertOne(doc);
+    return { created: true, merged: false, quantity: totalQty, challanId: String(r.insertedId) };
+}
+
 // ── ObjectId Validation Helper ─────────────────────────────────────
 function isValidObjectId(id) {
     return ObjectId.isValid(id) && String(new ObjectId(id)) === id;
@@ -1142,6 +1255,41 @@ app.get("/gate-pass", verifyToken, verifyNonVendor, async (req, res) => {
         res.send({ data, pagination: { total: data.length } });
     } catch (err) {
         logger.error('Failed to fetch gate passes', err);
+        res.status(500).send({ success: false, message: "Failed to fetch gate passes" });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+//  POST /gate-pass/by-trip-do
+//  Body: { tripDos: ["4681835", ...] }
+//  All-Challan page-এর "GP Match" column এটা ব্যবহার করে — challan
+//  product-এ বসানো Trip Do গুলোর against কোন gate pass আছে সেটা এক
+//  request-এ এনে client-side fuzzy verify (customer + model) করা হয়।
+//  /challans/by-trip-do-র আয়না; শুধু matching-এ দরকারি field গুলো যায়।
+// ─────────────────────────────────────────────────────────────────────
+app.post("/gate-pass/by-trip-do", verifyToken, verifyNonVendor, async (req, res) => {
+    try {
+        const { tripDos } = req.body || {};
+        if (!Array.isArray(tripDos) || tripDos.length === 0) {
+            return res.send({ success: true, data: [] });
+        }
+        const clean = [...new Set(
+            tripDos.map(t => String(t ?? "").trim()).filter(Boolean)
+        )].slice(0, 3000);
+        if (clean.length === 0) return res.send({ success: true, data: [] });
+
+        const db = await connectDB();
+        const data = await db.collection('gate-pass').find(
+            { tripDo: { $in: clean } },
+            { projection: {
+                tripDo: 1, customerName: 1, csd: 1, unit: 1, tripDate: 1,
+                "products._id": 1, "products.productName": 1,
+                "products.model": 1, "products.quantity": 1,
+            } }
+        ).limit(5000).toArray();
+        res.send({ success: true, data });
+    } catch (err) {
+        logger.error("gate-pass by-trip-do fetch failed", err);
         res.status(500).send({ success: false, message: "Failed to fetch gate passes" });
     }
 });
@@ -2151,13 +2299,13 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
     try {
         const db = await connectDB();
         const challanCollection = db.collection('challans');
-        const { customerName, receiverNumber, zone, address, thana, district, products, updatedBy, location } = req.body;
+        const { customerName, receiverNumber, zone, address, thana, district, products, updatedBy, location, splitLeftover } = req.body;
 
-        // FIX #50 — rate server-side resolve করার জন্য challan-এর location লাগে
+        // FIX #50 — rate server-side resolve করার জন্য challan-এর location লাগে।
+        // splitLeftover flow-তে old products + customer info-ও লাগে, তাই
+        // পুরো doc-ই আনা হয় (ছোট doc, projection বাদ)।
         const existingChallan = Array.isArray(products)
-            ? await challanCollection.findOne(
-                { _id: new ObjectId(req.params.id) }, { projection: { location: 1 } }
-            )
+            ? await challanCollection.findOne({ _id: new ObjectId(req.params.id) })
             : null;
 
         // FIX — thana/district edit হলে client নতুন location পাঠায়;
@@ -2204,7 +2352,47 @@ app.patch('/challans/:id', verifyToken, verifyNonVendor, validateObjectId('id'),
             { $set: setDoc }
         );
         if (result.matchedCount > 0) {
-            res.send({ success: true, message: "Challan and Products updated successfully" });
+            // ── Leftover split (opt-in) ──────────────────────────────────
+            // CreateDelivery / Trip-Details-এর "Add Challan" edit modal
+            // splitLeftover: true পাঠায় — product row remove বা qty কমালে
+            // বাদ পড়া অংশটা নতুন pending challan হয়ে All-Challan-এ থাকে,
+            // পরের delivery-তে ব্যবহারের জন্য। Delivered/re-delivered
+            // challan-এ এই route দিয়ে edit হয় না, তবু guard রাখা হলো।
+            let leftover = null;
+            if (
+                splitLeftover === true &&
+                sanitizedProducts !== undefined &&
+                existingChallan &&
+                existingChallan.status !== 'delivered' &&
+                existingChallan.status !== 're-delivered'
+            ) {
+                try {
+                    const leftoverProducts = computeLeftoverProducts(existingChallan.products, sanitizedProducts);
+                    if (leftoverProducts.length > 0) {
+                        leftover = await spawnLeftoverChallan(db, {
+                            sourceChallanId: req.params.id,
+                            sourceInfo: {
+                                customerName: customerName || existingChallan.customerName,
+                                receiverNumber: receiverNumber || existingChallan.receiverNumber,
+                                zone: zone || existingChallan.zone,
+                                address: address || existingChallan.address,
+                                thana: thana || existingChallan.thana,
+                                district: district || existingChallan.district,
+                                location: effectiveLocation || undefined,
+                                remarks: existingChallan.remarks,
+                                csd: existingChallan.csd,
+                                unit: existingChallan.unit,
+                            },
+                            leftoverProducts,
+                            createdBy: updatedBy || req.user?.email || 'unknown',
+                        });
+                    }
+                } catch (splitErr) {
+                    // Best-effort — split fail করলেও মূল update সফল-ই থাকে
+                    logger.error('Leftover split failed (PATCH /challans/:id)', splitErr);
+                }
+            }
+            res.send({ success: true, message: "Challan and Products updated successfully", ...(leftover ? { leftover } : {}) });
         } else {
             res.status(404).send({ success: false, message: "Challan not found" });
         }
@@ -3038,7 +3226,7 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
         const db = await connectDB();
         const deliveriesCollection = db.collection('deliveries');
         const { tripId, challanId, productId } = req.params;
-        const { productName, model, quantity, capacity, rate, updatedBy } = req.body;
+        const { productName, model, quantity, capacity, rate, updatedBy, splitLeftover } = req.body;
 
         const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
         if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
@@ -3086,7 +3274,69 @@ app.patch("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTok
             { _id: new ObjectId(tripId) },
             { $set: setPatch }
         );
-        res.send({ success: true, modifiedCount: result.modifiedCount });
+
+        // ── Leftover split (opt-in — Trip-Details Edit-Challan modal) ──
+        // quantity কমালে (৫ → ২) কমে যাওয়া অংশ (৩) নতুন pending challan
+        // হয়ে All-Challan-এ ফিরে যায় — next delivery-র জন্য available।
+        // পাশাপাশি canonical challans doc-এর ওই product-এর qty-ও নতুন
+        // মানে নামানো হয়, নাহলে delivered qty + pending leftover মিলে
+        // মোট সংখ্যা ফুলে যেত (gate-pass matching-ও ভুল হতো)।
+        let leftover = null;
+        if (splitLeftover === true) {
+            try {
+                const oldProduct = challanProducts[productIndex];
+                const oldQty = Number(oldProduct?.quantity) || 0;
+                const newQty = Number(quantity) || 0;
+                const diff = oldQty - newQty;
+                if (diff > 0) {
+                    const snap = trip.challans[challanIndex];
+                    leftover = await spawnLeftoverChallan(db, {
+                        sourceChallanId: challanId,
+                        sourceInfo: {
+                            customerName: snap.customerName,
+                            receiverNumber: snap.receiverNumber,
+                            zone: snap.zone,
+                            address: snap.address,
+                            thana: snap.thana,
+                            district: snap.district,
+                            location: snap.location || undefined,
+                            remarks: snap.remarks,
+                            csd: snap.csd,
+                            unit: snap.unit,
+                        },
+                        leftoverProducts: [{
+                            productName: oldProduct.productName || productName || '',
+                            model: oldProduct.model || model || '',
+                            quantity: diff,
+                            ...(oldProduct.capacity ? { capacity: oldProduct.capacity } : {}),
+                            ...(oldProduct.rate !== undefined && oldProduct.rate !== null ? { rate: oldProduct.rate } : {}),
+                            ...(typeof oldProduct.tripDo === 'string' && oldProduct.tripDo.trim() ? { tripDo: oldProduct.tripDo.trim() } : {}),
+                            sourceProductId: String(oldProduct._id || productId),
+                        }],
+                        createdBy: updatedBy || req.user?.email || 'unknown',
+                    });
+
+                    // Canonical challans doc mirror — একই product-এর qty কমানো
+                    if (isValidObjectId(challanId)) {
+                        await db.collection('challans').updateOne(
+                            { _id: new ObjectId(challanId) },
+                            {
+                                $set: {
+                                    "products.$[el].quantity": newQty,
+                                    lastUpdatedBy: updatedBy || req.user?.email || 'unknown',
+                                    lastUpdatedAt: new Date(),
+                                },
+                            },
+                            { arrayFilters: [{ "el._id": String(oldProduct._id || productId) }] }
+                        ).catch(() => { /* best-effort */ });
+                    }
+                }
+            } catch (splitErr) {
+                logger.error('Leftover split failed (PATCH trip product)', splitErr);
+            }
+        }
+
+        res.send({ success: true, modifiedCount: result.modifiedCount, ...(leftover ? { leftover } : {}) });
     } catch (err) {
         logger.error("Edit trip product failed", err);
         res.status(500).send({ success: false, message: "Failed to update product" });
@@ -3113,11 +3363,73 @@ app.delete("/deliveries/:tripId/challan/:challanId/product/:productId", verifyTo
         if (!Array.isArray(challanProducts) || challanProducts.length <= 1)
             return res.status(400).send({ success: false, message: "Cannot remove last product" });
 
+        // Split flow-এর জন্য মুছে-যাওয়া product-টা আগে ধরে রাখি
+        const removedProduct = challanProducts.find(p => String(p._id) === String(productId));
+
         const result = await deliveriesCollection.updateOne(
             { _id: new ObjectId(tripId) },
             { $pull: { [`challans.${challanIndex}.products`]: { _id: productId } } }
         );
-        res.send({ success: true, modifiedCount: result.modifiedCount });
+
+        // ── Leftover split (opt-in — ?splitLeftover=1) ─────────────────
+        // Trip-Details Edit-Challan modal থেকে row remove করলে সেই product
+        // পুরো qty সহ নতুন pending challan হয়ে All-Challan-এ ফিরে যায়।
+        // canonical challans doc থেকেও row টা সরানো হয় (delivered হিসেব
+        // থেকে বাদ), যাতে delivered + pending মিলে মোট qty ঠিক থাকে।
+        let leftover = null;
+        const wantSplit = String(req.query?.splitLeftover || '') === '1';
+        if (wantSplit && result.modifiedCount > 0 && removedProduct) {
+            try {
+                const snap = trip.challans[challanIndex];
+                leftover = await spawnLeftoverChallan(db, {
+                    sourceChallanId: challanId,
+                    sourceInfo: {
+                        customerName: snap.customerName,
+                        receiverNumber: snap.receiverNumber,
+                        zone: snap.zone,
+                        address: snap.address,
+                        thana: snap.thana,
+                        district: snap.district,
+                        location: snap.location || undefined,
+                        remarks: snap.remarks,
+                        csd: snap.csd,
+                        unit: snap.unit,
+                    },
+                    leftoverProducts: [{
+                        productName: removedProduct.productName || '',
+                        model: removedProduct.model || '',
+                        quantity: Number(removedProduct.quantity) || 0,
+                        ...(removedProduct.capacity ? { capacity: removedProduct.capacity } : {}),
+                        ...(removedProduct.rate !== undefined && removedProduct.rate !== null ? { rate: removedProduct.rate } : {}),
+                        ...(typeof removedProduct.tripDo === 'string' && removedProduct.tripDo.trim() ? { tripDo: removedProduct.tripDo.trim() } : {}),
+                        sourceProductId: String(removedProduct._id || productId),
+                    }],
+                    createdBy: req.user?.email || 'unknown',
+                });
+
+                // Canonical challans doc mirror — row remove (last product হলে skip)
+                if (isValidObjectId(challanId)) {
+                    const canon = await db.collection('challans').findOne(
+                        { _id: new ObjectId(challanId) },
+                        { projection: { "products._id": 1 } }
+                    );
+                    if (Array.isArray(canon?.products) && canon.products.length > 1 &&
+                        canon.products.some(p => String(p._id) === String(productId))) {
+                        await db.collection('challans').updateOne(
+                            { _id: new ObjectId(challanId) },
+                            {
+                                $pull: { products: { _id: String(productId) } },
+                                $set: { lastUpdatedBy: req.user?.email || 'unknown', lastUpdatedAt: new Date() },
+                            }
+                        ).catch(() => { /* best-effort */ });
+                    }
+                }
+            } catch (splitErr) {
+                logger.error('Leftover split failed (DELETE trip product)', splitErr);
+            }
+        }
+
+        res.send({ success: true, modifiedCount: result.modifiedCount, ...(leftover ? { leftover } : {}) });
     } catch (err) {
         logger.error("Delete trip product failed", err);
         res.status(500).send({ success: false, message: "Failed to delete product" });
@@ -3230,6 +3542,33 @@ app.post("/deliveries/:tripId/challan/:challanId/product", verifyToken, verifyNo
             { _id: new ObjectId(tripId) },
             { $push: { [`challans.${challanIndex}.products`]: newProduct } }
         );
+
+        // ── Canonical challans doc sync (opt-in) ───────────────────────
+        // Trip-Details-এর Edit-Challan modal থেকে নতুন product add করলে
+        // সেটা All-Challan-এর canonical challan record-এও যোগ হয় — একই
+        // _id সহ, যাতে পরের Trip-Do / gate-sync propagation ঠিকমতো match
+        // করে। Best-effort: fail করলেও trip-এ add সফল-ই থাকে।
+        if (req.body?.syncChallan === true && isValidObjectId(challanId)) {
+            try {
+                await db.collection('challans').updateOne(
+                    {
+                        _id: new ObjectId(challanId),
+                        // একই _id-র product আগেই থাকলে duplicate push নয়
+                        "products._id": { $ne: newProduct._id },
+                    },
+                    {
+                        $push: { products: { ...newProduct } },
+                        $set: {
+                            lastUpdatedBy: req.user?.email || 'unknown',
+                            lastUpdatedAt: new Date(),
+                        },
+                    }
+                );
+            } catch (syncErr) {
+                logger.error('Canonical challan product sync failed (POST trip product)', syncErr);
+            }
+        }
+
         res.send({ success: true, product: newProduct });
     } catch (err) {
         logger.error("Add trip product failed", err);
@@ -3407,6 +3746,16 @@ app.patch("/deliveries/bulk-trip-do", verifyToken, verifyRole('admin'), async (r
             ).toArray();
             const hasDerived = new Set(derivedDocs.map(d => String(d.returnedFromChallanId)));
 
+            // কোন original গুলোর split-leftover challan আছে (এক query) —
+            // CreateDelivery / Trip-Details edit-এ product কমানো/সরানোর ফলে
+            // জন্মানো pending leftover গুলো, Trip Do এদেরও পৌঁছাতে হবে
+            // যাতে All-Gate-Pass এদের pending qty হিসাবে ধরে।
+            const splitDocs = await challanCollection.find(
+                { splitFromChallanId: { $in: ids } },
+                { projection: { splitFromChallanId: 1 } }
+            ).toArray();
+            const hasSplit = new Set(splitDocs.map(d => String(d.splitFromChallanId)));
+
             const inIds = (pid, productIds) => productIds.includes(String(pid)) || productIds.includes(pid);
             const fillEmpty = { "el.tripDo": { $in: [null, ""] } };
 
@@ -3464,6 +3813,20 @@ app.patch("/deliveries/bulk-trip-do", verifyToken, verifyRole('admin'), async (r
                         }
                     ).then(r => { touched += r.modifiedCount || 0; })
                 );
+                // ── Split-leftover propagation ──────────────────────────
+                // Original product-এ Trip Do বসালে তার থেকে জন্মানো leftover
+                // challan-এর ফাঁকা tripDo গুলোও fill হয় (sourceProductId
+                // দিয়ে exact match; admin আলাদা DO বসিয়ে থাকলে overwrite নয়)।
+                if (hasSplit.has(challanId)) {
+                    operations.push(
+                        challanCollection.updateMany(
+                            { splitFromChallanId: challanId },
+                            { $set: { "products.$[el].tripDo": writeValue } },
+                            { arrayFilters: [{ "el.sourceProductId": { $in: productIds.map(String) }, ...fillEmpty }] }
+                        ).then(r => { touched += r.modifiedCount || 0; })
+                    );
+                }
+
                 if (!hasDerived.has(challanId)) continue;
                 const filter = { returnedFromChallanId: challanId };
                 operations.push(
@@ -3935,10 +4298,14 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
     let claimedSuccessfully = false;
     let embedded = false;
     let embeddedIds = [];
+    // Rollback + finalize-এ লাগে, তাই try block-এর বাইরে declare
+    let returnPendingIdSet = new Set();
+    let tripNumberForRollback = null;
 
     try {
         const trip = await deliveriesCollection.findOne({ _id: new ObjectId(tripId) });
         if (!trip) return res.status(404).send({ success: false, message: "Trip not found" });
+        tripNumberForRollback = trip.tripNumber || null;
 
         // Guard: don't add a challan that's already embedded in this trip.
         const existingIds = new Set((trip.challans || []).map(c => String(c.challanId)));
@@ -3950,12 +4317,33 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
             });
         }
 
+        // ── Return-pending lookup ──────────────────────────────────────
+        // মূল POST /deliveries route-এর মতোই: Trip-Details-এর "Product
+        // Return" থেকে জন্মানো challan-এর status "return-pending" থাকে।
+        // Existing trip-এ add করে dispatch করলেও সেগুলো "delivered" নয়,
+        // "re-delivered" হিসেবে finalize হতে হবে — নাহলে All-Challan /
+        // Delivered page-এ প্রথম delivery আর re-delivery আলাদা করা যায় না
+        // (আর gate-pass-এর net delivered হিসাবও ভুল হয়ে যায়)।
+        try {
+            const preStatusDocs = await challanCollection
+                .find({ _id: { $in: challanIds } })
+                .project({ status: 1 })
+                .toArray();
+            returnPendingIdSet = new Set(
+                preStatusDocs.filter(d => d.status === 'return-pending').map(d => d._id.toString())
+            );
+        } catch (err) {
+            logger.error('Pre-claim status lookup failed (add-challans)', err);
+        }
+
         // ── FIX #54: আগের কোনো crashed request-এর আটকে থাকা claim ছাড়ো ──
         await releaseStaleClaims(challanCollection, challanIds);
 
         // ── Step 1: Atomic claim (only pending, unclaimed challans) ──
+        // Main route-এর মতোই re-delivered-ও exclude — একবার re-deliver
+        // হয়ে যাওয়া challan আবার add করা যাবে না।
         const claimResult = await challanCollection.updateMany(
-            { _id: { $in: challanIds }, status: { $ne: 'delivered' }, claimToken: { $exists: false } },
+            { _id: { $in: challanIds }, status: { $nin: ['delivered', 're-delivered'] }, claimToken: { $exists: false } },
             { $set: { claimToken, claimedAt: new Date() } }
         );
         claimedSuccessfully = true;
@@ -3970,7 +4358,7 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
             const conflictDocs = await challanCollection
                 .find({ _id: { $in: challanIds } })
                 .project({ customerName: 1, status: 1 }).toArray();
-            const alreadyDelivered = conflictDocs.filter(d => d.status === 'delivered');
+            const alreadyDelivered = conflictDocs.filter(d => d.status === 'delivered' || d.status === 're-delivered');
             const msg = alreadyDelivered.length > 0
                 ? `Already delivered: ${alreadyDelivered.map(c => c.customerName).join(", ")}`
                 : "Some challans could not be claimed (in another active dispatch). Try again.";
@@ -3990,6 +4378,9 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
             // route above.
             remarks: typeof d.remarks === 'string' ? d.remarks : '',
             receiverNumber: d.receiverNumber,
+            // Re-delivery marker — Delivered page-এর Type column-এ
+            // "Re-Delivered" দেখাতে (main create-delivery route-এর মতোই)
+            isReDelivery: returnPendingIdSet.has(String(d.challanId)),
             products: (d.products || []).map(p => {
                 // FIX #50 — server-resolved rate, client মান শুধু cross-check
                 const guarded = resolveAuthoritativeRate({
@@ -4009,6 +4400,10 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
                     quantity: Number(p.quantity),
                     capacity: guarded.capacity,
                     rate: guarded.rate,
+                    // Trip Do carry — main route-এর মতোই: dispatch-এর আগে
+                    // বসানো থাকলে snapshot-এও যায়, নাহলে Delivered page-এ
+                    // গিয়ে হারিয়ে যেত (sync gap)।
+                    ...(typeof p.tripDo === 'string' && p.tripDo.trim() ? { tripDo: p.tripDo.trim() } : {}),
                 };
             }),
         }));
@@ -4025,15 +4420,36 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
         if (pushResult.modifiedCount === 0) throw new Error("Failed to embed challans into trip");
         embedded = true;
 
-        // ── Step 3: Finalize challan status (claim -> delivered) ──
-        const finalizeResult = await challanCollection.updateMany(
-            { _id: { $in: challanIds }, claimToken },
-            {
-                $set: { status: "delivered", tripNumber: trip.tripNumber },
-                $unset: { claimToken: "", claimedAt: "" },
-            }
-        );
-        if (finalizeResult.matchedCount !== challanIds.length) {
+        // ── Step 3: Finalize challan status ────────────────────────────
+        // Main create-delivery route-এর মতোই: return-pending challan
+        // "re-delivered" হয়, বাকিরা "delivered"। আগে সবাইকে "delivered"
+        // করা হতো — তাতে existing trip-এ add করা return product-এর
+        // status ভুল দেখাত।
+        const returnPendingChallanIds = challanIds.filter(id => returnPendingIdSet.has(id.toString()));
+        const regularChallanIds = challanIds.filter(id => !returnPendingIdSet.has(id.toString()));
+
+        let finalizedCount = 0;
+        if (regularChallanIds.length > 0) {
+            const r = await challanCollection.updateMany(
+                { _id: { $in: regularChallanIds }, claimToken },
+                {
+                    $set: { status: "delivered", tripNumber: trip.tripNumber },
+                    $unset: { claimToken: "", claimedAt: "" },
+                }
+            );
+            finalizedCount += r.matchedCount;
+        }
+        if (returnPendingChallanIds.length > 0) {
+            const r = await challanCollection.updateMany(
+                { _id: { $in: returnPendingChallanIds }, claimToken },
+                {
+                    $set: { status: "re-delivered", tripNumber: trip.tripNumber },
+                    $unset: { claimToken: "", claimedAt: "" },
+                }
+            );
+            finalizedCount += r.matchedCount;
+        }
+        if (finalizedCount !== challanIds.length) {
             throw new Error("Failed to finalize all challans");
         }
 
@@ -4061,6 +4477,27 @@ app.post("/deliveries/:tripId/add-challans", verifyToken, verifyNonVendor, valid
                     { _id: { $in: challanIds }, claimToken },
                     { $unset: { claimToken: "", claimedAt: "" } }
                 );
+                // Finalize আংশিক হয়ে গিয়ে থাকলে (claimToken আর নেই, status
+                // বসে গেছে) সেগুলোকে আগের অবস্থায় ফেরানো হয় — শুধু এই
+                // request-এর challan + এই trip-এর tripNumber match করলে।
+                // Return-pending থেকে আসা গুলো আবার return-pending-এ,
+                // বাকিরা plain pending-এ ফিরবে (main route-এর মতোই)।
+                if (tripNumberForRollback) {
+                    const revertReturnIds  = challanIds.filter(id => returnPendingIdSet.has(id.toString()));
+                    const revertRegularIds = challanIds.filter(id => !returnPendingIdSet.has(id.toString()));
+                    if (revertRegularIds.length > 0) {
+                        await challanCollection.updateMany(
+                            { _id: { $in: revertRegularIds }, tripNumber: tripNumberForRollback, status: "delivered" },
+                            { $set: { status: "pending" }, $unset: { tripNumber: "" } }
+                        );
+                    }
+                    if (revertReturnIds.length > 0) {
+                        await challanCollection.updateMany(
+                            { _id: { $in: revertReturnIds }, tripNumber: tripNumberForRollback, status: "re-delivered" },
+                            { $set: { status: "return-pending" }, $unset: { tripNumber: "" } }
+                        );
+                    }
+                }
             }
         } catch (rollbackErr) {
             logger.error("Add-challans rollback FAILED — manual fix needed", { tripId, rollbackErr });
