@@ -48,7 +48,12 @@ const multerUpload = multer({
         if (allowed.includes(file.mimetype)) {
             cb(null, true);
         } else {
-            cb(new Error('Only JPEG, PNG, WEBP allowed'));
+            // Code দিলে global error handler এটাকে 400 + পরিষ্কার message
+            // হিসেবে পাঠাতে পারে — আগে generic 500 "Internal Server Error"
+            // যেত (phone-এর HEIC ছবিই সবচেয়ে common case)।
+            const err = new Error('Only JPEG, PNG, WEBP allowed');
+            err.code = 'INVALID_FILE_TYPE';
+            cb(err);
         }
     }
 });
@@ -723,7 +728,32 @@ app.post('/upload-image', uploadLimiter, mongoUploadLimiter, multerUpload.single
 
         res.send({ success: true, url });
     } catch (err) {
-        logger.error('Image upload failed', err);
+        /* imgbb-side failure আলাদা করে চেনা — আগে সব ক্ষেত্রেই
+           generic "Image upload failed" (500) যেত, log-এও বোঝা যেত না
+           imgbb key invalid নাকি timeout নাকি অন্য কিছু। */
+        const imgbbStatus = err?.response?.status;
+        const imgbbData = err?.response?.data;
+        logger.error('Image upload failed', {
+            message: err?.message,
+            code: err?.code,
+            imgbbStatus,
+            imgbbError: imgbbData?.error || imgbbData,
+            user: req.user?.email,
+        });
+        if (err?.code === 'ECONNABORTED') {
+            return res.status(504).send({ success: false, message: 'Image hosting service timed out — please try again' });
+        }
+        if (imgbbStatus) {
+            // imgbb নিজে error দিয়েছে (invalid/expired API key হলে 400 আসে)
+            const detail = imgbbData?.error?.message || '';
+            const keyIssue = /key/i.test(detail);
+            return res.status(502).send({
+                success: false,
+                message: keyIssue
+                    ? 'Image hosting API key is invalid or expired — contact admin to update IMGBB_API_KEY'
+                    : `Image hosting service error${detail ? `: ${detail}` : ''}`,
+            });
+        }
         res.status(500).send({ success: false, message: 'Image upload failed' });
     }
 });
@@ -6436,6 +6466,13 @@ app.use((err, req, res, next) => {
     // Multer file size error
     if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(400).send({ success: false, message: 'File too large (max 5MB)' });
+    }
+    // Multer fileFilter rejection (HEIC / অন্য format)
+    if (err.code === 'INVALID_FILE_TYPE') {
+        return res.status(400).send({
+            success: false,
+            message: 'Only JPEG, PNG or WEBP images are allowed — phone HEIC photos must be converted to JPEG first'
+        });
     }
     res.status(500).send({ success: false, message: "Internal Server Error" });
 });
