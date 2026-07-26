@@ -361,6 +361,31 @@ const INDEX_PLAN = {
   ],
 
   // ─────────────────────────────────────────────────────────────────
+  //  RATE_ENTRIES collection (FIX #55 — client থেকে যোগ করা product/model)
+  //  Query patterns:
+  //    find({ active: { $ne: false } }).sort({ createdAt: 1 })  ← cache load
+  //    find({ type }).sort({ createdAt: -1 })                   ← admin list
+  //    findOne({ type, product: /^..$/i, model, capacity })     ← duplicate check
+  // ─────────────────────────────────────────────────────────────────
+  rate_entries: [
+    {
+      keys: { active: 1, createdAt: 1 },
+      options: { name: 'active_created' },
+      why: 'Rate override cache load — active rows in insertion order',
+    },
+    {
+      keys: { type: 1, createdAt: -1 },
+      options: { name: 'type_created_desc' },
+      why: 'Admin list page: filter by with-model / without-model, newest first',
+    },
+    {
+      keys: { product: 1, model: 1, capacity: 1 },
+      options: { name: 'product_model_capacity' },
+      why: 'Duplicate detection before insert/update',
+    },
+  ],
+
+  // ─────────────────────────────────────────────────────────────────
   //  RATE_LIMITS collection (FIX #51 — serverless-safe limiter counters)
   //  utils/mongoRateLimit.js নিজেও প্রথম call-এ index তৈরি করে,
   //  কিন্তু এখানে declare করা থাকলে setup script একবারেই সব বানায়।

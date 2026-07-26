@@ -39,6 +39,18 @@ const {
 } = require('./utils/helpers');
 const { resolveAuthoritativeRate } = require('./services/rateResolver');
 const { createMongoRateLimit } = require('./utils/mongoRateLimit');
+// FIX #55 — Client থেকে নতুন product/model যোগ করার feature।
+// rate_entries collection-এ custom row রাখে, baseline rateTable.js এর
+// উপরে overlay হয়। বিস্তারিত: services/customRateStore.js
+const {
+    COLLECTION: RATE_ENTRIES_COLLECTION,
+    LOCATION_KEYS: RATE_LOCATION_KEYS,
+    ensureCustomRates,
+    loadCustomRates,
+    invalidateCustomRates,
+    getRateTablePayload,
+    getBaselineTables,
+} = require('./services/customRateStore');
 
 const multerUpload = multer({
     storage: multer.memoryStorage(),
@@ -327,6 +339,10 @@ async function getConnection() {
 
 async function connectDB() {
     const { db } = await getConnection();
+    // FIX #55 — custom rate overrides cache warm রাখা।
+    // ৬০s TTL; fresh থাকলে কোনো DB hit হয় না, stale হলে background refresh।
+    // কখনো throw করে না, তাই কোনো route এতে ভাঙবে না।
+    await ensureCustomRates(db);
     return db;
 }
 
@@ -761,12 +777,276 @@ app.post('/upload-image', uploadLimiter, mongoUploadLimiter, multerUpload.single
 // ═══════════════════════════════════════════════════════════════════
 // /jwt — Issue Application JWT after Firebase ID Token Verification
 // ═══════════════════════════════════════════════════════════════════
-// ── FIX #50c — Rate table read endpoint ────────────────────────────
-// Client চাইলে এখান থেকে সর্বশেষ rate table নিতে পারে — ভবিষ্যতে
-// client-এর static copy সরিয়ে এটাকেই single source of truth করা যাবে।
-app.get('/rate-table', verifyToken, verifyApproved, (req, res) => {
-    const { WITH_MODEL_DATA, WITHOUT_MODEL_DATA } = require('./constants/rateTable');
-    res.send({ success: true, withModel: WITH_MODEL_DATA, withoutModel: WITHOUT_MODEL_DATA });
+// ── FIX #50c / #55 — Rate table read endpoint ──────────────────────
+// baseline table (constants/rateTable.js) + rate_entries collection-এর
+// custom row — দুটো merge করে পাঠায়। Client boot-এ একবার এটা fetch করে
+// নিজের rateMatcher-এ overlay করে, ফলে নতুন যোগ করা product/model
+// সাথে সাথেই challan/delivery সব জায়গায় কাজ করে।
+app.get('/rate-table', verifyToken, verifyApproved, async (req, res) => {
+    try {
+        const db = await connectDB();
+        await loadCustomRates(db);            // সবসময় টাটকা copy পাঠাই
+        res.send({ success: true, ...getRateTablePayload() });
+    } catch (err) {
+        logger.error('Rate table fetch failed', err);
+        // Baseline অন্তত পাঠাই — client তখন শুধু নিজের static copy ব্যবহার করবে
+        const base = getBaselineTables();
+        res.status(200).send({
+            success: true,
+            degraded: true,
+            custom: { withModel: [], withoutModel: [] },
+            withModel: base.withModel,
+            withoutModel: base.withoutModel,
+        });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// FIX #55 — Product / Model Rate Entries (client থেকে নতুন product add)
+// ═══════════════════════════════════════════════════════════════════
+// আগে নতুন unique product model যোগ করতে withModelData.js +
+// withoutModelData.js + constants/rateTable.js হাতে edit করে redeploy
+// করতে হতো। এখন admin/manager UI থেকেই row যোগ/edit/delete করতে পারে।
+//
+// Doc shape:
+//   {
+//     type:     'with-model' | 'without-model',
+//     product:  'Refrigerator',
+//     model:    '7A1'          // with-model হলে required, নাহলে ''
+//     capacity: 'Gross 50-150 Litre' | ''   // without-model এ optional
+//     rates:    { 'ISD': 650, 'OSD-Metro': 950, 'OSD-Thana': 1150 },
+//     active:   true,
+//     note:     '',
+//     createdBy, createdAt, updatedBy, updatedAt
+//   }
+//
+// ⚠ Rate সরাসরি bill-এর হিসাবে যায়, তাই সব write audit log-এ ওঠে।
+
+const RATE_ENTRY_TYPES = ['with-model', 'without-model'];
+
+/** body → validated doc fields (throw করে message নিয়ে) */
+function parseRateEntryBody(body) {
+    const type = String(body?.type || '').trim();
+    if (!RATE_ENTRY_TYPES.includes(type)) {
+        throw new Error("type must be 'with-model' or 'without-model'");
+    }
+
+    const product = String(body?.product || '').trim();
+    if (product.length < 2) throw new Error('Product name must be at least 2 characters');
+    if (product.length > 80) throw new Error('Product name is too long (max 80)');
+
+    let model = String(body?.model || '').trim();
+    if (type === 'with-model') {
+        // Model string substring-match এ ব্যবহার হয় — ১ অক্ষরের model
+        // প্রায় সব model string-এ মিলে যাবে, তাই ২ অক্ষর minimum।
+        if (model.length < 2) throw new Error('Model must be at least 2 characters (substring match হয়)');
+        if (model.length > 60) throw new Error('Model is too long (max 60)');
+    } else {
+        model = '';
+    }
+
+    const capacity = String(body?.capacity || '').trim();
+    if (capacity.length > 80) throw new Error('Capacity is too long (max 80)');
+
+    const rawRates = body?.rates || {};
+    const rates = {};
+    for (const key of RATE_LOCATION_KEYS) {
+        const n = Number(rawRates[key]);
+        if (!Number.isFinite(n) || n < 0 || n > 1000000) {
+            throw new Error(`Invalid rate for ${key} (0 – 1,000,000 এর মধ্যে হতে হবে)`);
+        }
+        rates[key] = Math.round(n);
+    }
+
+    const note = String(body?.note || '').trim().slice(0, 300);
+    const active = body?.active === undefined ? true : !!body.active;
+
+    return { type, product, model, capacity, rates, note, active };
+}
+
+/** একই product + model + capacity আগে থেকেই আছে কি না */
+async function findDuplicateRateEntry(col, { type, product, model, capacity }, excludeId) {
+    const ci = (s) => new RegExp(`^${escapeRegex(s)}$`, 'i');
+    const query = {
+        type,
+        product: ci(product),
+        model: model ? ci(model) : { $in: ['', null] },
+        capacity: capacity ? ci(capacity) : { $in: ['', null] },
+    };
+    if (excludeId) query._id = { $ne: new ObjectId(excludeId) };
+    return col.findOne(query);
+}
+
+// ── LIST ───────────────────────────────────────────────────────────
+// Custom entries (default) — includeBaseline=1 দিলে built-in table-ও আসে
+app.get('/rate-entries', verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
+    try {
+        const db = await connectDB();
+        const col = db.collection(RATE_ENTRIES_COLLECTION);
+
+        const filter = {};
+        if (RATE_ENTRY_TYPES.includes(req.query.type)) filter.type = req.query.type;
+        if (req.query.search) {
+            const rx = new RegExp(escapeRegex(String(req.query.search).trim()), 'i');
+            filter.$or = [{ product: rx }, { model: rx }, { capacity: rx }];
+        }
+
+        const data = await col.find(filter).sort({ createdAt: -1 }).toArray();
+
+        const payload = { success: true, data, count: data.length };
+        if (req.query.includeBaseline === '1') {
+            payload.baseline = getBaselineTables();
+        }
+        res.send(payload);
+    } catch (err) {
+        logger.error('Rate entries fetch failed', err);
+        res.status(500).send({ success: false, message: 'Failed to fetch rate entries' });
+    }
+});
+
+// ── CREATE ─────────────────────────────────────────────────────────
+app.post('/rate-entries', verifyToken, verifyRole('admin', 'manager'), async (req, res) => {
+    try {
+        let fields;
+        try {
+            fields = parseRateEntryBody(req.body);
+        } catch (e) {
+            return res.status(400).send({ success: false, message: e.message });
+        }
+
+        const db = await connectDB();
+        const col = db.collection(RATE_ENTRIES_COLLECTION);
+
+        const dup = await findDuplicateRateEntry(col, fields);
+        if (dup) {
+            return res.status(409).send({
+                success: false,
+                message: 'এই product + model + capacity combination আগেই যোগ করা আছে',
+                existingId: String(dup._id),
+            });
+        }
+
+        const doc = {
+            ...fields,
+            createdBy: req.user?.email || 'unknown',
+            createdAt: new Date(),
+            updatedBy: null,
+            updatedAt: null,
+        };
+
+        const result = await col.insertOne(doc);
+        invalidateCustomRates();
+
+        await recordAudit({
+            db,
+            action: 'CREATE_RATE_ENTRY',
+            collectionName: RATE_ENTRIES_COLLECTION,
+            documentId: String(result.insertedId),
+            newDoc: doc,
+            reason: fields.note,
+            req,
+        });
+
+        logger.info('Rate entry created', {
+            by: doc.createdBy, product: doc.product, model: doc.model, type: doc.type,
+        });
+
+        res.send({ success: true, insertedId: result.insertedId, data: { ...doc, _id: result.insertedId } });
+    } catch (err) {
+        logger.error('Rate entry create failed', err);
+        res.status(500).send({ success: false, message: 'Failed to create rate entry' });
+    }
+});
+
+// ── UPDATE ─────────────────────────────────────────────────────────
+app.patch('/rate-entries/:id', verifyToken, verifyRole('admin', 'manager'), validateObjectId('id'), async (req, res) => {
+    try {
+        let fields;
+        try {
+            fields = parseRateEntryBody(req.body);
+        } catch (e) {
+            return res.status(400).send({ success: false, message: e.message });
+        }
+
+        const db = await connectDB();
+        const col = db.collection(RATE_ENTRIES_COLLECTION);
+        const _id = new ObjectId(req.params.id);
+
+        const oldDoc = await col.findOne({ _id });
+        if (!oldDoc) {
+            return res.status(404).send({ success: false, message: 'Rate entry not found' });
+        }
+
+        const dup = await findDuplicateRateEntry(col, fields, req.params.id);
+        if (dup) {
+            return res.status(409).send({
+                success: false,
+                message: 'অন্য একটা entry-তে একই product + model + capacity আছে',
+                existingId: String(dup._id),
+            });
+        }
+
+        const update = {
+            ...fields,
+            updatedBy: req.user?.email || 'unknown',
+            updatedAt: new Date(),
+        };
+
+        await col.updateOne({ _id }, { $set: update });
+        invalidateCustomRates();
+
+        await recordAudit({
+            db,
+            action: 'EDIT_RATE_ENTRY',
+            collectionName: RATE_ENTRIES_COLLECTION,
+            documentId: req.params.id,
+            oldDoc,
+            newDoc: { ...oldDoc, ...update },
+            reason: req.body?.reason || fields.note,
+            req,
+        });
+
+        res.send({ success: true, data: { ...oldDoc, ...update } });
+    } catch (err) {
+        logger.error('Rate entry update failed', err);
+        res.status(500).send({ success: false, message: 'Failed to update rate entry' });
+    }
+});
+
+// ── DELETE ─────────────────────────────────────────────────────────
+app.delete('/rate-entries/:id', verifyToken, verifyRole('admin', 'manager'), validateObjectId('id'), async (req, res) => {
+    try {
+        const db = await connectDB();
+        const col = db.collection(RATE_ENTRIES_COLLECTION);
+        const _id = new ObjectId(req.params.id);
+
+        const oldDoc = await col.findOne({ _id });
+        if (!oldDoc) {
+            return res.status(404).send({ success: false, message: 'Rate entry not found' });
+        }
+
+        await col.deleteOne({ _id });
+        invalidateCustomRates();
+
+        await recordAudit({
+            db,
+            action: 'DELETE_RATE_ENTRY',
+            collectionName: RATE_ENTRIES_COLLECTION,
+            documentId: req.params.id,
+            oldDoc,
+            reason: req.body?.reason || req.query?.reason || '',
+            req,
+        });
+
+        logger.warn('Rate entry deleted', {
+            by: req.user?.email, product: oldDoc.product, model: oldDoc.model,
+        });
+
+        res.send({ success: true, message: 'Rate entry deleted' });
+    } catch (err) {
+        logger.error('Rate entry delete failed', err);
+        res.status(500).send({ success: false, message: 'Failed to delete rate entry' });
+    }
 });
 
 app.post('/jwt', authLimiter, mongoAuthLimiter, async (req, res) => {

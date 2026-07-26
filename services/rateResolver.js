@@ -20,7 +20,12 @@
 //    Default: enforce
 // ═══════════════════════════════════════════════════════════════════
 
-const { WITH_MODEL_DATA, WITHOUT_MODEL_DATA } = require('../constants/rateTable');
+// NOTE: baseline table (constants/rateTable.js) সরাসরি import করা হয় না।
+// customRateStore.getMergedTables() = [DB-র custom rows ..., baseline rows ...]
+// custom rows আগে থাকে, তাই admin UI থেকে যোগ করা row baseline-কে override
+// করতে পারে। DB unreachable হলেও store খালি custom list নিয়ে baseline
+// ফেরত দেয় — পুরনো behaviour অটুট।
+const { getMergedTables } = require('./customRateStore');
 
 const LOCATION_KEYS = ['ISD', 'OSD-Metro', 'OSD-Thana'];
 
@@ -53,6 +58,8 @@ function findRate({ productName, model, location, capacity }) {
     if (!productName || !location || !LOCATION_KEYS.includes(location)) {
         return empty;
     }
+
+    const { withModel: WITH_MODEL_DATA, withoutModel: WITHOUT_MODEL_DATA } = getMergedTables();
 
     // ── 1. WITH-MODEL first (more specific) ──
     if (model) {
