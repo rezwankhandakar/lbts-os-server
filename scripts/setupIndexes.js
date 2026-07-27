@@ -144,6 +144,26 @@ const INDEX_PLAN = {
   //    - aggregate for filter options                                  [Line 2745-2772]
   // ─────────────────────────────────────────────────────────────────
   challans: [
+    // ── Duplicate prevention ────────────────────────────────────────
+    {
+      // Layer 1 — idempotency key. unique, কিন্তু partial: শুধু যেসব doc-এ
+      // clientRequestId string হিসেবে আছে সেগুলোই index হয়। পুরনো সব
+      // challan (যাদের field নেই) বাদ পড়ে, তাই migration ছাড়াই safe।
+      keys: { clientRequestId: 1 },
+      options: {
+        name: 'clientRequestId_unique',
+        unique: true,
+        partialFilterExpression: { clientRequestId: { $type: 'string' } },
+      },
+      why: 'POST /challan — timeout/retry/double-submit এ duplicate insert আটকায়',
+    },
+    {
+      // Layer 2 — content fingerprint lookup: { dupKey, createdAt >= cutoff }
+      // unique নয় — আসল repeat order থাকতে পারে, তাই শুধু warning-এর জন্য।
+      keys: { dupKey: 1, createdAt: -1 },
+      options: { name: 'dupKey_created' },
+      why: 'POST /challan — গত ৬ ঘণ্টায় হুবহু একই challan আছে কিনা check',
+    },
     {
       // FIX #54 — stale claim cleanup query: { claimToken exists, claimedAt < cutoff }
       // Partial index তাই খুব ছোট থাকে (শুধু claimed docs index হয়)।

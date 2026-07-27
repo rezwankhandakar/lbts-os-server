@@ -489,6 +489,51 @@ function verifyNonVendor(req, res, next) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// DUPLICATE CHALLAN PREVENTION
+// ═══════════════════════════════════════════════════════════════════
+// সমস্যা: operator মাঝে মাঝে একই challan দুইবার entry করে ফেলত। দুইটা
+// আলাদা কারণ ছিল —
+//
+//   (a) NETWORK: axios timeout 30s, Vercel cold start-এ POST /challan
+//       এর বেশি সময় নিলে client "Failed to add challan" দেখাত, অথচ
+//       server-এ insert হয়ে গেছে। Operator আবার submit করলেই দুইটা doc।
+//       একই ঘটনা 401 token-refresh retry-তেও হতে পারত।
+//
+//   (b) HUMAN: operator ভুলে গিয়ে কিছুক্ষণ পরে হুবহু একই challan আবার
+//       টাইপ করে ফেলত — server-এ কোনো check ছিল না।
+//
+// সমাধান দুই layer-এ:
+//
+//   Layer 1 — clientRequestId (idempotency key)
+//     Client প্রতি fresh entry-র জন্য একটা UUID পাঠায়। challans-এ
+//     unique partial index থাকায় একই key দ্বিতীয়বার insert হতে পারে না;
+//     duplicate-key error ধরে আগের _id ফেরত দেওয়া হয় (duplicate: true)।
+//     ফলে retry সবসময় safe — (a) সম্পূর্ণ বন্ধ।
+//     Partial index তাই পুরনো doc (যাদের field নেই) index-এ ঢোকে না,
+//     কোনো migration লাগে না।
+//
+//   Layer 2 — dupKey (content fingerprint)
+//     customer + receiver phone + (product|model|qty) sorted থেকে একটা
+//     normalized key বানানো হয়। গত DUP_WINDOW_MS-এ একই key পেলে 409
+//     DUPLICATE_CHALLAN, সাথে আগের entry-র তথ্য। Operator UI-তে confirm
+//     করলে forceDuplicate: true দিয়ে আবার পাঠায় — কারণ আসল repeat order
+//     থাকতেও পারে। তাই dupKey কখনো unique index নয়।
+const DUP_WINDOW_MS = 6 * 60 * 60 * 1000; // ৬ ঘণ্টা — business pattern অনুযায়ী tune করা যায়
+
+const normDup = (s) => String(s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+function buildChallanDupKey(challan) {
+    const items = (Array.isArray(challan.products) ? challan.products : [])
+        .map(p => `${normDup(p.productName)}~${normDup(p.model)}~${Number(p.quantity) || 0}`)
+        .sort()
+        .join('|');
+    // শেষ ১০ digit — "01711223344", "+8801711223344", "8801711-223344"
+    // সবগুলোকে একই ধরা হয়।
+    const phone = String(challan.receiverNumber ?? '').replace(/\D/g, '').slice(-10);
+    return `${normDup(challan.customerName)}#${phone}#${items}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // FIX #54 — Stale claimToken auto-release
 // ═══════════════════════════════════════════════════════════════════
 // সমস্যা: delivery create / trip-add flow-তে challan-এ claimToken বসিয়ে
@@ -1815,6 +1860,13 @@ app.post("/challan", verifyToken, verifyNonVendor, validate([
     // sent as "" / 0 and the Delivered-page editor sets them later.
     body('products.*.capacity').optional({ checkFalsy: false }).isString(),
     body('products.*.rate').optional({ checkFalsy: false }).isNumeric(),
+    // ── Duplicate prevention fields ──
+    // clientRequestId: idempotency key (Layer 1). না পাঠালেও endpoint কাজ
+    // করবে, কিন্তু তখন retry-protection পাওয়া যাবে না।
+    body('clientRequestId').optional().isString().trim().isLength({ min: 8, max: 100 })
+        .withMessage('Invalid clientRequestId'),
+    // forceDuplicate: operator 409-এর পরে জেনেশুনে confirm করলে (Layer 2)।
+    body('forceDuplicate').optional().isBoolean().withMessage('forceDuplicate must be boolean'),
 ]), async (req, res) => {
     try {
         const db = await connectDB();
@@ -1847,8 +1899,72 @@ app.post("/challan", verifyToken, verifyNonVendor, validate([
         }
         challan.createdAt = new Date();
         challan.createdBy = req.user?.email || 'unknown';
-        const result = await challanCollection.insertOne(challan);
-        res.send({ success: true, insertedId: result.insertedId });
+
+        // ── Duplicate prevention ──────────────────────────────────────
+        // forceDuplicate একটা control flag, doc-এ save হওয়ার জিনিস নয় —
+        // req.body পুরোটাই insert হয়, তাই আগে সরিয়ে নেওয়া জরুরি।
+        const forceDuplicate = challan.forceDuplicate === true;
+        delete challan.forceDuplicate;
+
+        // Layer 1 — idempotency key. Client না পাঠালে server নিজে একটা
+        // বসিয়ে দেয় যাতে index-এ সব নতুন doc-এর key থাকে (তখন dedupe
+        // কাজ করবে না, কারণ retry-তে key বদলে যাবে — client patch জরুরি)।
+        challan.clientRequestId = challan.clientRequestId || new ObjectId().toString();
+
+        // Layer 2 — content fingerprint
+        challan.dupKey = buildChallanDupKey(challan);
+
+        if (!forceDuplicate) {
+            const recent = await challanCollection.findOne(
+                {
+                    dupKey: challan.dupKey,
+                    createdAt: { $gte: new Date(Date.now() - DUP_WINDOW_MS) },
+                },
+                { projection: { _id: 1, createdAt: 1, createdBy: 1, currentUser: 1 }, sort: { createdAt: -1 } }
+            );
+            if (recent) {
+                logger.warn('Duplicate challan blocked (content match)', {
+                    dupKey: challan.dupKey,
+                    existingId: String(recent._id),
+                    userEmail: req.user?.email,
+                });
+                return res.status(409).send({
+                    success: false,
+                    code: 'DUPLICATE_CHALLAN',
+                    message: 'হুবহু একই challan সম্প্রতি তৈরি করা হয়েছে',
+                    existing: {
+                        _id: recent._id,
+                        createdAt: recent.createdAt,
+                        createdBy: recent.currentUser || recent.createdBy,
+                    },
+                });
+            }
+        }
+
+        try {
+            const result = await challanCollection.insertOne(challan);
+            res.send({ success: true, insertedId: result.insertedId });
+        } catch (insertErr) {
+            // Layer 1 hit — একই clientRequestId আগেই insert হয়েছে (timeout
+            // retry / double submit)। নতুন doc নয়, আগের _id ফেরত যাবে।
+            if (insertErr?.code === 11000) {
+                const existing = await challanCollection.findOne(
+                    { clientRequestId: challan.clientRequestId },
+                    { projection: { _id: 1 } }
+                );
+                logger.warn('Duplicate challan blocked (idempotency key)', {
+                    clientRequestId: challan.clientRequestId,
+                    existingId: String(existing?._id),
+                    userEmail: req.user?.email,
+                });
+                return res.send({
+                    success: true,
+                    insertedId: existing?._id || null,
+                    duplicate: true,
+                });
+            }
+            throw insertErr;
+        }
     } catch (err) {
         logger.error('Failed to add challan', err);
         res.status(500).send({ success: false, message: "Failed to add challan" });
