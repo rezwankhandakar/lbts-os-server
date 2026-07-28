@@ -39,6 +39,15 @@ const {
 } = require('./utils/helpers');
 const { resolveAuthoritativeRate } = require('./services/rateResolver');
 const { createMongoRateLimit } = require('./utils/mongoRateLimit');
+// FIX #56 — imgbb-র bot filter (error code 103, "You have been forbidden
+// to use this website") এ Vendor/Driver/Vehicle photo upload আটকে যাচ্ছিল।
+// এখন provider chain: imgbb (browser header সহ) → Cloudinary (optional)
+// → নিজের MongoDB-তে self-host। বিস্তারিত: services/imageUpload.js
+const {
+    uploadImageResilient,
+    getStoredImage,
+    describeProviders,
+} = require('./services/imageUpload');
 // FIX #55 — Client থেকে নতুন product/model যোগ করার feature।
 // rate_entries collection-এ custom row রাখে, baseline rateTable.js এর
 // উপরে overlay হয়। বিস্তারিত: services/customRateStore.js
@@ -230,6 +239,16 @@ app.use(cors({
     credentials: true
 }));
 
+// ── Proxy awareness (Render / Vercel / যেকোনো reverse proxy) ────────
+// FIX #57 — express-rate-limit `req.ip` দিয়ে counter রাখে। Render-এ app
+// proxy-র পিছনে বসে, trust proxy না দিলে req.ip সবসময় proxy-র IP — মানে
+// *সব user মিলে একটাই bucket*। তখন uploadLimiter-এর 30 req/15min পুরো
+// team মিলে শেষ হয়ে যায় আর ছবি upload-এ "Too many upload requests"
+// আসতে থাকে, যদিও কেউই বেশি upload করেনি। 1 = একটা proxy hop
+// (Render/Vercel দুটোতেই ঠিক); `true` দিলে express-rate-limit v7
+// spoofing risk হিসেবে reject করে, তাই সংখ্যাই দেওয়া হয়েছে।
+app.set('trust proxy', 1);
+
 // ── Security Headers ───────────────────────────────────────────────
 app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
@@ -240,6 +259,10 @@ app.use(express.json({ limit: '2mb' }));
 // FIX #20 — Apply global rate limit to ALL routes (exempts health check)
 app.use((req, res, next) => {
     if (req.path === '/' || req.path === '/warmup') return next(); // skip health + warmup
+    // FIX #56 — একটা vendor list page-এ ২০-৩০টা <img> একসাথে load হয়;
+    // self-hosted ছবি global limit-এ পড়লে ছবিগুলোই ভাঙবে (429)।
+    // GET-only, read-only route, তাই exempt রাখা নিরাপদ।
+    if (req.method === 'GET' && req.path.startsWith('/images/')) return next();
     return globalLimiter(req, res, next);
 });
 
@@ -767,56 +790,76 @@ app.post('/upload-image', uploadLimiter, mongoUploadLimiter, multerUpload.single
             });
         }
 
-        if (!process.env.IMGBB_API_KEY) {
-            logger.error('IMGBB_API_KEY missing');
-            return res.status(500).send({ success: false, message: 'Image service not configured' });
+        // FIX #56 — imgbb single point of failure ছিল। এখন provider chain,
+        // শেষ ধাপে নিজের DB — তাই imgbb block করলেও upload কাজ করে।
+        // self-host ধাপের জন্য db লাগে; DB down হলেও imgbb ধাপ চলবে,
+        // তাই এখানে connectDB fail করলে থামি না।
+        let db = null;
+        try {
+            db = await connectDB();
+        } catch (dbErr) {
+            logger.warn('DB unavailable for image self-host fallback', { error: dbErr?.message });
         }
 
-        const formData = new FormData();
-        formData.append('image', req.file.buffer.toString('base64'));
+        const { url, provider } = await uploadImageResilient({
+            db,
+            req,
+            buffer: req.file.buffer,
+            format: realFormat,
+            filename: req.file.originalname,
+            uploadedBy: req.user?.email,
+            logger,
+        });
 
-        const response = await axios.post(
-            `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
-            formData,
-            { headers: formData.getHeaders(), timeout: 20000 }
-        );
-
-        const url = response?.data?.data?.url;
-        if (!url || typeof url !== 'string') {
-            logger.error('ImgBB response invalid', { responseData: response?.data });
-            return res.status(502).send({ success: false, message: 'Image service returned invalid response' });
-        }
-
-        res.send({ success: true, url });
+        res.send({ success: true, url, provider });
     } catch (err) {
-        /* imgbb-side failure আলাদা করে চেনা — আগে সব ক্ষেত্রেই
-           generic "Image upload failed" (500) যেত, log-এও বোঝা যেত না
-           imgbb key invalid নাকি timeout নাকি অন্য কিছু। */
-        const imgbbStatus = err?.response?.status;
-        const imgbbData = err?.response?.data;
-        logger.error('Image upload failed', {
+        /* FIX #56 — প্রতিটা provider কেন fail করল সেটা log-এ থাকে
+           (err.attempts), আর user-কে দেখানোর মতো short message
+           err.publicMessage-এ। আগে imgbb-র raw কথা ("You have been
+           forbidden to use this website") সোজা user-এর মুখে যেত। */
+        logger.error('Image upload failed on every provider', {
             message: err?.message,
-            code: err?.code,
-            imgbbStatus,
-            imgbbError: imgbbData?.error || imgbbData,
+            attempts: err?.attempts,
             user: req.user?.email,
         });
-        if (err?.code === 'ECONNABORTED') {
-            return res.status(504).send({ success: false, message: 'Image hosting service timed out — please try again' });
-        }
-        if (imgbbStatus) {
-            // imgbb নিজে error দিয়েছে (invalid/expired API key হলে 400 আসে)
-            const detail = imgbbData?.error?.message || '';
-            const keyIssue = /key/i.test(detail);
-            return res.status(502).send({
-                success: false,
-                message: keyIssue
-                    ? 'Image hosting API key is invalid or expired — contact admin to update IMGBB_API_KEY'
-                    : `Image hosting service error${detail ? `: ${detail}` : ''}`,
-            });
-        }
-        res.status(500).send({ success: false, message: 'Image upload failed' });
+        res.status(502).send({
+            success: false,
+            message: err?.publicMessage || 'Image upload failed — please try again',
+        });
     }
+});
+
+// ── FIX #56 — Self-hosted image serve (public, no auth) ────────────
+// uploadImageResilient-এর শেষ fallback ছবিটা `images` collection-এ রাখে
+// আর `/images/<id>.<ext>` URL ফেরত দেয়। <img src> কোনো Authorization
+// header পাঠায় না, তাই এই route অবশ্যই public — id হলো 128-bit
+// random hex, তাই URL guess করে অন্যের ছবি দেখা যায় না। helmet-এ আগে থেকেই
+// crossOriginResourcePolicy: cross-origin সেট আছে, তাই অন্য domain
+// থেকে <img> load হবে।
+app.get('/images/:id', async (req, res) => {
+    try {
+        const db = await connectDB();
+        const image = await getStoredImage(db, req.params.id);
+        if (!image) {
+            return res.status(404).send({ success: false, message: 'Image not found' });
+        }
+        res.set({
+            'Content-Type': image.contentType,
+            'Content-Length': image.buffer.length,
+            // ছবি immutable (নতুন upload = নতুন id), তাই আগ্রাসী cache
+            'Cache-Control': 'public, max-age=31536000, immutable',
+            'Cross-Origin-Resource-Policy': 'cross-origin',
+        });
+        res.send(image.buffer);
+    } catch (err) {
+        logger.error('Image serve failed', { id: req.params.id, message: err?.message });
+        res.status(500).send({ success: false, message: 'Could not load image' });
+    }
+});
+
+// ── FIX #56 — Admin diagnostics: কোন image provider active ─────────
+app.get('/image-service-status', verifyToken, verifyAdmin, (req, res) => {
+    res.send({ success: true, providers: describeProviders() });
 });
 
 // ═══════════════════════════════════════════════════════════════════
@@ -6874,9 +6917,16 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start Server ───────────────────────────────────────────────────
-if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
+// FIX #57 — আগে শর্ত ছিল `NODE_ENV !== "production" && !VERCEL`.
+// Vercel-এ ঠিক ছিল (serverless-এ module.exports = app-ই যথেষ্ট), কিন্তু
+// Render/Railway/VPS-এ process নিজে port ধরে বসে থাকতে হয়। ফলে Render-এ
+// NODE_ENV=production দিলে app.listen কখনোই চলত না → "No open ports
+// detected", deploy fail বা service কখনো response দিত না। এখন শর্ত শুধু
+// "serverless কি না" — তাই Render-এ নিশ্চিন্তে NODE_ENV=production দেওয়া যায়
+// (এতে CORS fail-fast warning সহ production guard গুলোও active হয়)।
+if (!process.env.VERCEL) {
     app.listen(port, () => {
-        logger.info(`Server running`, { port });
+        logger.info(`Server running`, { port, env: process.env.NODE_ENV || 'development' });
     });
 }
 
