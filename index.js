@@ -967,7 +967,11 @@ async function findDuplicateRateEntry(col, { type, product, model, capacity }, e
 
 // ── LIST ───────────────────────────────────────────────────────────
 // Custom entries (default) — includeBaseline=1 দিলে built-in table-ও আসে
-app.get('/rate-entries', verifyToken, verifyRole('admin', 'manager', 'ceo'), async (req, res) => {
+// Admin-only (আগে manager/ceo-ও পারত)। Product Rates page এখন admin-only,
+// তাই API-ও একই জায়গায় আনা হলো — নাহলে UI থেকে লুকিয়েও endpoint খোলা
+// থেকে যেত। Rate *পড়ার* যে কাজটা অন্য page-এ লাগে সেটা /rate-table
+// দিয়ে হয়, সেটা আগের মতোই সব approved user-এর জন্য খোলা।
+app.get('/rate-entries', verifyToken, verifyRole('admin'), async (req, res) => {
     try {
         const db = await connectDB();
         const col = db.collection(RATE_ENTRIES_COLLECTION);
@@ -993,7 +997,7 @@ app.get('/rate-entries', verifyToken, verifyRole('admin', 'manager', 'ceo'), asy
 });
 
 // ── CREATE ─────────────────────────────────────────────────────────
-app.post('/rate-entries', verifyToken, verifyRole('admin', 'manager'), async (req, res) => {
+app.post('/rate-entries', verifyToken, verifyRole('admin'), async (req, res) => {
     try {
         let fields;
         try {
@@ -1047,7 +1051,7 @@ app.post('/rate-entries', verifyToken, verifyRole('admin', 'manager'), async (re
 });
 
 // ── UPDATE ─────────────────────────────────────────────────────────
-app.patch('/rate-entries/:id', verifyToken, verifyRole('admin', 'manager'), validateObjectId('id'), async (req, res) => {
+app.patch('/rate-entries/:id', verifyToken, verifyRole('admin'), validateObjectId('id'), async (req, res) => {
     try {
         let fields;
         try {
@@ -1102,7 +1106,7 @@ app.patch('/rate-entries/:id', verifyToken, verifyRole('admin', 'manager'), vali
 });
 
 // ── DELETE ─────────────────────────────────────────────────────────
-app.delete('/rate-entries/:id', verifyToken, verifyRole('admin', 'manager'), validateObjectId('id'), async (req, res) => {
+app.delete('/rate-entries/:id', verifyToken, verifyRole('admin'), validateObjectId('id'), async (req, res) => {
     try {
         const db = await connectDB();
         const col = db.collection(RATE_ENTRIES_COLLECTION);
