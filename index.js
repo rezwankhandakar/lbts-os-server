@@ -4570,6 +4570,174 @@ app.post("/deliveries/split-product", verifyToken, verifyRole('admin'), async (r
     }
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// POST /challans/split-product
+//   All-Challan page-এর জন্য split। Delivered page-এর
+//   /deliveries/split-product এর ঠিক আয়না, শুধু উল্টো দিক থেকে:
+//
+//     Delivered page  → source of truth = `deliveries` (trip-এ embed করা
+//                       challan), canonical `challans` best-effort sync
+//     All-Challan page → source of truth = canonical `challans`,
+//                       `deliveries`-এ embed করা copy best-effort sync
+//
+//   কেন দরকার: qty 2-এর একটা row-এর অর্ধেকে আলাদা Trip Do বসাতে হলে
+//   আগে challan dispatch হয়ে Delivered page-এ যাওয়া পর্যন্ত অপেক্ষা
+//   করতে হতো। এখন pending অবস্থাতেই All-Challan থেকে ভাগ করা যায়।
+//
+//   Guards:
+//     - qty > 1 না হলে ভাগ করার কিছু নেই
+//     - splitQty অবশ্যই 1 থেকে (qty - 1) এর মধ্যে; original row কখনো
+//       0 হবে না (সেটা delete, split নয়)
+//   Admin only — Delivered-এর মতোই।
+// ─────────────────────────────────────────────────────────────────────
+app.post("/challans/split-product", verifyToken, verifyRole('admin'), async (req, res) => {
+    try {
+        const { challanId, productId, splitQty } = req.body || {};
+        if (!challanId || !productId) {
+            return res.status(400).send({ success: false, message: "challanId and productId required" });
+        }
+        if (!isValidObjectId(challanId)) {
+            return res.status(400).send({ success: false, message: "Invalid challanId" });
+        }
+        const peel = Number(splitQty);
+        if (!Number.isInteger(peel) || peel <= 0) {
+            return res.status(400).send({ success: false, message: "splitQty must be a positive integer" });
+        }
+
+        const db = await connectDB();
+        const challanCollection = db.collection('challans');
+        const deliveriesCollection = db.collection('deliveries');
+
+        // ── 1. Canonical challan + source product ──
+        const challan = await challanCollection.findOne({ _id: new ObjectId(challanId) });
+        if (!challan) {
+            return res.status(404).send({ success: false, message: "Challan not found" });
+        }
+        // পুরনো data-তে products._id string বা ObjectId — দুটোই হতে পারে,
+        // তাই দুরকম মিলিয়েই খুঁজি।
+        const source = (challan.products || []).find(
+            p => p._id === productId || p._id?.toString() === productId
+        );
+        if (!source) {
+            return res.status(404).send({ success: false, message: "Product not found in this challan" });
+        }
+
+        const originalQty = Number(source.quantity) || 0;
+        if (originalQty <= 1) {
+            return res.status(400).send({ success: false, message: "Nothing to split — this row has only 1 qty" });
+        }
+        if (peel >= originalQty) {
+            return res.status(400).send({
+                success: false,
+                message: `splitQty (${peel}) must be less than current quantity (${originalQty})`,
+            });
+        }
+        const remainingQty = originalQty - peel;
+
+        // ── 2. নতুন product (source-এর copy, নতুন _id, Trip Do ছাড়া) ──
+        const newProduct = { ...source };
+        delete newProduct.tripDo;
+        newProduct._id = new ObjectId().toString();
+        newProduct.quantity = peel;
+        newProduct.splitFrom = source._id?.toString?.() || source._id;
+
+        await recordAudit({
+            db, req,
+            action: "SPLIT_CHALLAN_PRODUCT",
+            collectionName: "challans",
+            documentId: challan._id,
+            oldDoc: challan,
+            reason: `Split product ${newProduct.splitFrom}: ${originalQty} → ${remainingQty} + ${peel}`,
+        });
+
+        // ── 3. Canonical challans update ──
+        // Filter-এ source._id (তার আসল type সহ) ব্যবহার করি, req.body-র
+        // string নয় — legacy ObjectId _id হলেও তাই match করবে।
+        await challanCollection.updateOne(
+            { _id: challan._id, "products._id": source._id },
+            { $set: { "products.$.quantity": remainingQty } }
+        );
+        await challanCollection.updateOne(
+            { _id: challan._id },
+            { $push: { products: newProduct } }
+        );
+
+        // ── 4. Best-effort sync to deliveries ──
+        // Challan ইতিমধ্যে কোনো trip-এ dispatch হয়ে থাকলে সেখানকার embedded
+        // copy-টাও ভাগ করতে হবে, নাহলে Delivered page আর All-Challan page
+        // আলাদা qty দেখাবে। Sync fail করলে request fail করি না — canonical
+        // ডেটা ঠিক আছে, log দেখে admin পরে মেলাতে পারবে।
+        let syncedTrips = 0;
+        try {
+            const trips = await deliveriesCollection.find({
+                $and: [
+                    { $or: [{ "challans.challanId": challanId }, { "challans.challanId": challan._id }] },
+                    { "challans.products._id": source._id },
+                ],
+            }).toArray();
+
+            for (const trip of trips) {
+                // embedded challanId string না ObjectId — arrayFilters-এ
+                // আসল type-টাই পাঠাতে হয়
+                let embeddedChallanIdValue = null;
+                let embeddedProduct = null;
+                for (const c of (trip.challans || [])) {
+                    const cid = c?.challanId;
+                    if (cid !== challanId && cid?.toString() !== challanId) continue;
+                    const p = (c.products || []).find(
+                        pp => pp._id === productId || pp._id?.toString() === productId
+                    );
+                    if (p) { embeddedChallanIdValue = cid; embeddedProduct = p; break; }
+                }
+                if (!embeddedProduct) continue;
+
+                // Embedded qty canonical থেকে আলাদা হয়ে থাকতে পারে (পুরনো
+                // partial return ইত্যাদি)। তাই canonical-এর remainingQty
+                // চাপিয়ে না দিয়ে embedded qty থেকেই peel বাদ দিই।
+                const embeddedQty = Number(embeddedProduct.quantity) || 0;
+                if (embeddedQty <= peel) {
+                    logger.warn?.("Skipped trip sync during challan split — embedded qty too small", {
+                        tripId: trip._id?.toString(), challanId, productId, embeddedQty, peel,
+                    });
+                    continue;
+                }
+
+                await deliveriesCollection.updateOne(
+                    { _id: trip._id },
+                    { $set: { "challans.$[c].products.$[p].quantity": embeddedQty - peel } },
+                    {
+                        arrayFilters: [
+                            { "c.challanId": embeddedChallanIdValue },
+                            { "p._id": embeddedProduct._id },
+                        ],
+                    }
+                );
+                await deliveriesCollection.updateOne(
+                    { _id: trip._id },
+                    { $push: { "challans.$[c].products": newProduct } },
+                    { arrayFilters: [{ "c.challanId": embeddedChallanIdValue }] }
+                );
+                syncedTrips++;
+            }
+        } catch (syncErr) {
+            logger.warn?.("Trip sync failed during challan split", {
+                challanId, productId, err: syncErr?.message,
+            });
+        }
+
+        res.send({
+            success: true,
+            originalProductId: productId,
+            originalQuantity: remainingQty,
+            newProduct,
+            syncedTrips,
+        });
+    } catch (err) {
+        logger.error("Challan product split failed", err);
+        res.status(500).send({ success: false, message: "Failed to split product" });
+    }
+});
+
 // FIX #25 — When removing challan from trip, restore original challan's status
 // ─────────────────────────────────────────────────────────────────────
 // DELETE /deliveries/:tripId
